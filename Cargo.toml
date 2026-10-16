@@ -1,0 +1,25 @@
+[package]
+name = "glm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+logos = "0.16.1"
+
+# One crate, two targets:
+#   bin  glm     — the compiler (src/main.rs and its modules)
+#   lib  glm_rt  — the C-ABI runtime, built as a staticlib that clang links
+#                  against the generated .ll (src/lib.rs -> src/rt.rs)
+[lib]
+name = "glm_rt"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "glm"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+panic = "abort"
