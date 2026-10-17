@@ -122,6 +122,7 @@ fn record_stmt_exprs(
                 expr(e, map, locs, i);
             }
         }
+        Stmt::Break => {}
     }
 }
 
@@ -208,6 +209,7 @@ fn number_stmt(stmt: &Stmt, sites: &mut BTreeMap<*const Expr, usize>) {
                 number_expr(e, sites);
             }
         }
+        Stmt::Break => {}
     }
 }
 
@@ -350,6 +352,7 @@ fn scan_stmt(
                 scan_expr(e, scopes, current_fn, touched);
             }
         }
+        Stmt::Break => {}
     }
 }
 

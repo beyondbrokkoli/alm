@@ -5,12 +5,14 @@ use std::process::Stdio;
 mod analysis;
 mod ast;
 mod backend;
+mod debug;
 mod ir;
 mod lexer;
 mod lowerer;
 mod parser;
+#[cfg(test)]
+mod property_tests;
 mod shape;
-mod type_checker;
 
 use ast::Stmt;
 
@@ -131,6 +133,7 @@ fn references_arg(stmts: &[Stmt]) -> bool {
             } => expr(condition) || go(then_body) || go(else_body),
             Stmt::Expr { expr: inner } => expr(inner),
             Stmt::Return { value } => value.as_ref().is_some_and(expr),
+            Stmt::Break => false,
         })
     }
     go(stmts)
@@ -174,6 +177,7 @@ fn uses_ffi(stmts: &[Stmt]) -> bool {
             } => expr(condition) || go(then_body) || go(else_body),
             Stmt::Expr { expr: inner } => expr(inner),
             Stmt::Return { value } => value.as_ref().is_some_and(expr),
+            Stmt::Break => false,
         })
     }
     go(stmts)
@@ -476,14 +480,9 @@ it defaults to libglm_out.so (or glm_out for --exe).";
         parser.ctor_line_seq.clone(),
     );
 
-    let mut shape = shape::analyze(&ctx);
-
-    if !shape.diagnostics.is_empty() {
-        fail_build(&shape.diagnostics);
-    }
-
-    let mut checker = type_checker::TypeChecker::new(&mut shape);
-    checker.check_program(&ast);
+    // one walk: the shape analyzer's recorded pass IS the checker (the
+    // fold) — analyze returns the complete fact set plus diagnostics
+    let shape = shape::analyze(&ctx);
 
     if !shape.diagnostics.is_empty() {
         fail_build(&shape.diagnostics);

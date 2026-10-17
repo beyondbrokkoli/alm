@@ -1,5 +1,6 @@
 use super::core::LayoutVerdict;
-use crate::ast::{Expr, StaticType, Stmt};
+use crate::ast::{Expr, Stmt};
+use crate::shape::Ty;
 use glm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,8 +37,42 @@ pub struct ArmFreeEntry {
 pub struct FnDef {
     pub params: Vec<String>,
     pub body: *const [Stmt],
-    pub ret: StaticType,
-    pub signature: Option<Vec<StaticType>>,
+    pub ret: Ty,
+    pub signature: Option<Vec<Ty>>,
+}
+
+/// The checker's resolved decision for one dotted ffi/coroutine call
+/// site. The checker validates member, arity, and operand types exactly
+/// once and records the verdict here; the lowerer consumes it instead of
+/// re-deriving the same decision from its own walk (every re-derivation
+/// was a fresh desync surface). Operands stay positional: the verb names
+/// the face, the call's own `args` slice carries the operands — the two
+/// walks read the identical AST node, so the positions cannot drift.
+#[derive(Clone)]
+pub enum FfiVerb {
+    Load,
+    ArgKind,
+    Cdef,
+    CoroCreate,
+    CoroResume,
+    CoroYield,
+    CoroStatus,
+    CoroClose,
+    /// The drive call: `lib.sym(tbl)` — base and symbol named because
+    /// neither is an operand position.
+    Drive {
+        base: String,
+        sym: String,
+    },
+}
+
+/// The addressing lane of one index key, decided by the checker at the
+/// key choke point (`check_index_key`); the lowerer consumes it instead
+/// of re-deriving the lane from its own walk of the key expression.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyLane {
+    Int,
+    Str,
 }
 
 impl FnDef {
@@ -49,8 +84,8 @@ impl FnDef {
 #[derive(Clone)]
 pub struct ShapeFacts {
     pub sites: BTreeMap<*const Expr, usize>,
-    pub elems: Vec<StaticType>,
-    pub boundary_elem: Option<StaticType>,
+    pub elems: Vec<Ty>,
+    pub boundary_elem: Option<Ty>,
     #[allow(dead_code)]
     pub layouts: Vec<LayoutVerdict>,
     pub free_sites: BTreeSet<*const Stmt>,
@@ -61,6 +96,7 @@ pub struct ShapeFacts {
     pub cond_temp_frees: BTreeMap<*const Stmt, Vec<usize>>,
     pub arm_temp_frees: BTreeMap<*const Expr, Vec<usize>>,
     pub ret_path_frees: BTreeMap<*const Stmt, Vec<DoExitFree>>,
+    pub break_path_frees: BTreeMap<*const Stmt, Vec<DoExitFree>>,
     pub ret_path_keep_frees: BTreeMap<*const Stmt, Vec<DoExitFree>>,
     pub ret_path_keep_temps: BTreeMap<*const Stmt, Vec<usize>>,
     pub rebind_frees: BTreeMap<*const Stmt, BTreeMap<String, Vec<Keep>>>,
@@ -75,36 +111,46 @@ pub struct ShapeFacts {
     pub move_poisons: BTreeMap<*const Stmt, BTreeSet<String>>,
     pub name_dense: BTreeMap<(String, usize), bool>,
     pub stored_ctor_parents: BTreeSet<usize>,
-    pub substitutions: BTreeMap<usize, StaticType>,
-    pub local_types: BTreeMap<(*const Stmt, String), StaticType>,
+    pub substitutions: BTreeMap<usize, Ty>,
+    pub local_types: BTreeMap<(*const Stmt, String), Ty>,
     pub row_reads: BTreeMap<usize, (String, usize)>,
     pub cell_children: BTreeMap<usize, BTreeSet<usize>>,
     pub fn_scope_keys: BTreeMap<*const Expr, (*const Stmt, u8)>,
     pub fn_touched: BTreeMap<*const Expr, BTreeSet<String>>,
     pub fn_defs: BTreeMap<*const Expr, FnDef>,
     pub call_defs: BTreeMap<*const Expr, *const Expr>,
+    pub ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
+    pub index_key_lanes: BTreeMap<*const Expr, KeyLane>,
+    /// The element face of one table access base, keyed by the base
+    /// expression: the checker's resolved elem, recorded at the access
+    /// choke points (`check_index_base` for bracket reads/writes, the
+    /// Field receiver arm for dot reads) and consumed straight by the
+    /// lowerer's Index/IndexAssign/Field faces, so the ctor's
+    /// allocation and every access face come from one decision.
+    pub access_elems: BTreeMap<*const Expr, Ty>,
     pub stmt_lines: BTreeMap<*const Stmt, usize>,
     pub ctor_lines: Vec<usize>,
+    #[allow(dead_code)]
     pub adopt_lines: BTreeMap<String, usize>,
     pub diagnostics: Vec<String>,
 }
 
 impl ShapeFacts {
-    pub fn elem_of(&self, ctor: &Expr) -> StaticType {
+    pub fn elem_of(&self, ctor: &Expr) -> Ty {
         let id = self.sites[&(ctor as *const Expr)];
         let elem = self.elems[id].clone();
         self.resolve_elem_type(elem)
     }
 
-    fn resolve_elem_type(&self, ty: StaticType) -> StaticType {
+    fn resolve_elem_type(&self, ty: Ty) -> Ty {
         match &ty {
-            StaticType::Unknown(id) => match self.substitutions.get(id) {
+            Ty::Unknown(id) => match self.substitutions.get(id) {
                 Some(resolved) => self.resolve_elem_type(resolved.clone()),
                 None => ty,
             },
-            StaticType::Table(inner) => {
+            Ty::Tbl(inner) => {
                 let resolved = self.resolve_elem_type((**inner).clone());
-                StaticType::Table(Box::new(resolved))
+                Ty::Tbl(Box::new(resolved))
             }
             _ => ty,
         }
@@ -133,7 +179,7 @@ impl ShapeFacts {
                     if reported.insert(row)
                         && matches!(
                             self.resolve_elem_type(self.elems[row].clone()),
-                            StaticType::Unknown(_)
+                            Ty::Unknown(_)
                         )
                     {
                         signal!(trace::TRACE_ANALYZE_MISSING_VALUE);

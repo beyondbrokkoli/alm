@@ -25,7 +25,7 @@ fn take_field(line: &str) -> (&str, &str) {
 /// artifacts link it. Every artifact the compiler emits gains
 /// DT_NEEDED libglm_async.so (see main.rs's clang link line).
 fn build_async_core() {
-    const SOURCES: [&str; 7] = [
+    const SOURCES: [&str; 8] = [
         "sys_sync.c",
         "state_globals.c",
         "mailbox.c",
@@ -33,6 +33,7 @@ fn build_async_core() {
         "mailbox_accessors.c",
         "glm_tenant.c",
         "glm_coro.c",
+        "str_pool.c",
     ];
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));

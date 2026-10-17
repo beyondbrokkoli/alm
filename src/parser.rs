@@ -169,6 +169,90 @@ impl<'a> Parser<'a> {
 
                 Ok(Stmt::While { condition, body })
             }
+            Some(Token::For) => {
+                // parse_stmt pushed one seq entry for the desugared Stmt::Do.
+                // record_stmt_lines consumes entries in AST pre-order, so the
+                // synthesized LocalDecl, While, and inner-body Do need their
+                // own entries BEFORE the body parses, and the synthetic
+                // i = i + 1 one after — all pointing at the for header,
+                // desugared code reports there.
+                let for_line = *self.stmt_line_seq.last().unwrap_or(&1);
+                let for_col = *self.stmt_col_seq.last().unwrap_or(&1);
+                self.stmt_line_seq.push(for_line);
+                self.stmt_line_seq.push(for_line);
+                self.stmt_line_seq.push(for_line);
+                self.stmt_col_seq.push(for_col);
+                self.stmt_col_seq.push(for_col);
+                self.stmt_col_seq.push(for_col);
+
+                self.tokens.next();
+                let var = match self.tokens.next() {
+                    Some(Token::Identifier(n)) => n.to_string(),
+                    _ => {
+                        return Err(ParseError(
+                            "Syntax Error: Expected loop variable name after 'for'".into(),
+                        ));
+                    }
+                };
+                self.expect(Token::Assign)?;
+                let start = self.parse_expr()?;
+                self.expect(Token::Comma)?;
+                let limit = self.parse_expr()?;
+                self.expect(Token::Do)?;
+
+                let mut body = Vec::new();
+                while self.tokens.peek() != Some(&Token::End) {
+                    body.push(self.parse_stmt()?);
+                }
+                self.expect(Token::End)?;
+
+                self.stmt_line_seq.push(for_line);
+                self.stmt_col_seq.push(for_col);
+
+                if Self::body_assigns_to(&body, &var) {
+                    return Err(ParseError(format!(
+                        "Syntax Error: cannot assign to for-loop variable '{var}'"
+                    )));
+                }
+
+                // Desugar: for i = a, b do B end is half-open (a ..< b) and
+                // becomes Do[ local i = a, While i < b { Do[ B ]; i = i + 1 } ]
+                // so the existing while phi/fill machinery handles everything.
+                // The user body rides its own inner scope: a `local i` in B
+                // shadows the counter only inside B, so the synthetic
+                // increment after it still reaches the counter (without the
+                // wrap it would increment the shadow — an infinite loop).
+                // Analysis walks the desugared tree, so *const Stmt keys
+                // stay consistent.
+                let increment = Stmt::Assignment {
+                    name: var.clone(),
+                    expr: Expr::BinaryOp {
+                        op: BinOp::Add,
+                        left: Box::new(Expr::Identifier(var.clone())),
+                        right: Box::new(Expr::Integer(1)),
+                    },
+                };
+                Ok(Stmt::Do {
+                    body: vec![
+                        Stmt::LocalDecl {
+                            names: vec![var.clone()],
+                            exprs: vec![start],
+                        },
+                        Stmt::While {
+                            condition: Expr::BinaryOp {
+                                op: BinOp::LessThan,
+                                left: Box::new(Expr::Identifier(var)),
+                                right: Box::new(limit),
+                            },
+                            body: vec![Stmt::Do { body }, increment],
+                        },
+                    ],
+                })
+            }
+            Some(Token::Break) => {
+                self.tokens.next();
+                Ok(Stmt::Break)
+            }
             Some(Token::If) => {
                 self.tokens.next();
                 let condition = self.parse_expr()?;
@@ -258,6 +342,19 @@ impl<'a> Parser<'a> {
                     let rhs = self.parse_expr()?;
                     match lhs {
                         Expr::Identifier(name) => Ok(Stmt::Assignment { name, expr: rhs }),
+                        Expr::Field { obj, name } => {
+                            // dot write sugar desugars to a string-keyed
+                            // index at parse time (the checker later
+                            // rejects a non-table receiver)
+                            glm_rt::trace::compiler_trace_signal(
+                                glm_rt::trace::TRACE_PARSE_STRKEY_DOT,
+                            );
+                            Ok(Stmt::IndexAssign {
+                                obj: *obj,
+                                key: Expr::String(name),
+                                value: rhs,
+                            })
+                        }
                         Expr::Index { obj, key } => Ok(Stmt::IndexAssign {
                             obj: *obj,
                             key: *key,
@@ -287,6 +384,36 @@ impl<'a> Parser<'a> {
             self.tokens.peek(),
             Some(Token::End) | Some(Token::Else) | Some(Token::ElseIf) | None
         )
+    }
+
+    /// Unlike has_break, assignments to the loop variable are rejected even
+    /// from nested While bodies (they still mutate the outer loop var), and a
+    /// LocalDecl of the same name shadows it for the rest of its block.
+    fn body_assigns_to(stmts: &[Stmt], var: &str) -> bool {
+        for s in stmts {
+            match s {
+                Stmt::LocalDecl { names, .. } if names.iter().any(|n| n == var) => {
+                    return false;
+                }
+                Stmt::Assignment { name, .. } if name == var => return true,
+                Stmt::Do { body } | Stmt::While { body, .. } => {
+                    if Self::body_assigns_to(body, var) {
+                        return true;
+                    }
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } if Self::body_assigns_to(then_body, var)
+                    || Self::body_assigns_to(else_body, var) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     fn parse_elseif_chain(&mut self) -> Result<Stmt, ParseError> {
@@ -639,16 +766,51 @@ impl<'a> Parser<'a> {
 
         let mut entries: Vec<(CtorKey, Expr)> = Vec::new();
         let mut slots: BTreeSet<i64> = BTreeSet::new();
+        // Record field identity: a named key and a literal-string expr key
+        // name the same field, so both dedupe through one set. (A dynamic
+        // expr key's type is the checker's call — see its TableCtor arm.)
+        let mut names: BTreeSet<String> = BTreeSet::new();
         let mut next_pos: i64 = 0;
         loop {
             let (key, value) = self.parse_ctor_entry(&mut next_pos)?;
-            if let CtorKey::Const(slot) = key
-                && !slots.insert(slot)
-            {
-                return Err(ParseError(format!(
-                    "Syntax Error: duplicate index {slot} in constructor — each slot may be \
-                     written once (last-wins is not glm's rule)"
-                )));
+            let record_name = match &key {
+                CtorKey::Str(n) => Some(n.as_str()),
+                CtorKey::Expr(Expr::String(s)) => Some(s.as_str()),
+                _ => None,
+            };
+            match &key {
+                CtorKey::Const(slot) => {
+                    if !slots.insert(*slot) {
+                        return Err(ParseError(format!(
+                            "Syntax Error: duplicate index {slot} in constructor — each slot may \
+                             be written once (last-wins is not glm's rule)"
+                        )));
+                    }
+                    if !names.is_empty() {
+                        return Err(ParseError(
+                            "Syntax Error: mixed array and record constructor elements — a \
+                             constructor is an array or a record, never both"
+                                .into(),
+                        ));
+                    }
+                }
+                CtorKey::Str(_) | CtorKey::Expr(_) if record_name.is_some() => {
+                    let name = record_name.unwrap();
+                    if !names.insert(name.to_string()) {
+                        return Err(ParseError(format!(
+                            "Syntax Error: duplicate key '{name}' in constructor — each field may \
+                             be written once (last-wins is not glm's rule)"
+                        )));
+                    }
+                    if !slots.is_empty() {
+                        return Err(ParseError(
+                            "Syntax Error: mixed array and record constructor elements — a \
+                             constructor is an array or a record, never both"
+                                .into(),
+                        ));
+                    }
+                }
+                _ => {}
             }
             entries.push((key, value));
             if matches!(self.tokens.peek(), Some(Token::Comma)) {
@@ -692,12 +854,16 @@ impl<'a> Parser<'a> {
                 Some(Token::Assign) => {
                     let name = match &value {
                         Expr::Identifier(n) => n.clone(),
-                        _ => "name".to_string(),
+                        _ => {
+                            return Err(ParseError(
+                                "Syntax Error: expected identifier before '='".into(),
+                            ));
+                        }
                     };
-                    Err(ParseError(format!(
-                        "Syntax Error: named keys ({{{name} = v}}) are not supported yet — use \
-                         an explicit integer key: {{[0] = v}}"
-                    )))
+                    self.tokens.next(); // consume '='
+                    let v = self.parse_expr()?;
+                    glm_rt::trace::compiler_trace_signal(glm_rt::trace::TRACE_PARSE_STRKEY_NAMED);
+                    Ok((CtorKey::Str(name), v))
                 }
                 _ => {
                     let slot = *next_pos;

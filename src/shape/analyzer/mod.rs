@@ -10,14 +10,17 @@ use super::core::{
 use super::facts;
 use super::facts::ShapeFacts;
 use super::helpers::{const_key_value, extract_guard, merge_table_scopes};
-use super::ty::{Ty, arith_ty, contains_any, join_ty, pinned_scalar, value_kind};
+use super::ty::{Ty, arith_ty, contains_any, decided, join_ty, pinned_scalar, value_kind};
 use Ty::{Any, Bool, Conflict, Coro, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
 
+mod checker;
 mod checks;
+mod constraints;
 mod exits;
 mod functions;
 mod infer;
 mod lattice;
+mod pins;
 mod rebind;
 mod rows;
 mod walk;
@@ -71,6 +74,12 @@ struct WalkState {
     changed: bool,
     conv_fires: BTreeSet<u8>,
     prov: Vec<BTreeMap<String, Option<Prov>>>,
+    /// per-scope scalar unknown nodes — bare-declaration slots and
+    /// scalar aliases of node-carrying RHSes (`local mode = arg[0]`
+    /// rides the seed). The use-site pinning discipline (pins.rs) reads
+    /// this map; it mirrors the checker's scope entries for the
+    /// scalar-unknown case only.
+    scalar_nodes: Vec<BTreeMap<String, usize>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -93,6 +102,13 @@ struct LatticeState {
     housed_ghosts: BTreeSet<usize>,
     claimed_ghosts: BTreeSet<usize>,
     adopt_witness: BTreeMap<usize, usize>,
+    /// the unknown-constraint store — the lattice home of the nominal
+    /// type variables (boundary seed, bare-declaration slots, fn return
+    /// nodes, per-call parameter instances) and their substitution pins.
+    /// The walk anchors the minting; the checking half constrains through
+    /// `bind`/`unify`; the assembled facts derive `substitutions` from
+    /// here. The checking half owns no algebra of its own.
+    unknowns: constraints::UnknownStore,
 }
 
 struct GhostMint {
@@ -109,6 +125,7 @@ struct OwnershipState {
     cond_temp_frees: BTreeMap<*const Stmt, Vec<usize>>,
     arm_temp_frees: BTreeMap<*const Expr, Vec<usize>>,
     ret_path_frees: BTreeMap<*const Stmt, Vec<super::facts::DoExitFree>>,
+    break_path_frees: BTreeMap<*const Stmt, Vec<super::facts::DoExitFree>>,
     ret_path_keep_frees: BTreeMap<*const Stmt, Vec<super::facts::DoExitFree>>,
     ret_path_keep_temps: BTreeMap<*const Stmt, Vec<usize>>,
     rebind_grants: BTreeMap<*const Stmt, BTreeMap<String, Vec<super::facts::Keep>>>,
@@ -126,6 +143,19 @@ struct HoldsState {
     hold_edges: BTreeMap<usize, BTreeSet<usize>>,
     cyclic_stores: BTreeMap<String, (String, usize)>,
     num_assigns: BTreeMap<String, Vec<NumExpr>>,
+    // nil-slot law: sites a straight-line `t = nil` severed from the
+    // name. The header is freed and the aliases are gone, but the name's
+    // element slot survives — a later rebind's adoption bridge joins
+    // these sites' elems (both directions), so the mix is name-global
+    // across the nil exactly as it is across a plain rebind.
+    nil_severed: BTreeMap<String, BTreeSet<usize>>,
+    // the move flavor of the same law: sites an affine move
+    // (`local u = t`) severed from the name. The binding becomes the
+    // MOVED marker, but the name's element slot survives it exactly as
+    // it survives a nil — a later rebind's adoption bridges the history,
+    // and the severed-sites view answers the pre-move type (the
+    // checking half's name→type view reads this through its snapshot).
+    moved_severed: BTreeMap<String, BTreeSet<usize>>,
 }
 
 struct ReadSideState {
@@ -153,6 +183,7 @@ fn collect_body_sites(
                 exprs.iter().for_each(|e| walk_expr(e, sites, out))
             }
             Stmt::Assignment { expr, .. } | Stmt::Expr { expr } => walk_expr(expr, sites, out),
+            Stmt::Break => {}
             Stmt::IndexAssign { obj, key, value } => {
                 walk_expr(obj, sites, out);
                 walk_expr(key, sites, out);
@@ -244,6 +275,7 @@ fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
                     walk_expr(e, out);
                 }
             }
+            Stmt::Break => {}
         }
     }
     fn walk_obj_value(s: &Stmt, out: &mut BTreeSet<String>) {
@@ -320,6 +352,7 @@ struct Analyzer {
     fn_ret_reaches: Vec<BTreeSet<usize>>,
     fn_walk: Vec<(*const Expr, Vec<String>)>,
     fn_scope_entries: Vec<usize>,
+    loop_scope_entries: Vec<usize>,
 }
 
 pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
@@ -331,6 +364,7 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
             changed: false,
             conv_fires: BTreeSet::new(),
             prov: vec![BTreeMap::new()],
+            scalar_nodes: vec![BTreeMap::new()],
         },
         ledger: Ledger {
             diagnostics: Vec::new(),
@@ -350,6 +384,7 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
             housed_ghosts: BTreeSet::new(),
             claimed_ghosts: BTreeSet::new(),
             adopt_witness: BTreeMap::new(),
+            unknowns: constraints::UnknownStore::new(),
         },
         own: OwnershipState {
             free_sites: BTreeSet::new(),
@@ -360,6 +395,7 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
             cond_temp_frees: BTreeMap::new(),
             arm_temp_frees: BTreeMap::new(),
             ret_path_frees: BTreeMap::new(),
+            break_path_frees: BTreeMap::new(),
             ret_path_keep_frees: BTreeMap::new(),
             ret_path_keep_temps: BTreeMap::new(),
             rebind_grants: BTreeMap::new(),
@@ -376,6 +412,8 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
             hold_edges: BTreeMap::new(),
             cyclic_stores: BTreeMap::new(),
             num_assigns: BTreeMap::new(),
+            nil_severed: BTreeMap::new(),
+            moved_severed: BTreeMap::new(),
         },
         reads: ReadSideState {
             tbl_value_stores: BTreeSet::new(),
@@ -409,14 +447,19 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
         fn_ret_reaches: Vec::new(),
         fn_walk: Vec::new(),
         fn_scope_entries: Vec::new(),
+        loop_scope_entries: Vec::new(),
     };
 
     let mut prev_end: Vec<BTreeMap<String, TableShape>> = Vec::new();
+    let mut dbg_pass: u32 = 0;
     loop {
+        dbg_pass += 1;
+        crate::glm_dbgln!("[fixpoint] pass {dbg_pass}");
         a.walk.changed = false;
         a.walk.scopes = vec![boundary_root_scope()];
         a.walk.fn_scopes = vec![BTreeMap::new()];
         a.walk.prov = vec![BTreeMap::new()];
+        a.walk.scalar_nodes = vec![BTreeMap::new()];
         a.walk_stmts(None, ctx.ast);
         let end = a.walk.scopes.clone();
         let stable = end == prev_end && !a.walk.changed;
@@ -430,18 +473,14 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
         trace::compiler_trace_signal(slot);
     }
 
-    let rec: Gate = Some(Recording { _priv: () });
-    a.walk.scopes = vec![boundary_root_scope()];
-    a.walk.fn_scopes = vec![BTreeMap::new()];
-    a.walk.prov = vec![BTreeMap::new()];
-    a.ledger.diagnostics.clear();
-    a.walk_stmts(rec, ctx.ast);
-
-    if let Err(err) = a.decide_root_exit(rec) {
-        a.ledger.diagnostics.push(err.0);
-    }
-    a.plan_stmt_temp_frees(ctx.ast);
-
+    // ---- ONE walk, recorded once ----
+    // The lattice is final now (the fixpoint converged), so the
+    // acceptance inputs are computable BEFORE the recorded pass: the
+    // adoption lines and the static-elem table (the same table
+    // into_facts carries out — one definition of the elem truth, read
+    // by both halves of the walk).
+    // Computed from the fixpoint's final scope state, which the recorded
+    // pass reproduces (that is what convergence means).
     let adopt_lines: BTreeMap<String, usize> = {
         let mut m = BTreeMap::new();
         for scope in a.walk.scopes.iter() {
@@ -460,88 +499,168 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
         m
     };
 
-    let mut facts = a.into_recorded(adopt_lines).into_facts(n);
+    // Fixpoint passes may error transiently (a scope that converges away
+    // from the error); the recorded pass is the truth — drop the echoes
+    // BEFORE the elem table drains the ledger into its own diagnostic
+    // list, or the echoes would ride out inside elems_diags.
+    a.ledger.diagnostics.clear();
+    let (static_elems, elems_diags) = a.compute_static_elems(n);
+
+    let rec: Gate = Some(Recording { _priv: () });
+    a.walk.scopes = vec![boundary_root_scope()];
+    a.walk.fn_scopes = vec![BTreeMap::new()];
+    a.walk.prov = vec![BTreeMap::new()];
+    a.walk.scalar_nodes = vec![BTreeMap::new()];
+
+    // The recorded pass drives BOTH halves per top-level statement, in
+    // program order: lattice machinery first, then the checker (its own
+    // recursion covers nested bodies — each statement is checked exactly
+    // once, loop fixpoint iterations never re-fire it). The checker only
+    // ever ran on a clean analyzer diagnostic list; keep that contract.
+    // The walk runs one statement AHEAD of the checker, so the checker
+    // reads the walk's state through two snapshots per statement: before
+    // the statement's walk (its queries) and after it (its fresh
+    // declarations' view compare).
+    let mut chk = checker::Checker::new(checker::CheckCtx {
+        stmt_lines: a.stmt_lines.clone(),
+        adopt_lines: adopt_lines.clone(),
+        sites: a.lattice.sites.clone(),
+        elems: static_elems.clone(),
+    });
+    let mut checker_ran = elems_diags.is_empty();
+    for stmt in ctx.ast {
+        chk.snapshot_pre(&a.walk, &a.holds.moved_severed);
+        if let Err(err) = a.walk_stmt(rec, stmt) {
+            signal!(rec.on(), trace::TRACE_GHOST_BAIL);
+            let line = a.stmt_lines.get(&(stmt as *const Stmt)).copied();
+            a.ledger.diagnostics.push(match line {
+                Some(l) => format!("line {l}: {}", err.0),
+                None => err.0,
+            });
+            checker_ran = false;
+            break;
+        }
+        chk.snapshot_post(&a.walk, &a.holds.moved_severed);
+        if checker_ran && let Err(msg) = chk.check_stmt(&mut a.lattice.unknowns, stmt) {
+            signal!(trace::TRACE_GHOST_BAIL_CHECKER);
+            if msg.contains("disagree") {
+                signal!(trace::TRACE_ENG_DESYNC);
+            }
+            let line = a.stmt_lines.get(&(stmt as *const Stmt)).copied();
+            a.ledger.diagnostics.push(match line {
+                Some(l) => format!("line {l}: {msg}"),
+                None => msg,
+            });
+            // a top-level checker error stops the walk, but the closing
+            // moves still run — the standalone pass did the same
+            break;
+        }
+    }
+    if checker_ran {
+        chk.finish(&mut a.lattice.unknowns);
+    }
+    let chk_facts = chk.into_facts();
+
+    if let Err(err) = a.decide_root_exit(rec) {
+        a.ledger.diagnostics.push(err.0);
+    }
+    a.plan_stmt_temp_frees(ctx.ast);
+
+    let mut facts = a
+        .into_recorded(adopt_lines, static_elems, elems_diags, chk_facts)
+        .into_facts();
     facts.fn_touched = crate::analysis::scan_fn_touched(ctx.ast);
+    // the row-read discipline is the analysis's final acceptance gate
+    facts.check_row_reads();
     facts
 }
 
 struct Recorded {
-    recording: bool,
     ledger: Ledger,
     lattice: LatticeState,
     own: OwnershipState,
-    holds: HoldsState,
     reads: ReadSideState,
     layout: LayoutFactsState,
     stmt_lines: BTreeMap<*const Stmt, usize>,
     ctor_lines: Vec<usize>,
     fn_scope_keys: BTreeMap<*const Expr, (*const Stmt, u8)>,
-    fn_body_sites: BTreeSet<usize>,
-    fn_param_sites: BTreeSet<usize>,
     join_tags: BTreeMap<*const Stmt, bool>,
     call_tags: BTreeMap<*const Expr, Vec<bool>>,
     adopt_lines: BTreeMap<String, usize>,
+    /// the single elem table, computed once post-fixpoint — the same
+    /// values the checker checked against ride out in the facts
+    static_elems: Vec<crate::shape::Ty>,
+    /// the elem table's own diagnostics (pending/missing/conflict/
+    /// nested-store/cyclic), appended after the walk's
+    elems_diags: Vec<String>,
+    chk: checker::CheckFacts,
 }
 
 impl Analyzer {
-    fn into_recorded(self, adopt_lines: BTreeMap<String, usize>) -> Recorded {
+    fn into_recorded(
+        self,
+        adopt_lines: BTreeMap<String, usize>,
+        static_elems: Vec<crate::shape::Ty>,
+        elems_diags: Vec<String>,
+        chk: checker::CheckFacts,
+    ) -> Recorded {
         Recorded {
-            recording: true,
             ledger: self.ledger,
             lattice: self.lattice,
             own: self.own,
-            holds: self.holds,
             reads: self.reads,
             layout: self.layout,
             stmt_lines: self.stmt_lines,
             ctor_lines: self.ctor_lines,
             fn_scope_keys: self.fn_scope_keys,
-            fn_body_sites: self.fn_body_sites,
-            fn_param_sites: self.fn_param_sites,
             join_tags: self.join_tags,
             call_tags: self.call_tags,
             adopt_lines,
+            static_elems,
+            elems_diags,
+            chk,
         }
     }
-}
 
-impl Recorded {
-    fn into_facts(mut self, n: usize) -> ShapeFacts {
-        let mut elems: Vec<crate::ast::StaticType> =
-            (0..n).map(crate::ast::StaticType::Unknown).collect();
+    /// The static-elem table, computed BEFORE the recorded pass so the
+    /// checker checks against the exact table the assembled facts will
+    /// carry. Diagnostics land in the ledger and are
+    /// drained out here (the walk clears it anyway).
+    fn compute_static_elems(&mut self, n: usize) -> (Vec<crate::shape::Ty>, Vec<String>) {
+        let mut elems: Vec<crate::shape::Ty> = (0..n).map(crate::shape::Ty::Unknown).collect();
 
         let site_ids: Vec<usize> = self.lattice.sites.values().copied().collect();
         for id in site_ids {
             if self.lattice.needed[id] && self.lattice.site_elem[id] == Pending {
                 if self.fn_body_sites.contains(&id) || self.fn_param_sites.contains(&id) {
-                    signal!(self.recording, trace::TRACE_ANALYZE_PENDING);
-                    elems[id] = crate::ast::StaticType::Unknown(id);
+                    signal!(trace::TRACE_ANALYZE_PENDING);
+                    elems[id] = crate::shape::Ty::Unknown(id);
                     continue;
                 }
                 if self.reads.boundary_fed.contains(&id) {
-                    signal!(self.recording, trace::TRACE_ANALYZE_PENDING);
-                    elems[id] = crate::ast::StaticType::Unknown(id);
+                    signal!(trace::TRACE_ANALYZE_PENDING);
+                    elems[id] = crate::shape::Ty::Unknown(id);
                     continue;
                 }
-                signal!(self.recording, trace::TRACE_ANALYZE_MISSING_VALUE);
+                signal!(trace::TRACE_ANALYZE_MISSING_VALUE);
                 let line = self.ctor_lines[id];
                 self.ledger.diagnostics.push(format!(
                     "line {line}: Type Error: a table is read before it is ever given a value \
                      (table site #{id})"
                 ));
-                elems[id] = crate::ast::StaticType::Unknown(id);
+                elems[id] = crate::shape::Ty::Unknown(id);
             } else if self.lattice.site_elem[id] == Pending {
-                signal!(self.recording, trace::TRACE_ANALYZE_PENDING);
-                elems[id] = crate::ast::StaticType::Unknown(id);
+                signal!(trace::TRACE_ANALYZE_PENDING);
+                elems[id] = crate::shape::Ty::Unknown(id);
             } else {
-                signal!(self.recording, trace::TRACE_ANALYZE_RESOLVED);
+                signal!(trace::TRACE_ANALYZE_RESOLVED);
                 elems[id] = self.elem_type_of_tbl(id);
             }
         }
 
         for (&site, name) in &self.reads.nested_store_bases {
             if !self.reads.tbl_value_stores.contains(&site) {
-                signal!(self.recording, trace::TRACE_STMT_IDX_NULL_ROW);
+                signal!(trace::TRACE_STMT_IDX_NULL_ROW);
                 let line = self.ctor_lines[site];
                 self.ledger.diagnostics.push(format!(
                     "line {line}: Type Error: cannot index a row of '{name}' — no table is ever \
@@ -551,7 +670,7 @@ impl Recorded {
         }
 
         for (base, (value, line)) in &self.holds.cyclic_stores {
-            signal!(self.recording, trace::TRACE_FAIL_CYCLIC_STORE);
+            signal!(trace::TRACE_FAIL_CYCLIC_STORE);
             self.ledger.diagnostics.push(format!(
                 "line {line}: Type Error: cyclic table store — '{value}' stored into '{base}' \
                  would create a table cycle (glm's element types are finite)"
@@ -562,6 +681,21 @@ impl Recorded {
             propagate_elem_down(&mut elems, &self.lattice.child_sites, id);
         }
 
+        let elems_diags: Vec<String> = std::mem::take(&mut self.ledger.diagnostics);
+        (elems, elems_diags)
+    }
+}
+
+impl Recorded {
+    fn into_facts(mut self) -> ShapeFacts {
+        let mut diagnostics = std::mem::take(&mut self.ledger.diagnostics);
+        diagnostics.append(&mut self.elems_diags);
+        diagnostics.append(&mut self.chk.diagnostics);
+
+        // the substitution fact is derived from the lattice's constraint
+        // store — one home for every pin the checking half recorded
+        let substitutions = self.lattice.unknowns.take_subs();
+
         let mut cell_children = self.lattice.child_sites.clone();
         for (parent, kids) in std::mem::take(&mut self.reads.row_links) {
             cell_children.entry(parent).or_default().extend(kids);
@@ -569,8 +703,8 @@ impl Recorded {
 
         ShapeFacts {
             sites: self.lattice.sites,
-            elems,
-            boundary_elem: None,
+            elems: self.static_elems,
+            boundary_elem: self.chk.boundary_elem,
             layouts: self.layout.verdicts,
             free_sites: self.own.free_sites,
             free_keeps: self.own.free_keeps,
@@ -580,14 +714,15 @@ impl Recorded {
             cond_temp_frees: self.own.cond_temp_frees,
             arm_temp_frees: self.own.arm_temp_frees,
             ret_path_frees: self.own.ret_path_frees,
+            break_path_frees: self.own.break_path_frees,
             ret_path_keep_frees: self.own.ret_path_keep_frees,
             ret_path_keep_temps: self.own.ret_path_keep_temps,
             rebind_frees: self.own.rebind_grants,
             move_poisons: self.own.move_poisons,
             name_dense: self.layout.name_dense,
             stored_ctor_parents: self.own.stored_ctor_parents,
-            substitutions: BTreeMap::new(),
-            local_types: BTreeMap::new(),
+            substitutions,
+            local_types: self.chk.local_types,
             row_reads: std::mem::take(&mut self.reads.row_reads),
             cell_children,
             fn_scope_keys: self.fn_scope_keys,
@@ -600,12 +735,15 @@ impl Recorded {
             arm_do_exit_frees: self.own.arm_do_exit_frees,
             arm_root_exit_frees: self.own.arm_root_exit_frees,
             fn_touched: BTreeMap::new(),
-            fn_defs: BTreeMap::new(),
-            call_defs: BTreeMap::new(),
+            fn_defs: self.chk.fn_defs,
+            call_defs: self.chk.call_defs,
+            ffi_verbs: self.chk.ffi_verbs,
+            index_key_lanes: self.chk.index_key_lanes,
+            access_elems: self.chk.access_elems,
             stmt_lines: self.stmt_lines,
             ctor_lines: self.ctor_lines,
             adopt_lines: self.adopt_lines,
-            diagnostics: self.ledger.diagnostics,
+            diagnostics,
         }
     }
 }

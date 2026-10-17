@@ -36,6 +36,9 @@ impl Analyzer {
         key: (*const Stmt, u8),
     ) -> Result<(), ShapeError> {
         self.fn_scope_keys.insert(fn_ptr, key);
+        // anchor the function's return node in the lattice's unknown
+        // store — the checking half's bind_function reads the same node
+        self.lattice.unknowns.ensure_fn_ret(fn_ptr);
         collect_body_sites(body, &self.lattice.sites, &mut self.fn_body_sites);
         self.fn_params.insert(fn_ptr, params.to_vec());
         let stored: BTreeSet<String> = collect_stored_bases(body)

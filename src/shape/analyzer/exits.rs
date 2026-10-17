@@ -64,6 +64,14 @@ impl Analyzer {
             if roots.is_empty() {
                 continue;
             }
+            // A value-kind binding that rides table sites is a cell read
+            // (dot access or index), not a header holder — cells can only
+            // hold packed scalars, so there is nothing for it to carry or
+            // free at scope exit.
+            if value_kind(&shape.ty) {
+                signal!(true, trace::TRACE_DO_EXIT_SCALAR_SKIP);
+                continue;
+            }
             let ghosts: Vec<usize> = roots.iter().copied().filter(is_ghost).collect();
             let sites: Vec<usize> = roots.iter().copied().filter(|s| !is_ghost(s)).collect();
             if split && !ghosts.is_empty() && !sites.is_empty() {
@@ -314,6 +322,44 @@ impl Analyzer {
         }
     }
 
+    /// Mirrors plan_return_exits, but unwinds only down to and including the
+    /// enclosing LOOP body scope (not the function entry): the loop's exit
+    /// block still runs inside the scopes that own the rest, and the loop
+    /// itself (or a wrapping Do) cleans them up on normal exit. Splits nothing
+    /// (compute_scope_frees(depth, false) folds arm frees in — breaks carry no
+    /// kept value, so there is no arm-split need).
+    pub(super) fn plan_break_exits(&mut self, stmt: *const Stmt) {
+        self.own.break_path_frees.remove(&stmt);
+        let Some(&entry) = self.loop_scope_entries.last() else {
+            return;
+        };
+        // A break inside an inline function body never binds to the
+        // outer loop — the checker rejects it (loop_depth resets in
+        // function bodies). If one is walked anyway, its scopes sit
+        // inside the function's window (fn_scope_entries), below the
+        // loop's body entry, and there is nothing this loop can plan
+        // for it.
+        if let Some(&fn_entry) = self.fn_scope_entries.last()
+            && fn_entry >= entry
+        {
+            return;
+        }
+        let mut plain: Vec<super::facts::DoExitFree> = Vec::new();
+        for depth in (entry..self.walk.scopes.len()).rev() {
+            if let Ok((frees, _)) = self.compute_scope_frees(depth, false) {
+                plain.extend(frees);
+            }
+        }
+        plain.sort_by_key(|f| (f.site, f.carrier.clone()));
+        plain.dedup_by_key(|f| (f.site, f.carrier.clone()));
+        if !plain.is_empty() {
+            for _ in &plain {
+                signal!(true, trace::TRACE_RET_PATH_FREE_SITE);
+            }
+            self.own.break_path_frees.insert(stmt, plain);
+        }
+    }
+
     pub(super) fn decide_root_exit(&mut self, rec: Gate) -> Result<(), ShapeError> {
         if !rec.on() {
             return Ok(());
@@ -367,6 +413,7 @@ impl Analyzer {
                     self.collect_temp_sites(value, Fate::Escapes, &mut sites);
                 }
                 Stmt::Return { .. } => {}
+                Stmt::Break => {}
                 Stmt::While { condition, body } => {
                     self.plan_cond_temp_frees(condition, s);
                     self.plan_stmt_temp_frees(body);
@@ -445,6 +492,7 @@ impl Analyzer {
                     self.plan_arm_temp_frees_in_expr(e);
                 }
             }
+            Stmt::Break => {}
         }
     }
 
@@ -603,6 +651,7 @@ impl Analyzer {
                     self.plan_fn_bodies_in_expr(e);
                 }
             }
+            Stmt::Break => {}
         }
     }
 

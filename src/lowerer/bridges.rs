@@ -1,21 +1,11 @@
 use super::{IrLowerer, LowerError};
-use crate::ast::StaticType;
+
 use crate::ir::{
     Any, AnyReg, BlockId, Bool, Byte, CellRepr, CellTy, CellVal, CmpRegs, CmpRepr, Float,
     Instruction, Int, MoveRegs, NumRegs, NumRegsRhs, NumRepr, PackRegs, PhiRegs, PhiRepr, Ptr, Reg,
-    RegKind, Terminator,
+    RegKind, TableKey, Terminator,
 };
-pub(super) fn elem_of_ty(ty: &StaticType) -> Result<StaticType, LowerError> {
-    match ty {
-        StaticType::Table(elem) => Ok((**elem).clone()),
-        _ => Err(LowerError(
-            "Lower Error: a table operand position received a non-table — \
-             the checker and the lowerer disagree"
-                .into(),
-        )),
-    }
-}
-
+use crate::shape::Ty;
 pub(super) fn int_of(r: AnyReg) -> Result<Reg<Int>, LowerError> {
     match r {
         AnyReg::Int(x) => Ok(x),
@@ -40,7 +30,34 @@ pub(super) fn bool_of(r: AnyReg) -> Result<Reg<Bool>, LowerError> {
 pub(super) fn ptr_of(r: AnyReg) -> Result<Reg<Ptr>, LowerError> {
     match r {
         AnyReg::Ptr(x) => Ok(x),
-        _ => Err(repr_mismatch("a table-header operand position")),
+        _ => {
+            crate::glm_dbgln!("[lower] ptr_of got {r:?}");
+            Err(repr_mismatch("a table-header operand position"))
+        }
+    }
+}
+
+/// The pooled-handle dual: a String-typed value may physically carry
+/// either string face — Str (a literal, a normalized binding) or Ptr
+/// (a cell read, a phi, a zero value) — and both are the same pooled
+/// pointer. ONE definition for every consumer that needs the string
+/// register behind a string-ish operand; the remaining arms are the
+/// desync tell (a non-pointer repr in a String position).
+pub(super) fn str_lane(r: AnyReg) -> Result<Reg<crate::ir::Str>, LowerError> {
+    match r {
+        AnyReg::Str(s) => Ok(s),
+        AnyReg::Ptr(p) => Ok(Reg::new(p.id)),
+        _ => Err(repr_mismatch("a string operand position")),
+    }
+}
+
+/// The same dual, pointer face: for consumers that want the raw pool
+/// handle (ffi lanes, pointer comparisons).
+pub(super) fn pooled_ptr_of(r: AnyReg) -> Result<Reg<Ptr>, LowerError> {
+    match r {
+        AnyReg::Ptr(p) => Ok(p),
+        AnyReg::Str(s) => Ok(Reg::new(s.id)),
+        _ => Err(repr_mismatch("a pooled-handle operand position")),
     }
 }
 
@@ -48,6 +65,25 @@ pub(super) fn any_of(r: AnyReg) -> Result<Reg<Any>, LowerError> {
     match r {
         AnyReg::Any(x) => Ok(x),
         _ => Err(repr_mismatch("a dynamic-cell operand position")),
+    }
+}
+
+/// String repr normalization: a value whose static type is String always
+/// carries the Str tag, whatever physical path produced the register —
+/// cell reads, phis, and zero values all emit the pointer kind, so the
+/// tag is re-derived from the type. Enforced at the variable-table choke
+/// points (`declare_var`/`update_var` — every binding read is uniform)
+/// and at the value-materialization points that bypass a binding
+/// (`table_get`, inline-return phis); everywhere else the invariant
+/// already holds.
+pub(super) fn string_repr(ty: &Ty, reg: AnyReg) -> AnyReg {
+    if ty == &Ty::Str {
+        match reg {
+            AnyReg::Ptr(p) => AnyReg::Str(Reg::new(p.id)),
+            other => other,
+        }
+    } else {
+        reg
     }
 }
 
@@ -276,24 +312,25 @@ impl IrLowerer<'_> {
         &mut self,
         target: crate::ir::RegId,
         table: Reg<Ptr>,
-        index: Reg<Int>,
-        elem: &StaticType,
+        index: TableKey,
+        elem: &Ty,
     ) -> AnyReg {
-        match CellTy::of(elem) {
+        let out = match CellTy::of(elem) {
             CellTy::Int => self.get::<Int>(target, table, index),
             CellTy::Float => self.get::<Float>(target, table, index),
             CellTy::Bool => self.get::<Bool>(target, table, index),
             CellTy::Ptr => self.get::<Ptr>(target, table, index),
             CellTy::Byte => self.get::<Byte>(target, table, index),
             CellTy::Any => self.get::<crate::ir::Any>(target, table, index),
-        }
+        };
+        string_repr(elem, out)
     }
 
     fn get<E: CellRepr>(
         &mut self,
         target: crate::ir::RegId,
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
     ) -> AnyReg {
         self.emit(Instruction::TableGet(E::get(
             Reg::new(target),
@@ -306,9 +343,9 @@ impl IrLowerer<'_> {
     pub(super) fn table_set(
         &mut self,
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
         value: AnyReg,
-        elem: &StaticType,
+        elem: &Ty,
     ) -> Result<(), LowerError> {
         match value.into_cell() {
             CellVal::Int(v) => self.set(table, index, v, elem),
@@ -325,7 +362,7 @@ impl IrLowerer<'_> {
         table: Reg<Ptr>,
         index: Reg<Int>,
         value: AnyReg,
-        elem: &StaticType,
+        elem: &Ty,
         layout: crate::shape::LayoutVerdict,
     ) -> Result<(), LowerError> {
         match value.into_cell() {
@@ -341,9 +378,9 @@ impl IrLowerer<'_> {
     fn set<E: CellRepr>(
         &mut self,
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
         value: Reg<E>,
-        elem: &StaticType,
+        elem: &Ty,
     ) -> Result<(), LowerError> {
         if CellTy::of(elem) != E::TAG {
             return Err(LowerError(
@@ -361,7 +398,7 @@ impl IrLowerer<'_> {
         table: Reg<Ptr>,
         index: Reg<Int>,
         value: Reg<E>,
-        elem: &StaticType,
+        elem: &Ty,
         layout: crate::shape::LayoutVerdict,
     ) -> Result<(), LowerError> {
         if CellTy::of(elem) != E::TAG {
@@ -383,9 +420,9 @@ impl IrLowerer<'_> {
     pub(super) fn promote_to_float(
         &mut self,
         reg: AnyReg,
-        ty: &StaticType,
+        ty: &Ty,
     ) -> Result<Reg<Float>, LowerError> {
-        if matches!(ty, StaticType::Integer) {
+        if matches!(ty, Ty::Int) {
             let source = int_of(reg)?;
             let target = self.next_reg();
             self.emit(Instruction::Sitofp {

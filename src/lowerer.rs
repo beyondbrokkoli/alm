@@ -2,15 +2,17 @@
 
 mod bridges;
 
-use crate::ast::{BinOp, CtorKey, Expr, StaticType, Stmt, UnOp};
+use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp, has_break};
 use crate::ir::{
     AnyReg, BasicBlock, BlockId, Bool, DbgBind, Instruction, Int, IrProgram, Ptr, Reg, RegId,
-    RegKind, SourceLoc, Terminator, repr_of,
+    RegKind, SourceLoc, TableKey, Terminator, repr_of,
 };
-use crate::shape::{ArmFreeEntry, DoExitFree, Keep, LayoutVerdict, ShapeFacts, TagSrc};
+use crate::shape::{
+    ArmFreeEntry, DoExitFree, FfiVerb, Keep, KeyLane, LayoutVerdict, ShapeFacts, TagSrc, Ty,
+};
 use bridges::{
-    NumPair, NumSingle, OrdPair, any_of, bool_of, elem_of_ty, int_of, num_pair, num_single,
-    ord_pair, phi_of, phi_push, ptr_of,
+    NumPair, NumSingle, OrdPair, any_of, bool_of, int_of, num_pair, num_single, ord_pair, phi_of,
+    phi_push, pooled_ptr_of, ptr_of, str_lane, string_repr,
 };
 use glm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,30 +25,31 @@ impl LowerError {
     }
 }
 
-pub fn boundary_elem_of(elem: StaticType) -> glm_rt::GlmElem {
+pub fn boundary_elem_of(elem: Ty) -> glm_rt::GlmElem {
     match elem {
-        StaticType::Float => glm_rt::GlmElem::Float,
-        StaticType::Boolean => glm_rt::GlmElem::Boolean,
-        StaticType::String => glm_rt::GlmElem::String,
-        StaticType::Any => glm_rt::GlmElem::Any,
-        StaticType::Integer | StaticType::Table(_) | StaticType::Unknown(_) => {
-            glm_rt::GlmElem::Integer
-        }
-        StaticType::Ffi | StaticType::FfiLib | StaticType::Coro => glm_rt::GlmElem::Integer,
+        Ty::Flt => glm_rt::GlmElem::Float,
+        Ty::Bool => glm_rt::GlmElem::Boolean,
+        Ty::Str => glm_rt::GlmElem::String,
+        Ty::Any => glm_rt::GlmElem::Any,
+        Ty::Int | Ty::Tbl(_) | Ty::Unknown(_) => glm_rt::GlmElem::Integer,
+        Ty::Ffi | Ty::FfiLib | Ty::Coro => glm_rt::GlmElem::Integer,
+        // the boundary elem fact is a resolved checker value — flow
+        // state never rides the artifact path
+        Ty::Pending | Ty::Conflict => unreachable!("flow state never rides the artifact path"),
     }
 }
 
-fn join_phi_ty(a: &StaticType, b: &StaticType) -> StaticType {
+fn join_phi_ty(a: &Ty, b: &Ty) -> Ty {
     if a == b {
         return a.clone();
     }
-    let heap = |t: &StaticType| matches!(t, StaticType::Table(_));
+    let heap = |t: &Ty| matches!(t, Ty::Tbl(_));
     if heap(a) { a.clone() } else { b.clone() }
 }
 
 enum ReturnKind {
     Boundary,
-    Inline { ty: StaticType },
+    Inline { ty: Ty },
 }
 
 struct ReturnCtx {
@@ -58,20 +61,30 @@ struct ReturnCtx {
 #[derive(Clone)]
 struct Local {
     reg: AnyReg,
-    ty: StaticType,
+    ty: Ty,
     layout: LayoutVerdict,
 }
 
 #[derive(Clone)]
 struct TypedReg {
     reg: AnyReg,
-    ty: StaticType,
+    ty: Ty,
 }
 
 struct LoopCtx {
     guard_reg: RegId,
     reserved: Vec<RegId>,
     nested_fills: Vec<(String, Reg<Int>)>,
+}
+
+/// One per ACTIVE loop (pushed for every While, not just fill-converted
+/// ones): breaks record (block, snapshot of phi_order locals) and the exit
+/// block gains one phi per loop-carried var ONLY when breaks exist — so
+/// break-free while loops lower bit-for-bit as before.
+struct BreakCtx {
+    exit_block: BlockId,
+    phi_vars: Vec<String>,
+    breaks: Vec<(BlockId, Vec<Local>)>,
 }
 
 struct FreeHandles {
@@ -99,6 +112,7 @@ pub struct IrLowerer<'a> {
 
     ctrl_depth: u32,
     return_ctxs: Vec<ReturnCtx>,
+    break_ctxs: Vec<BreakCtx>,
     inline_stack: Vec<*const Expr>,
 }
 
@@ -124,6 +138,7 @@ impl<'a> IrLowerer<'a> {
             call_tag_regs: BTreeMap::new(),
             ctrl_depth: 0,
             return_ctxs: Vec::new(),
+            break_ctxs: Vec::new(),
             inline_stack: Vec::new(),
         }
     }
@@ -363,7 +378,14 @@ impl<'a> IrLowerer<'a> {
         }
     }
 
-    fn declare_var(&mut self, name: String, reg: AnyReg, ty: StaticType, layout: LayoutVerdict) {
+    // The String repr invariant lives HERE, at the two binding choke
+    // points: a value whose static type is String always enters (and
+    // therefore leaves) the variable table tagged Str, whatever physical
+    // path produced the register (cell reads, phis, nulls all emit the
+    // pointer kind). Consumers can rely on it; producers need no
+    // per-site normalization.
+    fn declare_var(&mut self, name: String, reg: AnyReg, ty: Ty, layout: LayoutVerdict) {
+        let reg = string_repr(&ty, reg);
         self.push_dbg_bind(&name, reg, None);
         self.scopes
             .last_mut()
@@ -375,9 +397,10 @@ impl<'a> IrLowerer<'a> {
         &mut self,
         name: &str,
         reg: AnyReg,
-        ty: StaticType,
+        ty: Ty,
         layout: LayoutVerdict,
     ) -> Result<(), LowerError> {
+        let reg = string_repr(&ty, reg);
         for scope in self.scopes.iter_mut().rev() {
             if let Some(local) = scope.get_mut(name) {
                 local.reg = reg;
@@ -410,7 +433,7 @@ impl<'a> IrLowerer<'a> {
 
     fn holds_value(&self, name: &str) -> bool {
         self.read_var(name)
-            .is_ok_and(|local| !matches!(local.ty, StaticType::Unknown(_)))
+            .is_ok_and(|local| !matches!(local.ty, Ty::Unknown(_)))
     }
 
     fn null_moved(&mut self, src: &str) -> Result<(), LowerError> {
@@ -446,11 +469,8 @@ impl<'a> IrLowerer<'a> {
             "arg".to_string(),
             Local {
                 reg: AnyReg::Ptr(Reg::new(args_reg)),
-                ty: StaticType::Table(Box::new(
-                    self.shape
-                        .boundary_elem
-                        .clone()
-                        .unwrap_or(StaticType::Unknown(0)),
+                ty: Ty::Tbl(Box::new(
+                    self.shape.boundary_elem.clone().unwrap_or(Ty::Unknown(0)),
                 )),
                 layout: LayoutVerdict::default(),
             },
@@ -558,12 +578,12 @@ impl<'a> IrLowerer<'a> {
             };
             return match ctx.kind {
                 ReturnKind::Boundary => Ok(None),
-                ReturnKind::Inline { .. } => Ok(Some(self.zero_reg(kind))),
+                ReturnKind::Inline { ty } => Ok(Some(string_repr(&ty, self.zero_reg(kind)))),
             };
         };
-        let (kind, boundary) = match &ctx.kind {
-            ReturnKind::Boundary => (RegKind::Ptr, true),
-            ReturnKind::Inline { ty } => (repr_of(ty), false),
+        let (kind, boundary, ret_ty) = match &ctx.kind {
+            ReturnKind::Boundary => (RegKind::Ptr, true, None),
+            ReturnKind::Inline { ty } => (repr_of(ty), false, Some(ty)),
         };
         let mut args = ctx.args;
         if self.blocks[self.current_block].terminator.is_none() {
@@ -574,7 +594,10 @@ impl<'a> IrLowerer<'a> {
                 });
                 AnyReg::Ptr(Reg::new(r))
             } else {
-                self.zero_reg(kind)
+                match ret_ty {
+                    Some(ty) => string_repr(ty, self.zero_reg(kind)),
+                    None => self.zero_reg(kind),
+                }
             };
             self.terminate(Terminator::Jump(exit));
             args.push((self.current_block, fallthrough));
@@ -587,7 +610,85 @@ impl<'a> IrLowerer<'a> {
             self.terminate(Terminator::Return(Reg::new(phi_reg)));
             return Ok(None);
         }
-        Ok(Some(kind.reg(phi_reg)))
+        Ok(Some(match ret_ty {
+            Some(ty) => string_repr(ty, kind.reg(phi_reg)),
+            None => kind.reg(phi_reg),
+        }))
+    }
+
+    /// Table keys: a String literal folds to its negative interned
+    /// identity at COMPILE time (StrKeyConst — the whole point of
+    /// hash-derived keys: zero runtime work for `t.x` / `t["x"]` /
+    /// record fields); a String-typed dynamic key (`t[s]`) lowers to
+    /// glm_str_key (StrKey — one prefix load off the pooled handle);
+    /// anything else is the existing Integer lane. The returned
+    /// TableKey keeps the two lanes apart at the type level: only the
+    /// two derivations can construct the Str lane, so no user integer
+    /// can address a record cell. WHICH lane a dynamic key rides is
+    /// the checker's recorded decision (`index_key_lanes`, signal 178)
+    /// — this walk consumes it, never re-derives it.
+    fn lower_index_key(&mut self, key: &Expr) -> Result<TableKey, LowerError> {
+        if let Expr::String(s) = key {
+            let r = self.next_reg();
+            self.emit(Instruction::StrKeyConst {
+                target: Reg::new(r),
+                val: glm_rt::rt::str_key_of_bytes(s.as_bytes()),
+            });
+            return Ok(TableKey::Str(Reg::new(r)));
+        }
+        let lane = *self
+            .shape
+            .index_key_lanes
+            .get(&(key as *const Expr))
+            .ok_or_else(|| {
+                LowerError(
+                    "Lower Error: an index key carries no recorded lane — \
+                     the checker and the lowerer disagree"
+                        .into(),
+                )
+            })?;
+        let TypedReg { reg, .. } = self.lower_expr(key, None)?;
+        match lane {
+            KeyLane::Str => {
+                // a String read out of a cell (or joined at a phi) carries
+                // the pointer face; the two are the same pooled handle
+                let s = str_lane(reg)?;
+                let r = self.next_reg();
+                self.emit(Instruction::StrKey {
+                    target: Reg::new(r),
+                    s,
+                });
+                signal!(trace::TRACE_LOWER_KEY_LANE);
+                Ok(TableKey::Str(Reg::new(r)))
+            }
+            KeyLane::Int => {
+                signal!(trace::TRACE_LOWER_KEY_LANE);
+                Ok(TableKey::Int(int_of(reg)?))
+            }
+        }
+    }
+
+    /// The elem face of one access base, consumed straight from the
+    /// checker's recorded decision (signal 180's fact) — the lowerer
+    /// never re-derives the elem from its own type walk. That
+    /// re-derivation was the last elem seam: on adoption-bridged names
+    /// the two walks could answer different kinds, and only the runtime
+    /// caught up with them.
+    fn elem_face_of(&self, obj: &Expr) -> Result<Ty, LowerError> {
+        let elem = self
+            .shape
+            .access_elems
+            .get(&(obj as *const Expr))
+            .cloned()
+            .ok_or_else(|| {
+                LowerError(
+                    "Lower Error: a table access carries no recorded elem face — \
+                     the checker and the lowerer disagree"
+                        .into(),
+                )
+            })?;
+        signal!(trace::TRACE_LOWER_ELEM_FACE);
+        Ok(elem)
     }
 
     fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), LowerError> {
@@ -617,44 +718,49 @@ impl<'a> IrLowerer<'a> {
                         })?;
                     let reg_id = self.next_reg();
                     let reg = match &ty {
-                        StaticType::Integer => {
+                        Ty::Int => {
                             self.emit(Instruction::LoadInt {
                                 target: Reg::new(reg_id),
                                 val: 0,
                             });
                             AnyReg::Int(Reg::new(reg_id))
                         }
-                        StaticType::Float => {
+                        Ty::Flt => {
                             self.emit(Instruction::LoadFloat {
                                 target: Reg::new(reg_id),
                                 val: 0.0,
                             });
                             AnyReg::Float(Reg::new(reg_id))
                         }
-                        StaticType::Boolean => {
+                        Ty::Bool => {
                             self.emit(Instruction::LoadBool {
                                 target: Reg::new(reg_id),
                                 val: false,
                             });
                             AnyReg::Bool(Reg::new(reg_id))
                         }
-                        StaticType::Table(_) | StaticType::String | StaticType::Unknown(_) => {
+                        Ty::Tbl(_) | Ty::Unknown(_) | Ty::Str => {
                             self.emit(Instruction::LoadNull {
                                 target: Reg::new(reg_id),
                             });
                             AnyReg::Ptr(Reg::new(reg_id))
                         }
-                        StaticType::Ffi | StaticType::FfiLib | StaticType::Coro => {
+                        Ty::Ffi | Ty::FfiLib | Ty::Coro => {
                             self.emit(Instruction::LoadNull {
                                 target: Reg::new(reg_id),
                             });
                             AnyReg::Ptr(Reg::new(reg_id))
                         }
-                        StaticType::Any => {
+                        Ty::Any => {
                             self.emit(Instruction::LoadAnyZero {
                                 target: Reg::new(reg_id),
                             });
                             AnyReg::Any(Reg::new(reg_id))
+                        }
+                        // local_types is a resolved constraint-store value —
+                        // flow state never rides the artifact path
+                        Ty::Pending | Ty::Conflict => {
+                            unreachable!("flow state never rides the artifact path")
                         }
                     };
                     bindings.push((reg, ty, LayoutVerdict::default()));
@@ -768,30 +874,32 @@ impl<'a> IrLowerer<'a> {
                 self.emit_stmt_temp_frees(stmt);
             }
             Stmt::IndexAssign { obj, key, value } => {
-                let TypedReg {
-                    reg: t_any,
-                    ty: t_ty,
-                } = self.lower_expr(obj, None)?;
+                let TypedReg { reg: t_any, .. } = self.lower_expr(obj, None)?;
                 let t_reg = ptr_of(t_any)?;
-                let i_reg = int_of(self.lower_expr(key, None)?.reg)?;
+                let key = self.lower_index_key(key)?;
 
                 let base_name = get_base_identifier(obj);
 
-                let mut fast = false;
+                // Fill conversion: the guard rides the Integer lane, so
+                // only TableKey::Int can match a fill context — a record
+                // store is never fast-pathed.
+                let mut fast_guard: Option<Reg<Int>> = None;
                 let mut row_reserve: Option<(Reg<Ptr>, Reg<Int>)> = None;
-                for ctx in self.fills.loop_ctxs.iter_mut().rev() {
-                    if ctx.guard_reg == i_reg.id {
-                        if ctx.reserved.contains(&t_reg.id) {
-                            fast = true;
-                            break;
-                        } else if let Some(name) = base_name
-                            && let Some((_, bound)) =
-                                ctx.nested_fills.iter().find(|(n, _)| n == name)
-                        {
-                            ctx.reserved.push(t_reg.id);
-                            row_reserve = Some((t_reg, *bound));
-                            fast = true;
-                            break;
+                if let TableKey::Int(g) = key {
+                    for ctx in self.fills.loop_ctxs.iter_mut().rev() {
+                        if ctx.guard_reg == g.id {
+                            if ctx.reserved.contains(&t_reg.id) {
+                                fast_guard = Some(g);
+                                break;
+                            } else if let Some(name) = base_name
+                                && let Some((_, bound)) =
+                                    ctx.nested_fills.iter().find(|(n, _)| n == name)
+                            {
+                                ctx.reserved.push(t_reg.id);
+                                row_reserve = Some((t_reg, *bound));
+                                fast_guard = Some(g);
+                                break;
+                            }
                         }
                     }
                 }
@@ -799,9 +907,9 @@ impl<'a> IrLowerer<'a> {
                     self.emit(Instruction::TableReserve { table, bound });
                 }
 
-                let store_elem = elem_of_ty(&t_ty)?;
+                let store_elem = self.elem_face_of(obj)?;
                 let v_reg = self.lower_expr(value, None)?.reg;
-                let v_reg = if matches!(store_elem, StaticType::Any) {
+                let v_reg = if matches!(store_elem, Ty::Any) {
                     self.pack_any(v_reg)?
                 } else {
                     v_reg
@@ -814,11 +922,11 @@ impl<'a> IrLowerer<'a> {
                     }
                 }
 
-                if fast {
+                if let Some(g) = fast_guard {
                     let layout = self.lookup_layout_for(obj)?;
-                    self.table_set_fast(t_reg, i_reg, v_reg, &store_elem, layout)?;
+                    self.table_set_fast(t_reg, g, v_reg, &store_elem, layout)?;
                 } else {
-                    self.table_set(t_reg, i_reg, v_reg, &store_elem)?;
+                    self.table_set(t_reg, key, v_reg, &store_elem)?;
                 }
 
                 if matches!(value, Expr::TableCtor(_))
@@ -872,9 +980,10 @@ impl<'a> IrLowerer<'a> {
                         right: bound_expr,
                     } if as_ident(left).is_some() => {
                         let guard = as_ident(left).expect("guarded by as_ident");
-                        let stable = !free_idents(bound_expr)
-                            .iter()
-                            .any(|v| mutated_vars.contains(v) || stored_bases.contains(v));
+                        let stable = !has_break(body)
+                            && !free_idents(bound_expr)
+                                .iter()
+                                .any(|v| mutated_vars.contains(v) || stored_bases.contains(v));
                         let mut fills: BTreeSet<String> = BTreeSet::new();
                         let mut nested_fills: BTreeSet<String> = BTreeSet::new();
                         if stable {
@@ -981,8 +1090,8 @@ impl<'a> IrLowerer<'a> {
                     let mut nested_fill_regs: Vec<(String, Reg<Int>)> = Vec::new();
                     for name in names {
                         let local = self.read_var(name)?;
-                        if let StaticType::Table(inner_ty) = &local.ty
-                            && matches!(**inner_ty, StaticType::Table(_))
+                        if let Ty::Tbl(inner_ty) = &local.ty
+                            && matches!(**inner_ty, Ty::Tbl(_))
                         {
                             self.emit(Instruction::TableReserve {
                                 table: ptr_of(local.reg)?,
@@ -994,8 +1103,8 @@ impl<'a> IrLowerer<'a> {
                     for name in nested_fills {
                         if self.has_var(name) {
                             let local = self.read_var(name)?;
-                            if let StaticType::Table(inner_ty) = &local.ty
-                                && matches!(**inner_ty, StaticType::Table(_))
+                            if let Ty::Tbl(inner_ty) = &local.ty
+                                && matches!(**inner_ty, Ty::Tbl(_))
                             {
                                 self.emit(Instruction::TableReserve {
                                     table: ptr_of(local.reg)?,
@@ -1013,6 +1122,11 @@ impl<'a> IrLowerer<'a> {
                     });
                 }
 
+                self.break_ctxs.push(BreakCtx {
+                    exit_block,
+                    phi_vars: phis.iter().map(|(v, _, _)| v.clone()).collect(),
+                    breaks: Vec::new(),
+                });
                 self.current_block = body_block;
                 self.in_block(|an| {
                     for s in body {
@@ -1023,6 +1137,10 @@ impl<'a> IrLowerer<'a> {
                 if conv.is_some() {
                     self.fills.loop_ctxs.pop();
                 }
+                let break_ctx = self
+                    .break_ctxs
+                    .pop()
+                    .expect("while lowered its body with the BreakCtx pushed");
 
                 let end_of_body = self.current_block;
                 self.terminate(Terminator::Jump(header_block));
@@ -1047,6 +1165,24 @@ impl<'a> IrLowerer<'a> {
                 }
 
                 self.current_block = exit_block;
+
+                if !break_ctx.breaks.is_empty() {
+                    for (i, (var, phi_reg, pre_layout)) in phis.iter().enumerate() {
+                        let local = self.read_var(var)?;
+                        let repr = repr_of(&local.ty);
+                        let mut args = Vec::with_capacity(1 + break_ctx.breaks.len());
+                        args.push((header_block, repr.reg(*phi_reg)));
+                        let mut layout = pre_layout.join(local.layout);
+                        for (brk_block, snap) in &break_ctx.breaks {
+                            args.push((*brk_block, snap[i].reg));
+                            layout = layout.join(snap[i].layout);
+                        }
+                        let exit_phi = self.next_reg();
+                        let phi = phi_of(repr, exit_phi, args)?;
+                        self.emit(Instruction::Phi(phi));
+                        self.update_var(var, repr.reg(exit_phi), local.ty.clone(), layout)?;
+                    }
+                }
             }
             Stmt::Do { body } => self.in_do(|an| -> Result<(), LowerError> {
                 for s in body {
@@ -1067,6 +1203,37 @@ impl<'a> IrLowerer<'a> {
             Stmt::Expr { expr } => {
                 self.lower_expr(expr, None)?;
                 self.emit_stmt_temp_frees(stmt);
+            }
+            Stmt::Break => {
+                let phi_vars = self
+                    .break_ctxs
+                    .last()
+                    .ok_or_else(|| {
+                        LowerError(
+                            "Lower Error: 'break' outside of loop — \
+                             the checker and the lowerer disagree"
+                                .into(),
+                        )
+                    })?
+                    .phi_vars
+                    .clone();
+                let mut snap = Vec::with_capacity(phi_vars.len());
+                for var in &phi_vars {
+                    snap.push(self.read_var(var)?);
+                }
+                let frees = self
+                    .shape
+                    .break_path_frees
+                    .get(&(stmt as *const Stmt))
+                    .cloned()
+                    .unwrap_or_default();
+                self.emit_frees(&frees)?;
+                self.emit_stmt_temp_frees(stmt);
+                let ctx = self.break_ctxs.last_mut().expect("checked above");
+                let exit_block = ctx.exit_block;
+                ctx.breaks.push((self.current_block, snap));
+                self.terminate(Terminator::Jump(exit_block));
+                self.current_block = self.new_block();
             }
             Stmt::Return { value } => {
                 let boundary = matches!(
@@ -1222,7 +1389,7 @@ impl<'a> IrLowerer<'a> {
                     an.emit_scope_frees((stmt as *const Stmt, 0))
                 })?;
                 let then_end = self.current_block;
-                let then_regs: Vec<(String, AnyReg, StaticType, LayoutVerdict)> = phi_order
+                let then_regs: Vec<(String, AnyReg, Ty, LayoutVerdict)> = phi_order
                     .iter()
                     .map(|(name, _)| {
                         let local = self.read_var(name)?;
@@ -1249,7 +1416,7 @@ impl<'a> IrLowerer<'a> {
                     an.emit_scope_frees((stmt as *const Stmt, 1))
                 })?;
                 let else_end = self.current_block;
-                let else_regs: Vec<(String, AnyReg, StaticType, LayoutVerdict)> = phi_order
+                let else_regs: Vec<(String, AnyReg, Ty, LayoutVerdict)> = phi_order
                     .iter()
                     .map(|(name, _)| {
                         let local = self.read_var(name)?;
@@ -1312,204 +1479,137 @@ impl<'a> IrLowerer<'a> {
         }
     }
 
+    /// A dotted call lowers straight from the checker's recorded verb
+    /// (signal 176 → 177): member, arity, and operand faces were all
+    /// decided once upstream — this walk only sequences the operands.
+    /// Operands are positional: the verb names the face, `args` carries
+    /// the expressions, and both walks read the identical AST slice, so
+    /// positions cannot drift. The lone guard is the missing-fact tell:
+    /// a checker-accepted dotted call always carries a verb.
     fn lower_ffi_call(
         &mut self,
-        base: &str,
-        name: &str,
-        base_ty: &StaticType,
+        call: &Expr,
         args: &[Expr],
         reg: RegId,
     ) -> Result<TypedReg, LowerError> {
-        let ptr_lane = |r: AnyReg| -> Result<Reg<Ptr>, LowerError> {
-            match r {
-                AnyReg::Ptr(reg) => Ok(reg),
-                AnyReg::Str(reg) => Ok(Reg::new(reg.id)),
-                _ => Err(LowerError(
-                    "Lower Error: an ffi operand left the pointer repr — \
+        let verb = self
+            .shape
+            .ffi_verbs
+            .get(&(call as *const Expr))
+            .cloned()
+            .ok_or_else(|| {
+                LowerError(
+                    "Lower Error: a dotted call site carries no resolved verb — \
                      the checker and the lowerer disagree"
                         .into(),
-                )),
+                )
+            })?;
+        signal!(trace::TRACE_LOWER_FFI_VERB);
+        match verb {
+            FfiVerb::Load => {
+                let path = self.lower_expr(&args[0], None)?;
+                let path_reg = pooled_ptr_of(path.reg)?;
+                self.emit(Instruction::FfiLoad {
+                    target: Reg::new(reg),
+                    path: path_reg,
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Ptr(Reg::new(reg)),
+                    ty: Ty::FfiLib,
+                })
             }
-        };
-        match base_ty {
-            StaticType::Ffi => match name {
-                "load" => {
-                    if args.len() != 1 {
-                        return Err(LowerError(
-                            "Lower Error: ffi.load arity — the checker and the lowerer disagree"
-                                .into(),
-                        ));
-                    }
-                    let path = self.lower_expr(&args[0], None)?;
-                    let path_reg = ptr_lane(path.reg)?;
-                    self.emit(Instruction::FfiLoad {
-                        target: Reg::new(reg),
-                        path: path_reg,
-                    });
-                    Ok(TypedReg {
-                        reg: AnyReg::Ptr(Reg::new(reg)),
-                        ty: StaticType::FfiLib,
-                    })
-                }
-                "arg_kind" => {
-                    if args.len() != 1 {
-                        return Err(LowerError(
-                            "Lower Error: ffi.arg_kind arity — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        ));
-                    }
-                    let lib = self.lower_expr(&args[0], None)?;
-                    let lib_reg = ptr_lane(lib.reg)?;
-                    self.emit(Instruction::FfiArgKind {
-                        target: Reg::new(reg),
-                        lib: lib_reg,
-                    });
-                    Ok(TypedReg {
-                        reg: AnyReg::Int(Reg::new(reg)),
-                        ty: StaticType::Integer,
-                    })
-                }
-                "cdef" => {
-                    if args.len() != 1 {
-                        return Err(LowerError(
-                            "Lower Error: ffi.cdef arity — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        ));
-                    }
-                    self.emit(Instruction::LoadNull {
-                        target: Reg::new(reg),
-                    });
-                    Ok(TypedReg {
-                        reg: AnyReg::Ptr(Reg::new(reg)),
-                        ty: StaticType::Ffi,
-                    })
-                }
-                _ => Err(LowerError(format!(
-                    "Lower Error: unknown ffi member '{name}' — \
-                     the checker and the lowerer disagree"
-                ))),
-            },
-            StaticType::Coro => match name {
-                "create" => {
-                    if args.len() != 1 {
-                        return Err(LowerError(
-                            "Lower Error: coroutine.create arity — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        ));
-                    }
-                    let lib = self.lower_expr(&args[0], None)?;
-                    let lib_reg = ptr_lane(lib.reg)?;
-                    self.emit(Instruction::CoroCreate {
-                        target: Reg::new(reg),
-                        lib: lib_reg,
-                    });
-                    Ok(TypedReg {
-                        reg: AnyReg::Int(Reg::new(reg)),
-                        ty: StaticType::Integer,
-                    })
-                }
-                "resume" => {
-                    if args.len() != 2 {
-                        return Err(LowerError(
-                            "Lower Error: coroutine.resume arity — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        ));
-                    }
-                    let handle = self.lower_expr(&args[0], None)?;
-                    let handle_reg = int_of(handle.reg)?;
-                    let tbl = self.lower_expr(&args[1], None)?;
-                    let tbl_reg = ptr_of(tbl.reg)?;
-                    self.emit(Instruction::CoroResume {
-                        target: Reg::new(reg),
-                        handle: handle_reg,
-                        args: tbl_reg,
-                    });
-                    Ok(TypedReg {
-                        reg: AnyReg::Int(Reg::new(reg)),
-                        ty: StaticType::Integer,
-                    })
-                }
-                "yield" => {
-                    if args.len() != 1 {
-                        return Err(LowerError(
-                            "Lower Error: coroutine.yield arity — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        ));
-                    }
-                    let value = self.lower_expr(&args[0], None)?;
-                    let value_reg = int_of(value.reg)?;
-                    self.emit(Instruction::CoroYield {
-                        target: Reg::new(reg),
-                        value: value_reg,
-                    });
-                    Ok(TypedReg {
-                        reg: AnyReg::Int(Reg::new(reg)),
-                        ty: StaticType::Integer,
-                    })
-                }
-                "status" => {
-                    if args.len() != 1 {
-                        return Err(LowerError(
-                            "Lower Error: coroutine.status arity — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        ));
-                    }
-                    let handle = self.lower_expr(&args[0], None)?;
-                    let handle_reg = int_of(handle.reg)?;
-                    self.emit(Instruction::CoroStatus {
-                        target: Reg::new(reg),
-                        handle: handle_reg,
-                    });
-                    Ok(TypedReg {
-                        reg: AnyReg::Str(Reg::new(reg)),
-                        ty: StaticType::String,
-                    })
-                }
-                "close" => {
-                    if args.len() != 1 {
-                        return Err(LowerError(
-                            "Lower Error: coroutine.close arity — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        ));
-                    }
-                    let handle = self.lower_expr(&args[0], None)?;
-                    let handle_reg = int_of(handle.reg)?;
-                    self.emit(Instruction::CoroClose {
-                        target: Reg::new(reg),
-                        handle: handle_reg,
-                    });
-                    Ok(TypedReg {
-                        reg: AnyReg::Int(Reg::new(reg)),
-                        ty: StaticType::Integer,
-                    })
-                }
-                _ => Err(LowerError(format!(
-                    "Lower Error: unknown coroutine member '{name}' — \
-                     the checker and the lowerer disagree"
-                ))),
-            },
-            StaticType::FfiLib => {
-                if args.len() != 1 {
-                    return Err(LowerError(
-                        "Lower Error: ffi drive-call arity — \
-                         the checker and the lowerer disagree"
-                            .into(),
-                    ));
-                }
-                let local = self.read_var(base)?;
-                let lib_reg = ptr_lane(local.reg)?;
+            FfiVerb::ArgKind => {
+                let lib = self.lower_expr(&args[0], None)?;
+                let lib_reg = pooled_ptr_of(lib.reg)?;
+                self.emit(Instruction::FfiArgKind {
+                    target: Reg::new(reg),
+                    lib: lib_reg,
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Int(Reg::new(reg)),
+                    ty: Ty::Int,
+                })
+            }
+            FfiVerb::Cdef => {
+                self.emit(Instruction::LoadNull {
+                    target: Reg::new(reg),
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Ptr(Reg::new(reg)),
+                    ty: Ty::Ffi,
+                })
+            }
+            FfiVerb::CoroCreate => {
+                let lib = self.lower_expr(&args[0], None)?;
+                let lib_reg = pooled_ptr_of(lib.reg)?;
+                self.emit(Instruction::CoroCreate {
+                    target: Reg::new(reg),
+                    lib: lib_reg,
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Int(Reg::new(reg)),
+                    ty: Ty::Int,
+                })
+            }
+            FfiVerb::CoroResume => {
+                let handle = self.lower_expr(&args[0], None)?;
+                let handle_reg = int_of(handle.reg)?;
+                let tbl = self.lower_expr(&args[1], None)?;
+                let tbl_reg = ptr_of(tbl.reg)?;
+                self.emit(Instruction::CoroResume {
+                    target: Reg::new(reg),
+                    handle: handle_reg,
+                    args: tbl_reg,
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Int(Reg::new(reg)),
+                    ty: Ty::Int,
+                })
+            }
+            FfiVerb::CoroYield => {
+                let value = self.lower_expr(&args[0], None)?;
+                let value_reg = int_of(value.reg)?;
+                self.emit(Instruction::CoroYield {
+                    target: Reg::new(reg),
+                    value: value_reg,
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Int(Reg::new(reg)),
+                    ty: Ty::Int,
+                })
+            }
+            FfiVerb::CoroStatus => {
+                let handle = self.lower_expr(&args[0], None)?;
+                let handle_reg = int_of(handle.reg)?;
+                self.emit(Instruction::CoroStatus {
+                    target: Reg::new(reg),
+                    handle: handle_reg,
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Str(Reg::new(reg)),
+                    ty: Ty::Str,
+                })
+            }
+            FfiVerb::CoroClose => {
+                let handle = self.lower_expr(&args[0], None)?;
+                let handle_reg = int_of(handle.reg)?;
+                self.emit(Instruction::CoroClose {
+                    target: Reg::new(reg),
+                    handle: handle_reg,
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Int(Reg::new(reg)),
+                    ty: Ty::Int,
+                })
+            }
+            FfiVerb::Drive { base, sym } => {
+                let local = self.read_var(&base)?;
+                let lib_reg = pooled_ptr_of(local.reg)?;
                 let arg = self.lower_expr(&args[0], None)?;
                 let arg_reg = ptr_of(arg.reg)?;
                 self.emit(Instruction::FfiCall {
                     lib: lib_reg,
-                    sym: name.to_string(),
+                    sym,
                     arg: arg_reg,
                 });
                 self.emit(Instruction::LoadNull {
@@ -1517,14 +1617,9 @@ impl<'a> IrLowerer<'a> {
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Ptr(Reg::new(reg)),
-                    ty: StaticType::Ffi,
+                    ty: Ty::Ffi,
                 })
             }
-            _ => Err(LowerError(
-                "Lower Error: a dotted call on a non-ffi base reached lowering — \
-                 the checker and the lowerer disagree"
-                    .into(),
-            )),
         }
     }
 
@@ -1539,7 +1634,7 @@ impl<'a> IrLowerer<'a> {
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Int(Reg::new(reg)),
-                    ty: StaticType::Integer,
+                    ty: Ty::Int,
                 })
             }
             Expr::Float(val) => {
@@ -1549,7 +1644,7 @@ impl<'a> IrLowerer<'a> {
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Float(Reg::new(reg)),
-                    ty: StaticType::Float,
+                    ty: Ty::Flt,
                 })
             }
             Expr::Boolean(val) => {
@@ -1559,7 +1654,7 @@ impl<'a> IrLowerer<'a> {
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Bool(Reg::new(reg)),
-                    ty: StaticType::Boolean,
+                    ty: Ty::Bool,
                 })
             }
             Expr::String(val) => {
@@ -1569,7 +1664,7 @@ impl<'a> IrLowerer<'a> {
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Str(Reg::new(reg)),
-                    ty: StaticType::String,
+                    ty: Ty::Str,
                 })
             }
             Expr::Nil => {
@@ -1581,7 +1676,7 @@ impl<'a> IrLowerer<'a> {
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Int(Reg::new(reg)),
-                    ty: StaticType::Integer,
+                    ty: Ty::Int,
                 })
             }
             Expr::SysExecCount => {
@@ -1590,7 +1685,7 @@ impl<'a> IrLowerer<'a> {
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Int(Reg::new(reg)),
-                    ty: StaticType::Integer,
+                    ty: Ty::Int,
                 })
             }
             Expr::FfiModule => {
@@ -1599,7 +1694,7 @@ impl<'a> IrLowerer<'a> {
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Ptr(Reg::new(reg)),
-                    ty: StaticType::Ffi,
+                    ty: Ty::Ffi,
                 })
             }
             Expr::CoroModule => {
@@ -1608,37 +1703,21 @@ impl<'a> IrLowerer<'a> {
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Ptr(Reg::new(reg)),
-                    ty: StaticType::Coro,
+                    ty: Ty::Coro,
                 })
             }
-            Expr::Field { .. } => Err(LowerError(
-                "Lower Error: a bare field access reached lowering — \
-                     the checker and the lowerer disagree"
-                    .into(),
-            )),
             Expr::Function { .. } => {
                 self.emit(Instruction::LoadNull {
                     target: Reg::new(reg),
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Ptr(Reg::new(reg)),
-                    ty: StaticType::Unknown(0),
+                    ty: Ty::Unknown(0),
                 })
             }
             Expr::Call { callee, args } => {
-                if let Expr::Field { obj, name } = callee.as_ref() {
-                    let base = match obj.as_ref() {
-                        Expr::Identifier(n) => n.clone(),
-                        _ => {
-                            return Err(LowerError(
-                                "Lower Error: ffi call through a non-name base — \
-                                 the checker and the lowerer disagree"
-                                    .into(),
-                            ));
-                        }
-                    };
-                    let local = self.read_var(&base)?;
-                    return self.lower_ffi_call(&base, name, &local.ty, args, reg);
+                if let Expr::Field { .. } = callee.as_ref() {
+                    return self.lower_ffi_call(expr, args, reg);
                 }
                 let fn_ptr = self
                     .shape
@@ -1747,7 +1826,7 @@ impl<'a> IrLowerer<'a> {
             Expr::TableCtor(entries) => {
                 let elem = self.shape.elem_of(expr);
 
-                if matches!(elem, crate::ast::StaticType::Unknown(_)) {
+                if matches!(elem, crate::shape::Ty::Unknown(_)) {
                     signal!(trace::TRACE_TABLE_NEW_UNDECIDED);
                 }
 
@@ -1762,13 +1841,13 @@ impl<'a> IrLowerer<'a> {
                 let is_stored_parent =
                     ctor_site.is_some_and(|s| self.shape.stored_ctor_parents.contains(s));
 
-                let contains_tables = matches!(elem, crate::ast::StaticType::Table(_))
+                let contains_tables = matches!(elem, crate::shape::Ty::Tbl(_))
                     && (has_inline_tables || is_stored_parent);
 
                 let mut elem_regs = Vec::with_capacity(entries.len());
                 for (_, e) in entries {
                     let TypedReg { reg: r, .. } = self.lower_expr(e, None)?;
-                    let r = if matches!(elem, StaticType::Any) {
+                    let r = if matches!(elem, Ty::Any) {
                         self.pack_any(r)?
                     } else {
                         r
@@ -1809,28 +1888,61 @@ impl<'a> IrLowerer<'a> {
                                 target: Reg::new(i_reg),
                                 val: *slot,
                             });
-                            self.table_set(tbl, Reg::new(i_reg), v_reg, &elem)?;
+                            self.table_set(tbl, TableKey::Int(Reg::new(i_reg)), v_reg, &elem)?;
+                        }
+                        CtorKey::Str(name) => {
+                            let k = self.next_reg();
+                            self.emit(Instruction::StrKeyConst {
+                                target: Reg::new(k),
+                                val: glm_rt::rt::str_key_of_bytes(name.as_bytes()),
+                            });
+                            self.table_set(tbl, TableKey::Str(Reg::new(k)), v_reg, &elem)?;
                         }
                         CtorKey::Expr(ke) => {
-                            let i_reg = int_of(self.lower_expr(ke, None)?.reg)?;
-                            self.table_set(tbl, i_reg, v_reg, &elem)?;
+                            // the checker runs check_index_key on ctor keys —
+                            // String keys are legal and lower to StrKey
+                            let key = self.lower_index_key(ke)?;
+                            self.table_set(tbl, key, v_reg, &elem)?;
                         }
                     }
                 }
                 Ok(TypedReg {
                     reg: AnyReg::Ptr(tbl),
-                    ty: StaticType::Table(Box::new(elem)),
+                    ty: Ty::Tbl(Box::new(elem)),
                 })
             }
             Expr::Index { obj, key } => {
-                let TypedReg {
-                    reg: t_any,
-                    ty: t_ty,
-                } = self.lower_expr(obj, None)?;
-                let i_reg = int_of(self.lower_expr(key, None)?.reg)?;
-                let target_ty = elem_of_ty(&t_ty)?;
+                let t_any = self.lower_expr(obj, None)?.reg;
+                let key = self.lower_index_key(key)?;
+                let target_ty = self.elem_face_of(obj)?;
                 let t_reg = ptr_of(t_any)?;
-                let out = self.table_get(reg, t_reg, i_reg, &target_ty);
+                let out = self.table_get(reg, t_reg, key, &target_ty);
+                Ok(TypedReg {
+                    reg: out,
+                    ty: target_ty,
+                })
+            }
+            Expr::Field { obj, name } => {
+                // Non-callee dot access is a record read: identical to
+                // t["name"]. Inlined rather than delegated to a synthetic
+                // Index expr, whose clone would allocate a fresh operand
+                // the checker never walked. Register order: the get
+                // target is allocated before the operand (an untargeted
+                // field access still burns its entry register).
+                let get_reg = if target.is_some() {
+                    reg
+                } else {
+                    self.next_reg()
+                };
+                let TypedReg { reg: t_any, .. } = self.lower_expr(obj, None)?;
+                let k = self.next_reg();
+                self.emit(Instruction::StrKeyConst {
+                    target: Reg::new(k),
+                    val: glm_rt::rt::str_key_of_bytes(name.as_bytes()),
+                });
+                let target_ty = self.elem_face_of(obj)?;
+                let t_reg = ptr_of(t_any)?;
+                let out = self.table_get(get_reg, t_reg, TableKey::Str(Reg::new(k)), &target_ty);
                 Ok(TypedReg {
                     reg: out,
                     ty: target_ty,
@@ -1898,7 +2010,7 @@ impl<'a> IrLowerer<'a> {
                 self.emit(Instruction::Phi(phi));
                 Ok(TypedReg {
                     reg: AnyReg::Bool(Reg::new(reg)),
-                    ty: StaticType::Boolean,
+                    ty: Ty::Bool,
                 })
             }
             Expr::BinaryOp { op, left, right } => {
@@ -2037,13 +2149,13 @@ impl<'a> IrLowerer<'a> {
                     | BinOp::LessEq
                     | BinOp::GreaterEq
                     | BinOp::Equal
-                    | BinOp::NotEqual => StaticType::Boolean,
-                    BinOp::Div => StaticType::Float,
+                    | BinOp::NotEqual => Ty::Bool,
+                    BinOp::Div => Ty::Flt,
                     _ => {
-                        if matches!(l_ty, StaticType::Float) || matches!(r_ty, StaticType::Float) {
-                            StaticType::Float
+                        if matches!(l_ty, Ty::Flt) || matches!(r_ty, Ty::Flt) {
+                            Ty::Flt
                         } else {
-                            StaticType::Integer
+                            Ty::Int
                         }
                     }
                 };
@@ -2078,7 +2190,7 @@ impl<'a> IrLowerer<'a> {
                     });
                     Ok(TypedReg {
                         reg: AnyReg::Bool(Reg::new(reg)),
-                        ty: StaticType::Boolean,
+                        ty: Ty::Bool,
                     })
                 }
                 UnOp::Len => {
@@ -2089,33 +2201,23 @@ impl<'a> IrLowerer<'a> {
                         });
                         return Ok(TypedReg {
                             reg: AnyReg::Int(Reg::new(reg)),
-                            ty: StaticType::Integer,
+                            ty: Ty::Int,
                         });
                     }
                     let TypedReg { reg: v, ty } = self.lower_expr(expr, None)?;
                     match ty {
-                        StaticType::String => {
-                            let s_reg = match v {
-                                AnyReg::Str(r) => r,
-                                AnyReg::Ptr(r) => Reg::new(r.id),
-                                _ => {
-                                    return Err(LowerError(
-                                        "Lower Error: '#' on a String operand of another \
-                                         repr — the checker and the lowerer disagree"
-                                            .into(),
-                                    ));
-                                }
-                            };
+                        Ty::Str => {
+                            let s_reg = str_lane(v)?;
                             self.emit(Instruction::StrLen {
                                 target: Reg::new(reg),
                                 s: s_reg,
                             });
                             Ok(TypedReg {
                                 reg: AnyReg::Int(Reg::new(reg)),
-                                ty: StaticType::Integer,
+                                ty: Ty::Int,
                             })
                         }
-                        StaticType::Any => {
+                        Ty::Any => {
                             let a_reg = any_of(v)?;
                             self.emit(Instruction::AnyLen {
                                 target: Reg::new(reg),
@@ -2123,10 +2225,10 @@ impl<'a> IrLowerer<'a> {
                             });
                             Ok(TypedReg {
                                 reg: AnyReg::Int(Reg::new(reg)),
-                                ty: StaticType::Integer,
+                                ty: Ty::Int,
                             })
                         }
-                        StaticType::Table(_) | StaticType::Unknown(_) => {
+                        Ty::Tbl(_) | Ty::Unknown(_) => {
                             let t_reg = ptr_of(v)?;
                             self.emit(Instruction::TableLen {
                                 target: Reg::new(reg),
@@ -2134,7 +2236,7 @@ impl<'a> IrLowerer<'a> {
                             });
                             Ok(TypedReg {
                                 reg: AnyReg::Int(Reg::new(reg)),
-                                ty: StaticType::Integer,
+                                ty: Ty::Int,
                             })
                         }
                         _ => Err(LowerError(
@@ -2380,6 +2482,14 @@ mod desync_class_tests {
             "Lower Error: IR emitter label desync: a br/phi names block 'b3', \
              which the module never emits — the emitters and the block \
              model disagree (see SeamPlan in backend.rs)",
+            "Lower Error: a dotted call site carries no resolved verb — \
+             the checker and the lowerer disagree",
+            "Lower Error: an index key carries no recorded lane — \
+             the checker and the lowerer disagree",
+            "Lower Error: a table access carries no recorded elem face — \
+             the checker and the lowerer disagree",
+            "Lower Error: a string operand position received a different repr — \
+             the checker and the lowerer disagree",
         ] {
             assert!(LowerError(msg.to_string()).is_desync(), "{msg}");
         }
@@ -2393,5 +2503,50 @@ mod desync_class_tests {
         ] {
             assert!(!LowerError(msg.to_string()).is_desync(), "{msg}");
         }
+    }
+}
+
+#[cfg(test)]
+mod break_gate_tests {
+    use crate::ast::has_break;
+    use crate::ast::{Expr, Stmt};
+
+    fn assign_i() -> Stmt {
+        Stmt::Assignment {
+            name: "i".to_string(),
+            expr: Expr::Integer(1),
+        }
+    }
+
+    #[test]
+    fn flat_break_is_this_loops() {
+        assert!(has_break(&[Stmt::Break]));
+        assert!(!has_break(&[assign_i()]));
+    }
+
+    #[test]
+    fn break_through_do_and_if_counts() {
+        let cond = Expr::Boolean(true);
+        let brk = vec![Stmt::Break];
+        assert!(has_break(&[Stmt::Do { body: brk.clone() }]));
+        assert!(has_break(&[Stmt::If {
+            condition: cond.clone(),
+            then_body: brk.clone(),
+            else_body: vec![],
+        }]));
+        assert!(has_break(&[Stmt::If {
+            condition: cond,
+            then_body: vec![],
+            else_body: brk,
+        }]));
+    }
+
+    #[test]
+    fn break_inside_nested_while_binds_to_the_inner_loop() {
+        let nested = vec![Stmt::While {
+            condition: Expr::Boolean(true),
+            body: vec![Stmt::Break],
+        }];
+        assert!(!has_break(&nested));
     }
 }

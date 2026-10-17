@@ -1,4 +1,5 @@
 use super::*;
+use crate::ast::has_break;
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum NumExpr {
     Lit(i64),
@@ -199,10 +200,13 @@ impl Analyzer {
                     }
                     if let CtorKey::Expr(ke) = k {
                         let (kt, _, _) = self.infer_expr(rec, ke)?;
-                        if matches!(kt, Flt | Bool | Str) {
+                        if matches!(kt, Flt | Bool) {
                             signal!(rec.on(), trace::TRACE_INFER_IDX_BAD_KEY);
                             continue;
                         }
+                        // an expression key pins to Integer when the
+                        // walk can see its node
+                        self.pin_int_use(rec, ke, &kt);
                         if rec.on() {
                             self.check_key_threshold(rec, ke, &BTreeSet::from([id]))?;
                         }
@@ -329,6 +333,12 @@ impl Analyzer {
                             }
                         }
                     }
+                    if matches!(t, Conflict) {
+                        crate::glm_dbgln!(
+                            "[ctor] site {id} line {:?}: cell value is Conflict",
+                            self.ctor_lines[id]
+                        );
+                    }
                     self.decide(rec, id, &t);
                 }
                 let resolved = if self.lattice.site_elem[id] != Pending {
@@ -360,7 +370,8 @@ impl Analyzer {
             }
             Expr::Index { obj, key } => {
                 let (kt, _, _) = self.infer_expr(rec, key)?;
-                if matches!(kt, Flt | Bool | Str) {
+                if matches!(kt, Flt | Bool) {
+                    crate::glm_dbgln!("[idx] bad key ty={:?}", kt);
                     signal!(rec.on(), trace::TRACE_INFER_IDX_BAD_KEY);
                     self.infer_expr(rec, obj)?;
                     return Ok((Conflict, BTreeSet::new(), BTreeMap::new()));
@@ -389,6 +400,10 @@ impl Analyzer {
                     }
                     return Ok((r, BTreeSet::new(), BTreeMap::new()));
                 }
+                // base checks out as a table: the key discipline pins an
+                // unresolved key to Integer (mirroring the checking
+                // half's base-then-key order)
+                self.pin_int_use(rec, key, &kt);
                 let claimed_rows: BTreeSet<usize> = self
                     .lattice
                     .claimed_ghosts
@@ -519,11 +534,62 @@ impl Analyzer {
                 signal!(rec.on(), trace::TRACE_INFER_IDENT);
                 let (depth, bind) = self.resolve(rec, name)?;
                 let _ = depth;
+                if matches!(bind.ty, Conflict) {
+                    crate::glm_dbgln!(
+                        "[ident] '{name}' resolves to Conflict aliases={:?}",
+                        bind.aliases
+                    );
+                }
                 Ok((bind.ty, bind.aliases.clone(), bind.lineage.clone()))
             }
             Expr::BinaryOp { op, left, right } => {
                 let (lt, _, _) = self.infer_expr(rec, left)?;
                 let (rt, _, _) = self.infer_expr(rec, right)?;
+                // the use-site pin disciplines, mirroring the checking
+                // half at this same operator: Boolean operands for
+                // and/or, the numeric pair for arithmetic and the
+                // comparisons, the scalar pair for equality
+                match op {
+                    BinOp::And | BinOp::Or => {
+                        self.pin_bool_use(rec, left, &lt);
+                        self.pin_bool_use(rec, right, &rt);
+                    }
+                    BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::IntDiv
+                    | BinOp::Mod
+                    | BinOp::Div
+                    | BinOp::LessThan
+                    | BinOp::GreaterThan
+                    | BinOp::LessEq
+                    | BinOp::GreaterEq => {
+                        self.pin_numeric_pair(rec, left, &lt, right, &rt);
+                    }
+                    BinOp::Equal | BinOp::NotEqual => {
+                        self.pin_scalar_pair(rec, left, &lt, right, &rt);
+                    }
+                }
+                // the computed-scalar discipline: where the just-landed
+                // pins closed both operands and the checker's own
+                // discipline at this operator would return a type
+                // without error, the walk binds that type directly (the
+                // binding is the value view; no held `top` entry). The
+                // fixpoint and walk-blind operands keep the Pending
+                // shape below.
+                match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::IntDiv | BinOp::Mod => {
+                        if let Some(t) = self.computed_arith_scalar(rec, left, &lt, right, &rt) {
+                            return Ok((t, BTreeSet::new(), BTreeMap::new()));
+                        }
+                    }
+                    BinOp::Div => {
+                        if let Some(t) = self.computed_div_scalar(rec, left, &lt, right, &rt) {
+                            return Ok((t, BTreeSet::new(), BTreeMap::new()));
+                        }
+                    }
+                    _ => {}
+                }
                 match op {
                     BinOp::Div if matches!(lt, Int | Flt) && matches!(rt, Int | Flt) => {
                         signal!(rec.on(), trace::TRACE_INFER_BINOP_ARITH);
@@ -531,6 +597,9 @@ impl Analyzer {
                     }
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::IntDiv | BinOp::Mod => {
                         signal!(rec.on(), trace::TRACE_INFER_BINOP_ARITH);
+                        if matches!(arith_ty(lt.clone(), rt.clone()), Conflict) {
+                            crate::glm_dbgln!("[arith] {:?} {op:?} {:?} = Conflict", lt, rt);
+                        }
                         Ok((arith_ty(lt, rt), BTreeSet::new(), BTreeMap::new()))
                     }
                     _ => {
@@ -544,10 +613,20 @@ impl Analyzer {
                 match op {
                     UnOp::Neg => {
                         signal!(rec.on(), trace::TRACE_INFER_UNOP_NEG);
+                        // unary '-' pins its operand to Integer
+                        self.pin_int_use(rec, expr, &t);
+                        // the computed-scalar discipline (same as the
+                        // binary operators): a closed operand binds its
+                        // kind directly
+                        if let Some(k) = self.computed_neg_scalar(rec, expr, &t) {
+                            return Ok((k, BTreeSet::new(), BTreeMap::new()));
+                        }
                         Ok((t, BTreeSet::new(), BTreeMap::new()))
                     }
                     UnOp::Not => {
                         signal!(rec.on(), trace::TRACE_INFER_UNOP_NOT);
+                        // 'not' pins its operand to Boolean
+                        self.pin_bool_use(rec, expr, &t);
                         Ok((Bool, BTreeSet::new(), BTreeMap::new()))
                     }
                     UnOp::Len => {
@@ -566,9 +645,30 @@ impl Analyzer {
             }
             Expr::FfiModule => Ok((Ffi, BTreeSet::new(), BTreeMap::new())),
             Expr::CoroModule => Ok((Coro, BTreeSet::new(), BTreeMap::new())),
-            Expr::Field { .. } => Err(ShapeError(
-                "Scope Error: '.' is the ffi/coroutine surface's — use it in call position".into(),
-            )),
+            Expr::Field { obj, .. } => {
+                // a record read answers the table's element type and rides
+                // the receiver's sites: record cells are the table's elem
+                // (Any for heterogeneous records), and the constant-key
+                // row-read lifetime machinery does not apply to names
+                let (ty, sites, lineage) = self.infer_expr(rec, obj)?;
+                match ty {
+                    Tbl(inner) if matches!(*inner, Conflict) => {
+                        crate::glm_dbgln!("[field] dot read on Tbl(Conflict) sites={:?}", sites);
+                        Ok((*inner, sites, lineage))
+                    }
+                    Tbl(inner) => Ok((*inner, sites, lineage)),
+                    _ => {
+                        crate::glm_dbgln!(
+                            "[field] dot access on non-table ty={:?} sites={:?}",
+                            ty,
+                            sites
+                        );
+                        Err(ShapeError(
+                            "Scope Error: dot access needs a record or the ffi surface".into(),
+                        ))
+                    }
+                }
+            }
             Expr::Function { .. } => {
                 signal!(rec.on(), trace::TRACE_INFER_IDENT);
                 Ok((Pending, BTreeSet::new(), BTreeMap::new()))
@@ -760,6 +860,9 @@ impl Analyzer {
     }
 
     pub(super) fn detect_fill_loop(&mut self, rec: Gate, guard: &str, body: &[Stmt]) {
+        if has_break(body) {
+            return;
+        }
         if !guard_provably_nonneg(&self.holds.num_assigns, guard) {
             return;
         }

@@ -10,7 +10,7 @@ use crate::trace::{
     TRACE_CORO_YIELD_DROPPED, TRACE_FAIL_ANY_LEN, TRACE_FAIL_CORO_CREATE, TRACE_FAIL_DIV_ZERO,
     TRACE_FAIL_FFI_LOAD, TRACE_FAIL_FFI_SYM, TRACE_FAIL_LEAK_DETECTED, TRACE_FAIL_NULL_ROW_STORE,
     TRACE_RT_ALLOC, TRACE_RT_FFI_LOAD, TRACE_RT_FREE, TRACE_RT_FREE_CHILD, TRACE_RT_GROW_NULL,
-    TRACE_RT_RESERVE_NULL, TRACE_RT_STR_INTERN, TRACE_RT_STR_POOL_HIT,
+    TRACE_RT_RESERVE_NULL,
 };
 
 #[repr(u8)]
@@ -71,6 +71,8 @@ static LOCAL_LEAK_HOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU
 // fallback path, where this copy owes its own leak check
 unsafe extern "C" {
     fn vx_trace_poke_exec(exec_id: i32, slot: u8);
+    fn vx_str_intern(s: *const u8, len: usize) -> *const u8;
+    fn vx_str_register(strtab: *mut *const u8, n: usize);
     fn vx_exec_register(name: *const i8, flags: u32) -> i32;
     fn vx_exec_census_set(id: i32, live: i64, total: i64);
     fn vx_exec_state_set(id: i32, state: u32);
@@ -481,10 +483,18 @@ pub unsafe extern "C" fn glm_tbl_set(t: *mut GlmTable, index: i64, val: *const u
 unsafe fn set_core<C: CellRepr>(t: *mut GlmTable, index: i64, cell: C) {
     let tbl = unsafe { &mut *t };
 
+    // Integer keys are the non-negative span of the i64 lane: negative
+    // integers — including any whose bits happen to land in the reserved
+    // string-key range — drop silently, the total-store philosophy.
+    // String keys cannot reach this core: they enter through
+    // set_skey_core from the *_skey entry points, which the compiler
+    // selects only for its Reg<StrKey> lane (src/ir.rs), so a user
+    // integer can never address a record cell however it was produced.
+    if index < 0 {
+        return;
+    }
+
     if tbl.mode == TableMode::Sparse {
-        if index < 0 {
-            return;
-        }
         tbl.border = tbl.border.max(index.saturating_add(1));
         let map = unsafe { &mut *tbl.sparse_map };
         map.insert(index, cell.to_lane());
@@ -497,9 +507,6 @@ unsafe fn set_core<C: CellRepr>(t: *mut GlmTable, index: i64, cell: C) {
         return;
     }
 
-    if index < 0 {
-        return;
-    }
     tbl.border = tbl.border.max(index.saturating_add(1));
     unsafe { span_grow(tbl, index.wrapping_add(1)) };
     let ptr = unsafe { tbl.data.add(index as usize * C::ESIZE) };
@@ -507,6 +514,17 @@ unsafe fn set_core<C: CellRepr>(t: *mut GlmTable, index: i64, cell: C) {
     if !tbl.sparse_map.is_null() {
         unsafe { (&mut *tbl.sparse_map).remove(&index) };
     }
+}
+
+/// String-key store: the overflow map only — never border/#t, the dense
+/// span, or the mode (a record write on a Dense table is just an
+/// overflow insert). The caller is a `*_skey` entry point; the compiler
+/// guarantees the key is a negative interned identity, which the
+/// debug_assert double-checks.
+unsafe fn set_skey_core<C: CellRepr>(t: *mut GlmTable, key: i64, cell: C) {
+    debug_assert!(is_str_key(key), "skey store outside the reserved range");
+    let tbl = unsafe { &mut *t };
+    unsafe { overflow_map(tbl).insert(key, cell.to_lane()) };
 }
 
 #[unsafe(no_mangle)]
@@ -532,10 +550,13 @@ pub unsafe extern "C" fn glm_tbl_get(t: *mut GlmTable, index: i64, dst: *mut u8,
 unsafe fn get_core<C: CellRepr>(t: *mut GlmTable, index: i64) -> C {
     let tbl = unsafe { &mut *t };
 
+    // negative integers (the string-key range included) read the zero
+    // lane — string keys never reach this core (see set_core)
+    if index < 0 {
+        return C::from_lane(0);
+    }
+
     if tbl.mode == TableMode::Sparse {
-        if index < 0 {
-            return C::from_lane(0);
-        }
         let map = unsafe { &mut *tbl.sparse_map };
         return match map.get(&index) {
             Some(&lane) => C::from_lane(lane),
@@ -543,17 +564,29 @@ unsafe fn get_core<C: CellRepr>(t: *mut GlmTable, index: i64) -> C {
         };
     }
 
-    if index >= 0
-        && !tbl.sparse_map.is_null()
+    if !tbl.sparse_map.is_null()
         && let Some(&lane) = unsafe { (&*tbl.sparse_map).get(&index) }
     {
         return C::from_lane(lane);
     }
-    if index < 0 || index >= tbl.len {
+    if index >= tbl.len {
         return C::from_lane(0);
     }
     let ptr = unsafe { tbl.data.add(index as usize * C::ESIZE) };
     unsafe { C::load_span(ptr) }
+}
+
+/// String-key read: the overflow map only; a missing field reads the
+/// zero lane — the same "unset cell" semantics as out-of-range arrays.
+unsafe fn get_skey_core<C: CellRepr>(t: *mut GlmTable, key: i64) -> C {
+    debug_assert!(is_str_key(key), "skey read outside the reserved range");
+    let tbl = unsafe { &mut *t };
+    if !tbl.sparse_map.is_null()
+        && let Some(&lane) = unsafe { (&*tbl.sparse_map).get(&key) }
+    {
+        return C::from_lane(lane);
+    }
+    C::from_lane(0)
 }
 
 #[unsafe(no_mangle)]
@@ -579,6 +612,80 @@ pub unsafe extern "C" fn glm_tbl_get_any(t: *mut GlmTable, index: i64) -> i128 {
     }
     match unsafe { (&*t).esize } {
         16 => unsafe { get_core::<u128>(t, index) as i128 },
+        other => {
+            eprintln!("glm runtime error: GlmTable esize {other} has no register cell face");
+            std::process::abort();
+        }
+    }
+}
+
+// The string-key faces of the same four entry points. The compiler's
+// TableKey::Str lane (Reg<StrKey>, src/ir.rs) selects these — the split
+// IS the unforgeability guarantee: no integer register can name a record
+// cell, because generated integer traffic only ever names the int faces
+// above (whose cores drop every negative index).
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn glm_tbl_set_skey(t: *mut GlmTable, key: i64, val: *const u8) {
+    if t.is_null() {
+        unsafe { glm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
+        eprintln!("glm runtime error: attempt to index a nil value (null table row)");
+        std::process::abort();
+    }
+    match unsafe { (&*t).esize } {
+        1 => unsafe { set_skey_core::<u8>(t, key, u8::load_slot(val)) },
+        8 => unsafe { set_skey_core::<u64>(t, key, u64::load_slot(val)) },
+        16 => unsafe { set_skey_core::<u128>(t, key, u128::load_slot(val)) },
+        other => {
+            eprintln!("glm runtime error: GlmTable esize {other} has no cell repr");
+            std::process::abort();
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn glm_tbl_get_skey(t: *mut GlmTable, key: i64, dst: *mut u8, esize: usize) {
+    if dst.is_null() {
+        return;
+    }
+    if t.is_null() {
+        std::ptr::write_bytes(dst, 0, esize);
+        return;
+    }
+    match unsafe { (&*t).esize } {
+        1 => unsafe { u8::store_dst(get_skey_core::<u8>(t, key), dst) },
+        8 => unsafe { u64::store_dst(get_skey_core::<u64>(t, key), dst) },
+        16 => unsafe { u128::store_dst(get_skey_core::<u128>(t, key), dst) },
+        other => {
+            eprintln!("glm runtime error: GlmTable esize {other} has no cell repr");
+            std::process::abort();
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn glm_tbl_set_any_skey(t: *mut GlmTable, key: i64, val: i128) {
+    if t.is_null() {
+        unsafe { glm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
+        eprintln!("glm runtime error: attempt to index a nil value (null table row)");
+        std::process::abort();
+    }
+    match unsafe { (&*t).esize } {
+        16 => unsafe { set_skey_core::<u128>(t, key, val as u128) },
+        other => {
+            eprintln!("glm runtime error: GlmTable esize {other} has no register cell face");
+            std::process::abort();
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn glm_tbl_get_any_skey(t: *mut GlmTable, key: i64) -> i128 {
+    if t.is_null() {
+        return 0;
+    }
+    match unsafe { (&*t).esize } {
+        16 => unsafe { get_skey_core::<u128>(t, key) as i128 },
         other => {
             eprintln!("glm runtime error: GlmTable esize {other} has no register cell face");
             std::process::abort();
@@ -936,54 +1043,61 @@ pub unsafe extern "C" fn glm_str_len(val: *const u8) -> i64 {
     len as i64
 }
 
-use std::sync::Mutex;
-
-static STR_POOL: Mutex<Option<HashMap<Vec<u8>, usize>>> = Mutex::new(None);
-
-fn str_pool() -> std::sync::MutexGuard<'static, Option<HashMap<Vec<u8>, usize>>> {
-    let mut guard = STR_POOL.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        *guard = Some(HashMap::new());
-    }
-    guard
-}
+/* The string pool lives in the substrate (async/str_pool.c) — the third
+stateful layer inverted (trace plate, exec registry, strings). One pool
+per process: pointer equality is sound across glm copies, and every
+pooled string carries its negative table key in an 8-byte prefix.
+RT_STR_INTERN / RT_STR_POOL_HIT (slots 8/9) are poked by the substrate
+now, anonymously — the pool cannot know the calling copy's exec id. */
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn glm_str_register(ptrs: *const *const u8, n: usize) {
-    let mut pool = str_pool();
-    let Some(map) = pool.as_mut() else {
-        return;
-    };
-    for i in 0..n {
-        let p = unsafe { *ptrs.add(i) };
-        if p.is_null() {
-            continue;
-        }
-        let bytes = unsafe { cstr_bytes(p) };
-        map.entry(bytes.to_vec()).or_insert(p as usize);
-    }
+    unsafe { vx_str_register(ptrs as *mut *const u8, n) };
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn glm_str_intern(s: *const u8, len: usize) -> *const u8 {
-    let bytes = unsafe { std::slice::from_raw_parts(s, len) };
-    {
-        let pool = str_pool();
-        if let Some(&addr) = pool.as_ref().and_then(|m| m.get(bytes)) {
-            unsafe { glm_trace_set(TRACE_RT_STR_POOL_HIT) };
-            return addr as *const u8;
-        }
+    unsafe { vx_str_intern(s, len) }
+}
+
+/// The negative table key of a pooled string: one load of the 8-byte
+/// prefix. Contract: `s` must be pool-born (interned or registered) —
+/// static .rodata literals have no prefix (the backend routes literal
+/// handles through strtab slots for exactly this reason).
+///
+/// A null handle (an unset String cell reads 0 — total-read philosophy,
+/// the same null `glm_str_len` guards) answers -1: negative but NOT a
+/// str key (top two bits 11, not 10), so set_core no-ops it like any
+/// other negative index and get_core reads a zero lane — the store is
+/// dropped, the read is 0, and neither the array slot 0 nor the overflow
+/// map is polluted. (Answering 0 would alias array slot 0; answering
+/// STR_KEY_TAG would alias every null string onto one overflow cell.)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn glm_str_key(s: *const u8) -> i64 {
+    if s.is_null() {
+        return -1;
     }
-    unsafe { glm_trace_set(TRACE_RT_STR_INTERN) };
-    let mut buf = Vec::with_capacity(len + 1);
-    buf.extend_from_slice(bytes);
-    buf.push(0);
-    let p = Box::into_raw(buf.into_boxed_slice()) as *const u8;
-    let mut pool = str_pool();
-    if let Some(map) = pool.as_mut() {
-        map.insert(bytes.to_vec(), p as usize);
+    unsafe { (s as *const i64).sub(1).read_unaligned() }
+}
+
+/// Rust mirror of str_pool.c's derive — an ABI contract, not an
+/// implementation detail. The backend's literal-key constant folder must
+/// produce identical values. FNV-1a 64 over the NUL-free bytes, masked to
+/// 62 bits, tagged into the reserved negative range (top two bits 10).
+pub const STR_KEY_TAG: i64 = i64::MIN;
+
+#[inline]
+pub fn is_str_key(index: i64) -> bool {
+    (index & (3i64 << 62)) == STR_KEY_TAG
+}
+
+pub fn str_key_of_bytes(bytes: &[u8]) -> i64 {
+    let mut h: u64 = 14695981039346656037;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
     }
-    p
+    (STR_KEY_TAG as u64 | (h & 0x3FFF_FFFF_FFFF_FFFF)) as i64
 }
 
 #[inline]
@@ -1488,4 +1602,102 @@ pub unsafe extern "C" fn glm_coro_close(co: i64) -> i64 {
     unsafe { glm_trace_set(TRACE_CORO_CLOSE) };
     unsafe { vx_coro_join(co as i32) };
     0
+}
+
+#[cfg(test)]
+mod strkey_tests {
+    use super::*;
+
+    /// Records are overflow cells addressed by negative interned
+    /// identities through the dedicated skey faces. The three invariants
+    /// that make them safe on Dense tables: `#t` (border) is untouched,
+    /// the dense span is untouched, and the value round-trips through
+    /// the overflow map.
+    #[test]
+    fn negative_keys_never_pollute_border() {
+        for flags in [0u8, 1u8] {
+            // 0 = Dense, 1 = Sparse — record writes behave identically
+            let t = unsafe { glm_tbl_new(std::mem::size_of::<i128>(), flags) };
+            let key = str_key_of_bytes(b"health");
+
+            unsafe { glm_tbl_set_any(t, 0, 41) }; // array cell (int face)
+            unsafe { glm_tbl_set_any(t, 1, 7) };
+            unsafe { glm_tbl_set_any_skey(t, key, glm_any_pack(3, 0x1234)) }; // record cell
+
+            assert_eq!(
+                unsafe { glm_tbl_len(t) },
+                2,
+                "record write must not touch #t"
+            );
+            assert_eq!(
+                unsafe { glm_tbl_get_any_skey(t, key) },
+                glm_any_pack(3, 0x1234)
+            );
+            assert_eq!(unsafe { glm_tbl_get_any(t, 0) }, 41);
+            assert_eq!(unsafe { glm_tbl_get_any(t, 1) }, 7);
+            assert_eq!(
+                unsafe { glm_tbl_get_any_skey(t, str_key_of_bytes(b"missing")) },
+                0
+            );
+            // free per iteration: unit tests must not feed the exit-time
+            // leak tripwire — sys_alloc_count() is a CI signal, not noise
+            unsafe { glm_tbl_free(t) };
+        }
+    }
+
+    /// THE unforgeability pin: an i64 whose bits land in the reserved
+    /// string-key range, driven through the INTEGER faces (the only
+    /// faces generated integer traffic can name), drops like any other
+    /// negative index — it must not create, read, or alias a record
+    /// cell, no matter how a running program computed it.
+    #[test]
+    fn str_range_integers_drop_through_the_int_faces() {
+        let t = unsafe { glm_tbl_new(std::mem::size_of::<i128>(), 0) };
+        let forged = str_key_of_bytes(b"health");
+        assert!(is_str_key(forged));
+
+        unsafe { glm_tbl_set_any(t, forged, glm_any_pack(3, 0x1234)) };
+        assert_eq!(
+            unsafe { glm_tbl_len(t) },
+            0,
+            "a forged str-range int must not grow #t"
+        );
+        assert_eq!(
+            unsafe { glm_tbl_get_any_skey(t, str_key_of_bytes(b"health")) },
+            0,
+            "a forged str-range int must not create the record cell"
+        );
+        assert_eq!(
+            unsafe { glm_tbl_get_any(t, forged) },
+            0,
+            "a forged str-range int reads the zero lane, not a cell"
+        );
+        unsafe { glm_tbl_free(t) };
+    }
+
+    #[test]
+    fn interned_strings_carry_their_key_in_the_prefix() {
+        let a = unsafe { glm_str_intern(b"player".as_ptr(), 6) };
+        let b = unsafe { glm_str_intern(b"player".as_ptr(), 6) };
+        assert_eq!(a, b, "intern dedup within the process pool");
+
+        let key = unsafe { glm_str_key(a) };
+        assert!(is_str_key(key), "pooled strings carry negative str keys");
+        assert_eq!(key, str_key_of_bytes(b"player"), "prefix cache == derive");
+
+        // the handle stays a valid C-string: prefix is invisible to readers
+        assert_eq!(unsafe { glm_str_len(a) }, 6);
+        assert_eq!(unsafe { *a }, b'p');
+    }
+
+    #[test]
+    fn key_derive_is_stable_and_disjoint_from_program_integers() {
+        let k1 = str_key_of_bytes(b"health");
+        let k2 = str_key_of_bytes(b"health");
+        assert_eq!(k1, k2);
+        assert_ne!(str_key_of_bytes(b"health"), str_key_of_bytes(b"wealth"));
+        assert!(k1 < 0);
+        assert!(is_str_key(k1));
+        assert!(!is_str_key(-1) && !is_str_key(-42) && !is_str_key(5));
+    }
 }

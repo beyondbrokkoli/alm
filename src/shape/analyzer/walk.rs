@@ -94,6 +94,11 @@ impl Analyzer {
                     }
                 }
                 for (idx, expr) in exprs.iter().enumerate() {
+                    // the scalar-node bookkeeping mirrors the checker's
+                    // scope entry: an RHS riding a shared unknown node
+                    // (bare alias, boundary cell, pending-site read, fn
+                    // return) binds that node to the name
+                    self.note_decl_scalar_node(&names[idx], expr);
                     if matches!(expr, Expr::Nil) {
                         signal!(rec.on(), trace::TRACE_BIND_SCALAR);
                         sets.push(TableShape {
@@ -118,6 +123,15 @@ impl Analyzer {
                         });
                     } else {
                         let bind = self.infer_bind(rec, expr)?;
+                        if matches!(expr, Expr::Field { .. } | Expr::Index { .. })
+                            && matches!(bind.ty, Conflict)
+                        {
+                            crate::glm_dbgln!(
+                                "[localdecl] '{}' bound to Conflict aliases={:?}",
+                                names[idx],
+                                bind.aliases
+                            );
+                        }
                         self.check_uses(rec, expr)?;
                         self.collect_entry_moves(rec, expr, &mut moved_srcs)?;
                         if value_kind(&bind.ty) {
@@ -130,6 +144,17 @@ impl Analyzer {
                 }
                 while sets.len() < names.len() {
                     signal!(rec.on(), trace::TRACE_BIND_SCALAR);
+                    // anchor the bare declaration's identity node in the
+                    // lattice's unknown store — the checking half's
+                    // declare reads (and, defensively, mints) the same
+                    // node, one per declaration across every pass. Bare
+                    // decls do NOT register in scalar_nodes: the
+                    // nil-poison law rejects every read through a bare
+                    // name before a use-site pin could fire, so the node
+                    // only ever closes via assignment unification.
+                    self.lattice
+                        .unknowns
+                        .ensure_bare_node(stmt, &names[sets.len()]);
                     sets.push(TableShape {
                         ty: Pending,
                         layout: LayoutVerdict::default(),
@@ -149,6 +174,10 @@ impl Analyzer {
                     if let Some(old) = self.walk.scopes.last().and_then(|s| s.get(name)).cloned() {
                         self.rebind_death(rec, name, depth, stmt, &old, &set.aliases)?;
                     }
+                    // a fresh declaration is a fresh name: no severed
+                    // elem history carries over the shadowing
+                    self.holds.nil_severed.remove(name);
+                    self.holds.moved_severed.remove(name);
                     self.check_row_ownership(name, depth, &set, &moved_srcs)?;
                     let prov = self.prov_for_bind(exprs.get(idx), &set);
                     let scope = self.walk.scopes.last_mut().unwrap();
@@ -190,10 +219,12 @@ impl Analyzer {
                 }
                 if matches!(expr, Expr::Nil) {
                     signal!(rec.on(), trace::TRACE_STMT_ASSIGN_NIL);
+                    self.note_assign_scalar_node(name, expr);
                     self.drop_reference(rec, name, stmt)?;
                     return Ok(());
                 }
                 let bind = self.infer_bind(rec, expr)?;
+                self.note_assign_scalar_node(name, expr);
                 self.check_uses(rec, expr)?;
                 let mut moved_srcs: Vec<(usize, String)> = Vec::new();
                 if let Expr::Identifier(src) = expr {
@@ -224,15 +255,56 @@ impl Analyzer {
                         }
                     }
                     let line = self.stmt_lines.get(&(stmt as *const Stmt)).copied();
-                    let old: Vec<usize> = self
+                    let mut old: BTreeSet<usize> = self
                         .resolve_aliases(rec, name)?
                         .into_iter()
                         .filter(|s| !is_root(s) && !is_ghost(s))
                         .collect();
+                    // the sites a `t = nil` severed from the name ride
+                    // along: the type slot survives the nil, so adoption
+                    // bridges the elem history both ways across it. A
+                    // move (`local u = t`) severs the same way — the
+                    // slot survives the move, the history bridges.
+                    old.extend(
+                        self.holds
+                            .nil_severed
+                            .get(name)
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    );
+                    old.extend(
+                        self.holds
+                            .moved_severed
+                            .get(name)
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    );
+                    let old: Vec<usize> = old.into_iter().collect();
                     let mut old_sum = Pending;
                     for s in &old {
                         old_sum = join_ty(&old_sum, &self.lattice.site_elem[*s]);
                     }
+                    // The scalar adoption: a scalar (or Any) mix joins
+                    // the name's site history to the incoming kind —
+                    // every flat program replays this exactly.
+                    // NESTED-table mixes (the elem history rides one
+                    // level down — `t = {{1}}; t = {{2.5}}` joins
+                    // Tbl(Int) with Tbl(Flt) to Tbl(Any) on both sites,
+                    // the ctor arm's mixed-rows promotion carries Any
+                    // into the inner sites on the next pass) adopt under
+                    // two hard guards: the elem must be FULLY DECIDED (a
+                    // Pending inside means a self-referential ctor is
+                    // still forming — adopting it grows the nesting one
+                    // level per pass and the fixpoint never converges;
+                    // the cyclic_ctor_assign_rejected case), and each
+                    // site's join must be CLEAN (a shape mismatch —
+                    // scalar elem vs table elem — stays the site
+                    // Conflict / the checker's unify refusal, not ours
+                    // to preempt).
+                    let nested = |t: &Ty| matches!(t, Tbl(_) if decided(t));
+                    let joins_clean = |cur: &Ty, vt: &Ty| !matches!(join_ty(cur, vt), Conflict);
                     if value_kind(&incoming) {
                         signal!(rec.on(), trace::TRACE_STMT_ASSIGN_TBL_SCALAR);
                         for s in old {
@@ -240,10 +312,29 @@ impl Analyzer {
                             self.note_adopt_if_flipping(rec, s, &incoming, line);
                             self.decide(rec, s, &incoming);
                         }
+                    } else if nested(&incoming) {
+                        for s in old {
+                            if joins_clean(&self.lattice.site_elem[s], &incoming) {
+                                signal!(rec.on(), trace::TRACE_STMT_ASSIGN_TBL_SCALAR);
+                                signal!(rec.on(), trace::TRACE_STMT_ASSIGN_TBL_SCALAR_VALID);
+                                self.note_adopt_if_flipping(rec, s, &incoming, line);
+                                self.decide(rec, s, &incoming);
+                            }
+                        }
                     }
                     if value_kind(&old_sum) {
                         for s in &bind.aliases {
                             if !is_root(s) && !is_ghost(s) {
+                                self.note_adopt_if_flipping(rec, *s, &old_sum, line);
+                                self.decide(rec, *s, &old_sum);
+                            }
+                        }
+                    } else if nested(&old_sum) {
+                        for s in &bind.aliases {
+                            if !is_root(s)
+                                && !is_ghost(s)
+                                && joins_clean(&self.lattice.site_elem[*s], &old_sum)
+                            {
                                 self.note_adopt_if_flipping(rec, *s, &old_sum, line);
                                 self.decide(rec, *s, &old_sum);
                             }
@@ -286,7 +377,10 @@ impl Analyzer {
 
             Stmt::IndexAssign { obj, key, value } => {
                 let (t, obj_sites, _) = self.infer_expr(rec, obj)?;
-                self.infer_expr(rec, key)?;
+                let (kty, _, _) = self.infer_expr(rec, key)?;
+                // the key discipline: an unresolved key the walk can
+                // see pins to Integer
+                self.pin_int_use(rec, key, &kty);
                 self.check_table_use(rec, obj)?;
                 self.check_uses(rec, obj)?;
                 self.check_uses(rec, key)?;
@@ -557,6 +651,12 @@ impl Analyzer {
                         .filter_map(|x| self.proj_node(x))
                         .collect();
                     let line = self.stmt_lines.get(&(stmt as *const Stmt)).copied();
+                    if matches!(expected_ty, Conflict) {
+                        crate::glm_dbgln!(
+                            "[idxassign] line {line:?}: storing Conflict into sites {proj_bases:?} (vt={:?})",
+                            vt
+                        );
+                    }
                     for s in proj_bases
                         .iter()
                         .copied()
@@ -608,7 +708,10 @@ impl Analyzer {
             }
 
             Stmt::While { condition, body } => {
-                self.infer_expr(rec, condition)?;
+                let (cty, _, _) = self.infer_expr(rec, condition)?;
+                // the condition discipline: an unresolved operand the
+                // walk can see pins to Boolean here, before the body
+                self.pin_bool_use(rec, condition, &cty);
                 self.check_uses(rec, condition)?;
 
                 if rec.on()
@@ -621,6 +724,10 @@ impl Analyzer {
                 let entry = self.walk.scopes.clone();
                 let mut head = entry.clone();
                 let scope_key = (stmt as *const Stmt, 0);
+                // the loop BODY scope index plan_break_exits unwinds down to:
+                // with_scope pushes body scopes onto walk.scopes, so entries
+                // must be taken BEFORE the first with_scope of the fixpoint.
+                self.loop_scope_entries.push(self.walk.scopes.len());
                 loop {
                     self.walk.scopes = head.clone();
                     self.check_uses(rec, condition)?;
@@ -637,6 +744,7 @@ impl Analyzer {
                     }
                     head = merged;
                 }
+                self.loop_scope_entries.pop();
                 self.walk.scopes = head;
                 for depth in 0..self.walk.scopes.len() {
                     let names: Vec<String> = self.walk.scopes[depth].keys().cloned().collect();
@@ -658,7 +766,8 @@ impl Analyzer {
                 else_body,
             } => {
                 signal!(rec.on(), trace::TRACE_STMT_IF);
-                self.infer_expr(rec, condition)?;
+                let (cty, _, _) = self.infer_expr(rec, condition)?;
+                self.pin_bool_use(rec, condition, &cty);
                 self.check_uses(rec, condition)?;
                 let snapshot = self.walk.scopes.clone();
                 let prov_snapshot = self.walk.prov.clone();
@@ -726,6 +835,12 @@ impl Analyzer {
                 self.check_uses(rec, expr)?;
             }
 
+            Stmt::Break => {
+                if rec.on() {
+                    self.plan_break_exits(stmt as *const Stmt);
+                }
+            }
+
             Stmt::Return { value } => {
                 if let Some(v) = value {
                     let (ty, mut aliases, lineage) = self.infer_expr(rec, v)?;
@@ -789,16 +904,20 @@ impl Analyzer {
         self.walk.scopes.push(BTreeMap::new());
         self.walk.fn_scopes.push(BTreeMap::new());
         self.walk.prov.push(BTreeMap::new());
+        self.walk.scalar_nodes.push(BTreeMap::new());
     }
 
     pub(super) fn exit_scope(&mut self) {
         if let Some(dying) = self.walk.scopes.last() {
             for name in dying.keys() {
                 self.holds.num_assigns.remove(name);
+                self.holds.nil_severed.remove(name);
+                self.holds.moved_severed.remove(name);
             }
         }
         self.walk.fn_scopes.pop();
         self.walk.prov.pop();
+        self.walk.scalar_nodes.pop();
         self.walk.scopes.pop();
     }
 

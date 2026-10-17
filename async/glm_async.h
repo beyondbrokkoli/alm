@@ -2,6 +2,7 @@
 #define GLM_ASYNC_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,7 +15,7 @@ extern "C" {
    One .so per OS process (the loader's guarantee) owns every piece of
    process-wide glm state: the multi-exec registry, the trace plate file,
    and the exit-time leak report. Per-artifact glm_rt copies hold only
-   their exec_id handle. See async/README.md for the full contract. */
+   their exec_id handle. */
 
 #define VX_EXEC_MAX          8
 #define VX_EXEC_NAME_MAX     56
@@ -111,6 +112,22 @@ int64_t  vx_coro_yield(uint64_t value);                   /* producer publish */
 uint32_t vx_coro_status(int32_t id);                      /* state word */
 void     vx_coro_join(int32_t id);                        /* wait + join */
 void     vx_coro_quiesce(void);                           /* exit-report pre-pass */
+
+/* str_pool.c — the process-canonical string pool (the third stateful
+   layer: trace plate, exec registry, strings). Layout contract, frozen:
+     allocation: [8 bytes: i64 key] [N bytes: UTF-8] [1 byte: 0x00]
+     handle:     pointer to the UTF-8 bytes — the canonical *const u8
+     key:        INT64_MIN | (fnv1a_64(bytes) & 0x3FFF_FFFF_FFFF_FFFF)
+   The key derive is a cross-module ABI contract; src/rt.rs and the
+   backend's constant folder must stay byte-identical to str_pool.c.
+   Allocator rule: the substrate is the sole allocator of interned
+   strings and they are immortal — module boundaries cannot split an
+   allocation. vx_str_register interns COPIES of .rodata literals and
+   overwrites the caller's (writable) strtab slots with canonical
+   prefixed pointers, so no unprefixed static string ever masquerades
+   as a pool handle. */
+const uint8_t* vx_str_intern(const uint8_t* s, size_t len);
+void           vx_str_register(const uint8_t** strtab, int64_t n);
 
 #ifdef __cplusplus
 }

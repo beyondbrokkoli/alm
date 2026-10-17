@@ -1,34 +1,3 @@
-#[derive(Debug, Clone, PartialEq)]
-pub enum StaticType {
-    Integer,
-    Float,
-    Boolean,
-    String,
-    Table(Box<StaticType>),
-    Unknown(usize),
-    Ffi,
-    FfiLib,
-    Coro,
-    Any,
-}
-
-impl std::fmt::Display for StaticType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StaticType::Integer => write!(f, "Int"),
-            StaticType::Float => write!(f, "Float"),
-            StaticType::Boolean => write!(f, "Bool"),
-            StaticType::String => write!(f, "String"),
-            StaticType::Table(inner) => write!(f, "Table<{}>", inner),
-            StaticType::Unknown(_) => write!(f, "?"),
-            StaticType::Ffi => write!(f, "Ffi"),
-            StaticType::FfiLib => write!(f, "FfiLib"),
-            StaticType::Coro => write!(f, "Coro"),
-            StaticType::Any => write!(f, "Any"),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum BinOp {
     Add,
@@ -58,6 +27,9 @@ pub enum UnOp {
 pub enum CtorKey {
     Const(i64),
     Expr(Expr),
+    /// `{ name = v }` — a record field. Lowers to the negative interned
+    /// identity of `name` (str_key_of_bytes), stored via the overflow map.
+    Str(String),
 }
 
 #[derive(Debug, Clone)]
@@ -136,4 +108,25 @@ pub enum Stmt {
     Return {
         value: Option<Expr>,
     },
+    Break,
+}
+
+/// True when a `break` belongs to THIS loop level: recurses into Do/If
+/// but not into nested While (a break there binds to the inner loop).
+/// One definition, two gates that must agree: the lowerer's fill
+/// conversion and the analyzer's Dense promotion both refuse loops whose
+/// own body carries a break — a fill loop's body must run to the guard's
+/// completion, so a break out of it invalidates the reserve.
+pub fn has_break(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Break => true,
+        Stmt::Do { body } => has_break(body),
+        Stmt::While { .. } => false,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => has_break(then_body) || has_break(else_body),
+        _ => false,
+    })
 }

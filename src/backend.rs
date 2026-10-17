@@ -1,31 +1,32 @@
-use crate::ast::StaticType;
+use crate::shape::Ty;
+
 use crate::ir::{
     BlockId, Bool, CellGet, CellSet, CellSetFast, CmpRegs, DbgBind, EntryKind, Instruction, Int,
     IrProgram, MoveRegs, NumRegs, NumRegsRhs, PackRegs, PhiRegs, Ptr, Reg, RegKind, Repr,
-    SourceLoc, Terminator, UnaryNum,
+    SourceLoc, TableKey, Terminator, UnaryNum,
 };
 use crate::shape::LayoutVerdict;
 use glm_rt::trace;
 use std::collections::HashMap;
 use std::path::Path;
 
-fn elem_size(ty: &StaticType) -> u32 {
+fn elem_size(ty: &Ty) -> u32 {
     match ty {
-        StaticType::Boolean => 1,
-        StaticType::Unknown(_) => 1,
-        StaticType::Any => 16,
+        Ty::Bool => 1,
+        Ty::Unknown(_) => 1,
+        Ty::Any => 16,
         _ => 8,
     }
 }
 
-fn elem_kind_code(ty: &StaticType) -> u8 {
+fn elem_kind_code(ty: &Ty) -> u8 {
     match ty {
-        StaticType::Integer => glm_rt::rt::GLM_ARG_INT as u8,
-        StaticType::Float => glm_rt::rt::GLM_ARG_FLOAT as u8,
-        StaticType::Boolean => glm_rt::rt::GLM_ARG_BOOL as u8,
-        StaticType::String => glm_rt::rt::GLM_ARG_STRING as u8,
-        StaticType::Any => glm_rt::rt::GLM_ARG_ANY as u8,
-        StaticType::Table(_) => glm_rt::rt::GLM_ELEM_TABLE,
+        Ty::Int => glm_rt::rt::GLM_ARG_INT as u8,
+        Ty::Flt => glm_rt::rt::GLM_ARG_FLOAT as u8,
+        Ty::Bool => glm_rt::rt::GLM_ARG_BOOL as u8,
+        Ty::Str => glm_rt::rt::GLM_ARG_STRING as u8,
+        Ty::Any => glm_rt::rt::GLM_ARG_ANY as u8,
+        Ty::Tbl(_) => glm_rt::rt::GLM_ELEM_TABLE,
         _ => glm_rt::rt::GLM_ELEM_UNDECIDED,
     }
 }
@@ -310,7 +311,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
     let mut globals = String::new();
     let mut dbg = DebugMeta::new(&program.source_file);
     let mut needs_dbg_value_decl = false;
-    let mut str_pool: HashMap<&str, String> = HashMap::new();
+    let mut str_pool: HashMap<&str, (String, u32)> = HashMap::new();
     let mut str_order: Vec<String> = Vec::new();
     let mut str_idx = 0;
     let mut needs_floor_decl = false;
@@ -320,11 +321,9 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
     let mut needs_tbl_free_decl = false;
     let mut needs_tbl_free_except_decl = false;
     let mut needs_tbl_free_except_n_decl = false;
-    let mut needs_tbl_get_decl = false;
-    let mut needs_tbl_set_decl = false;
-    let mut needs_tbl_get_any_decl = false;
-    let mut needs_tbl_set_any_decl = false;
+    let mut tbl_decls = TableDecls::default();
     let mut needs_str_len_decl = false;
+    let mut needs_str_key_decl = false;
     let mut needs_sys_alloc_count_decl = false;
     let mut needs_sys_exec_count_decl = false;
     let mut needs_coro_decls = false;
@@ -342,6 +341,57 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
 
     let mut allocas = String::new();
     let mut code = String::new();
+
+    // String handles are canonical pool pointers, not static .rodata —
+    // string `==` compares identities, and the pool copies literals into
+    // prefixed blocks (async/str_pool.c). So EVERY LoadString loads its
+    // handle through the strtab slot the ctor rewrote at startup, and the
+    // pre-passes below must therefore know the full strtab before the main
+    // walk emits the first slot load: the gep type names the array size,
+    // and that size must be the FINAL one on every slot load. FfiCall
+    // symbol names share the pool map (a sym whose content equals a
+    // literal reuses its global) and ride the same strtab, so they are
+    // pre-registered too — literals first, then syms, mirroring the
+    // order the main walk would first see them.
+    for block in &program.blocks {
+        for instr in &block.instrs {
+            if let Instruction::LoadString { val, .. } = instr
+                && !str_pool.contains_key(val.as_str())
+            {
+                let g = format!("@.str.{}", str_idx);
+                str_idx += 1;
+                str_order.push(g.clone());
+                globals.push_str(&format!(
+                    "{} = private unnamed_addr constant [{} x i8] c\"{}\\00\"\n",
+                    g,
+                    val.len() + 1,
+                    llvm_bytes(val.as_bytes())
+                ));
+                str_pool.insert(val.as_str(), (g, (str_order.len() - 1) as u32));
+            }
+        }
+    }
+    for block in &program.blocks {
+        for instr in &block.instrs {
+            if let Instruction::FfiCall { sym, .. } = instr
+                && !str_pool.contains_key(sym.as_str())
+            {
+                let g = format!("@.str.{}", str_idx);
+                str_idx += 1;
+                str_order.push(g.clone());
+                globals.push_str(&format!(
+                    "{} = private unnamed_addr constant [{} x i8] c\"{}\\00\"\n",
+                    g,
+                    sym.len() + 1,
+                    llvm_bytes(sym.as_bytes())
+                ));
+                // no strtab slot: ffi syms are gep'd straight off the
+                // .rodata global for dlsym — the sentinel says "never
+                // loaded through the table"
+                str_pool.insert(sym.as_str(), (g, u32::MAX));
+            }
+        }
+    }
 
     for block in &program.blocks {
         code.push_str(&format!("\nb{}:\n", block.id));
@@ -362,6 +412,12 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                 Instruction::LoadInt { target, val } => {
                     code.push_str(&format!("  %v{} = add i64 0, {}\n", target.id, val))
                 }
+                Instruction::StrKeyConst { target, val } => {
+                    // the constant-fold twin of LoadInt for the StrKey lane:
+                    // identical materialization, a register class nothing
+                    // but a string-key derivation can produce
+                    code.push_str(&format!("  %v{} = add i64 0, {}\n", target.id, val))
+                }
                 Instruction::LoadFloat { target, val } => {
                     code.push_str(&format!("  %v{} = fadd double 0.0, {:?}\n", target.id, val))
                 }
@@ -374,36 +430,42 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                     code.push_str(&format!("  %v{} = add i128 0, 0\n", target.id))
                 }
                 Instruction::LoadString { target, val } => {
-                    let g = match str_pool.get(val.as_str()) {
-                        Some(name) => {
+                    let slot = match str_pool.get(val.as_str()) {
+                        Some(entry) => {
                             trace::compiler_trace_signal(trace::TRACE_STR_POOL_HIT);
-                            name.clone()
+                            entry.1
                         }
-                        None => {
-                            let g = format!("@.str.{}", str_idx);
-                            str_idx += 1;
-                            str_order.push(g.clone());
-                            globals.push_str(&format!(
-                                "{} = private unnamed_addr constant [{} x i8] c\"{}\\00\"\n",
-                                g,
-                                val.len() + 1,
-                                llvm_bytes(val.as_bytes())
-                            ));
-                            str_pool.insert(val.as_str(), g.clone());
-                            g
-                        }
+                        // unreachable: the pre-pass pre-registered every
+                        // LoadString content before the main walk
+                        None => unreachable!("LoadString content missed by the strtab pre-pass"),
                     };
+                    // two instructions: LLVM rejects a gep instruction as
+                    // a load operand (only the parenthesized constexpr form
+                    // would parse, and that folds the slot at link time).
+                    // str_order is complete by now (both pre-passes ran),
+                    // so every slot load names the FINAL strtab size.
+                    let f = ks;
+                    ks += 1;
                     code.push_str(&format!(
-                        "  %v{} = getelementptr inbounds [{} x i8], ptr {}, i64 0, i64 0\n",
-                        target.id,
-                        val.len() + 1,
-                        g
+                        "  %ts{f}.slot = getelementptr inbounds [{n} x ptr], ptr @.glm_strtab, i64 0, i64 {slot}\n\
+                         %v{t} = load ptr, ptr %ts{f}.slot\n",
+                        f = f,
+                        n = str_order.len(),
+                        slot = slot,
+                        t = target.id
                     ));
                 }
                 Instruction::StrLen { target, s } => {
                     needs_str_len_decl = true;
                     code.push_str(&format!(
                         "  %v{} = call i64 @glm_str_len(ptr %v{})\n",
+                        target.id, s.id
+                    ));
+                }
+                Instruction::StrKey { target, s } => {
+                    needs_str_key_decl = true;
+                    code.push_str(&format!(
+                        "  %v{} = call i64 @glm_str_key(ptr %v{})\n",
                         target.id, s.id
                     ));
                 }
@@ -487,8 +549,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                         &mut allocas,
                         &mut code,
                         seam_plan.number(block.id, ii),
-                        &mut needs_tbl_get_decl,
-                        &mut needs_tbl_get_any_decl,
+                        &mut tbl_decls,
                     );
                 }
                 Instruction::TableReserve { table, bound } => {
@@ -506,8 +567,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                         &mut code,
                         seam_plan.number(block.id, ii),
                         &mut needs_hdr_md,
-                        &mut needs_tbl_set_decl,
-                        &mut needs_tbl_set_any_decl,
+                        &mut tbl_decls,
                     );
                 }
                 Instruction::TableSet(s) => {
@@ -516,8 +576,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                         &mut allocas,
                         &mut code,
                         seam_plan.number(block.id, ii),
-                        &mut needs_tbl_set_decl,
-                        &mut needs_tbl_set_any_decl,
+                        &mut tbl_decls,
                     );
                 }
                 Instruction::TableFree { table } => {
@@ -627,20 +686,10 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                 Instruction::FfiCall { lib, sym, arg } => {
                     needs_ffi_call_decl = true;
                     let g = match str_pool.get(sym.as_str()) {
-                        Some(name) => name.clone(),
-                        None => {
-                            let g = format!("@.str.{}", str_idx);
-                            str_idx += 1;
-                            str_order.push(g.clone());
-                            globals.push_str(&format!(
-                                "{} = private unnamed_addr constant [{} x i8] c\"{}\\00\"\n",
-                                g,
-                                sym.len() + 1,
-                                llvm_bytes(sym.as_bytes())
-                            ));
-                            str_pool.insert(sym.as_str(), g.clone());
-                            g
-                        }
+                        Some((name, _)) => name.clone(),
+                        // unreachable: the pre-pass pre-registered every
+                        // ffi symbol before the main walk
+                        None => unreachable!("ffi symbol missed by the strtab pre-pass"),
                     };
                     code.push_str(&format!(
                         "  call void @glm_ffi_call(ptr %v{}, ptr {}, ptr %v{})\n",
@@ -702,37 +751,40 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                         }
                         let (r, ty) = (*r, ty);
                         match ty {
-                            StaticType::Integer => {
+                            Ty::Int => {
                                 code.push_str(&format!("  call void @glm_print_int(i64 %v{})\n", r))
                             }
-                            StaticType::Float => code.push_str(&format!(
+                            Ty::Flt => code.push_str(&format!(
                                 "  call void @glm_print_float(double %v{})\n",
                                 r
                             )),
-                            StaticType::Boolean => {
+                            Ty::Bool => {
                                 code.push_str(&format!("  call void @glm_print_bool(i1 %v{})\n", r))
                             }
-                            StaticType::String => code
+                            Ty::Str => code
                                 .push_str(&format!("  call void @glm_print_string(ptr %v{})\n", r)),
-                            StaticType::Any => {
+                            Ty::Any => {
                                 needs_any_print_decl = true;
                                 code.push_str(&format!(
                                     "  call void @glm_any_print(i128 %v{})\n",
                                     r
                                 ));
                             }
-                            StaticType::Table(_) => {
+                            Ty::Tbl(_) => {
                                 return Err(vec![
                                     "Type Error: tables cannot be printed".to_string(),
                                 ]);
                             }
-                            StaticType::Ffi | StaticType::FfiLib | StaticType::Coro => {
+                            Ty::Ffi | Ty::FfiLib | Ty::Coro => {
                                 return Err(vec![
                                     "Type Error: the module surfaces cannot be printed".to_string(),
                                 ]);
                             }
-                            StaticType::Unknown(_) => {
-                                code.push_str("  call void @glm_print_int(i64 0)\n")
+                            Ty::Unknown(_) => code.push_str("  call void @glm_print_int(i64 0)\n"),
+                            // print operands carry resolved lowerer types —
+                            // flow state never rides the artifact path
+                            Ty::Pending | Ty::Conflict => {
+                                unreachable!("flow state never rides the artifact path")
                             }
                         }
                     }
@@ -850,11 +902,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
     }
 
     let mut registry = String::new();
-    let str_carrying = matches!(
-        program.boundary_elem,
-        Some(glm_rt::GlmElem::String | glm_rt::GlmElem::Any)
-    );
-    if str_carrying && !str_order.is_empty() {
+    if !str_order.is_empty() {
         trace::compiler_trace_signal(trace::TRACE_STRTAB_EMIT);
         let ptrs: Vec<String> = str_order.iter().map(|g| format!("ptr {g}")).collect();
         registry.push_str(&format!(
@@ -894,17 +942,29 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
     if needs_tbl_free_except_n_decl {
         head.push_str("declare void @glm_tbl_free_except_n(ptr, ptr, i64)\n");
     }
-    if needs_tbl_get_decl {
+    if tbl_decls.get {
         head.push_str("declare void @glm_tbl_get(ptr, i64, ptr, i64)\n");
     }
-    if needs_tbl_set_decl {
+    if tbl_decls.set {
         head.push_str("declare void @glm_tbl_set(ptr, i64, ptr)\n");
     }
-    if needs_tbl_get_any_decl {
+    if tbl_decls.get_any {
         head.push_str("declare i128 @glm_tbl_get_any(ptr, i64)\n");
     }
-    if needs_tbl_set_any_decl {
+    if tbl_decls.set_any {
         head.push_str("declare void @glm_tbl_set_any(ptr, i64, i128)\n");
+    }
+    if tbl_decls.get_skey {
+        head.push_str("declare void @glm_tbl_get_skey(ptr, i64, ptr, i64)\n");
+    }
+    if tbl_decls.set_skey {
+        head.push_str("declare void @glm_tbl_set_skey(ptr, i64, ptr)\n");
+    }
+    if tbl_decls.get_any_skey {
+        head.push_str("declare i128 @glm_tbl_get_any_skey(ptr, i64)\n");
+    }
+    if tbl_decls.set_any_skey {
+        head.push_str("declare void @glm_tbl_set_any_skey(ptr, i64, i128)\n");
     }
     if needs_str_len_decl {
         head.push_str("declare i64 @glm_str_len(ptr)\n");
@@ -964,6 +1024,9 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
     if !registry.is_empty() {
         head.push_str("declare void @glm_str_register(ptr, i64)\n");
     }
+    if needs_str_key_decl {
+        head.push_str("declare i64 @glm_str_key(ptr)\n");
+    }
     if needs_exec_main_decl {
         head.push_str("declare i32 @glm_exec_main(i32, ptr, i32, ptr)\n");
     }
@@ -982,10 +1045,10 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
         if !needs_tbl_new_decl {
             anchor.push_str("declare ptr @glm_tbl_new(i64, i8)\n");
         }
-        if !needs_tbl_set_decl {
+        if !tbl_decls.set {
             anchor.push_str("declare void @glm_tbl_set(ptr, i64, ptr)\n");
         }
-        if !needs_tbl_get_decl {
+        if !tbl_decls.get {
             anchor.push_str("declare void @glm_tbl_get(ptr, i64, ptr, i64)\n");
         }
         if !needs_tbl_free_decl {
@@ -1000,7 +1063,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
             "  i64 ptrtoint (ptr @glm_tbl_free to i64),\n",
             "  i64 ptrtoint (ptr @glm_str_intern to i64)\n",
             "]\n",
-            "@llvm.compiler.used = appending global [1 x ptr] [ptr @.glm_rt_anchor]\n",
+            "@llvm.compiler.used = appending global [1 x ptr] [ptr @.glm_rt_anchor], section \"llvm.metadata\"\n",
         ));
     }
 
@@ -1039,94 +1102,39 @@ fn emit_cell_get(
     allocas: &mut String,
     code: &mut String,
     seam: usize,
-    needs_tbl_get_decl: &mut bool,
-    needs_tbl_get_any_decl: &mut bool,
+    tbl_decls: &mut TableDecls,
 ) {
     match g {
         CellGet::Int {
             target,
             table,
             index,
-        } => emit_table_get(
-            target,
-            table,
-            index,
-            allocas,
-            code,
-            seam,
-            needs_tbl_get_decl,
-            needs_tbl_get_any_decl,
-        ),
+        } => emit_table_get(target, table, index, allocas, code, seam, tbl_decls),
         CellGet::Float {
             target,
             table,
             index,
-        } => emit_table_get(
-            target,
-            table,
-            index,
-            allocas,
-            code,
-            seam,
-            needs_tbl_get_decl,
-            needs_tbl_get_any_decl,
-        ),
+        } => emit_table_get(target, table, index, allocas, code, seam, tbl_decls),
         CellGet::Bool {
             target,
             table,
             index,
-        } => emit_table_get(
-            target,
-            table,
-            index,
-            allocas,
-            code,
-            seam,
-            needs_tbl_get_decl,
-            needs_tbl_get_any_decl,
-        ),
+        } => emit_table_get(target, table, index, allocas, code, seam, tbl_decls),
         CellGet::Ptr {
             target,
             table,
             index,
-        } => emit_table_get(
-            target,
-            table,
-            index,
-            allocas,
-            code,
-            seam,
-            needs_tbl_get_decl,
-            needs_tbl_get_any_decl,
-        ),
+        } => emit_table_get(target, table, index, allocas, code, seam, tbl_decls),
         CellGet::Byte {
             target,
             table,
             index,
-        } => emit_table_get(
-            target,
-            table,
-            index,
-            allocas,
-            code,
-            seam,
-            needs_tbl_get_decl,
-            needs_tbl_get_any_decl,
-        ),
+        } => emit_table_get(target, table, index, allocas, code, seam, tbl_decls),
         CellGet::Any {
             target,
             table,
             index,
-        } => emit_table_get(
-            target,
-            table,
-            index,
-            allocas,
-            code,
-            seam,
-            needs_tbl_get_decl,
-            needs_tbl_get_any_decl,
-        ),
+        } => emit_table_get(target, table, index, allocas, code, seam, tbl_decls),
     }
 }
 
@@ -1137,8 +1145,7 @@ fn emit_cell_set_fast(
     code: &mut String,
     seam: usize,
     needs_hdr_md: &mut bool,
-    needs_tbl_set_decl: &mut bool,
-    needs_tbl_set_any_decl: &mut bool,
+    tbl_decls: &mut TableDecls,
 ) {
     match s {
         CellSetFast::Int {
@@ -1157,8 +1164,7 @@ fn emit_cell_set_fast(
             code,
             seam,
             needs_hdr_md,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
+            tbl_decls,
         ),
         CellSetFast::Float {
             table,
@@ -1176,8 +1182,7 @@ fn emit_cell_set_fast(
             code,
             seam,
             needs_hdr_md,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
+            tbl_decls,
         ),
         CellSetFast::Bool {
             table,
@@ -1195,8 +1200,7 @@ fn emit_cell_set_fast(
             code,
             seam,
             needs_hdr_md,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
+            tbl_decls,
         ),
         CellSetFast::Ptr {
             table,
@@ -1214,8 +1218,7 @@ fn emit_cell_set_fast(
             code,
             seam,
             needs_hdr_md,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
+            tbl_decls,
         ),
         CellSetFast::Byte {
             table,
@@ -1233,8 +1236,7 @@ fn emit_cell_set_fast(
             code,
             seam,
             needs_hdr_md,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
+            tbl_decls,
         ),
         CellSetFast::Any {
             table,
@@ -1252,8 +1254,7 @@ fn emit_cell_set_fast(
             code,
             seam,
             needs_hdr_md,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
+            tbl_decls,
         ),
     }
 }
@@ -1264,94 +1265,39 @@ fn emit_cell_set(
     allocas: &mut String,
     code: &mut String,
     seam: usize,
-    needs_tbl_set_decl: &mut bool,
-    needs_tbl_set_any_decl: &mut bool,
+    tbl_decls: &mut TableDecls,
 ) {
     match s {
         CellSet::Int {
             table,
             index,
             value,
-        } => emit_table_set(
-            table,
-            index,
-            value,
-            allocas,
-            code,
-            seam,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
-        ),
+        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
         CellSet::Float {
             table,
             index,
             value,
-        } => emit_table_set(
-            table,
-            index,
-            value,
-            allocas,
-            code,
-            seam,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
-        ),
+        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
         CellSet::Bool {
             table,
             index,
             value,
-        } => emit_table_set(
-            table,
-            index,
-            value,
-            allocas,
-            code,
-            seam,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
-        ),
+        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
         CellSet::Ptr {
             table,
             index,
             value,
-        } => emit_table_set(
-            table,
-            index,
-            value,
-            allocas,
-            code,
-            seam,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
-        ),
+        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
         CellSet::Byte {
             table,
             index,
             value,
-        } => emit_table_set(
-            table,
-            index,
-            value,
-            allocas,
-            code,
-            seam,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
-        ),
+        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
         CellSet::Any {
             table,
             index,
             value,
-        } => emit_table_set(
-            table,
-            index,
-            value,
-            allocas,
-            code,
-            seam,
-            needs_tbl_set_decl,
-            needs_tbl_set_any_decl,
-        ),
+        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
     }
 }
 
@@ -1493,38 +1439,64 @@ fn emit_phi<R: Repr>(target: &Reg<R>, args: &[(BlockId, Reg<R>)], code: &mut Str
     ));
 }
 
+/// Which of the eight runtime table entry points a module references:
+/// (get|set) × (cell face | i128 register face) × (Integer lane | StrKey
+/// lane). The decl flags exist only to emit `declare`s; the lane split
+/// itself is decided per-instruction from TableKey, and generated
+/// integer traffic can never name an `_skey` symbol or vice versa.
+#[derive(Default)]
+struct TableDecls {
+    get: bool,
+    set: bool,
+    get_any: bool,
+    set_any: bool,
+    get_skey: bool,
+    set_skey: bool,
+    get_any_skey: bool,
+    set_any_skey: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_table_get<E: Repr>(
     target: &Reg<E>,
     table: &Reg<Ptr>,
-    index: &Reg<Int>,
+    index: &TableKey,
     allocas: &mut String,
     code: &mut String,
     seam: usize,
-    needs_tbl_get_decl: &mut bool,
-    needs_tbl_get_any_decl: &mut bool,
+    tbl_decls: &mut TableDecls,
 ) {
+    // the key lane picks the entry point: integers name glm_tbl_get[_any],
+    // string keys name the _skey faces — the split that keeps a runtime
+    // integer (however produced) from ever addressing a record cell
+    let (sym, flag) = match (E::REG_FACE, index) {
+        (true, TableKey::Int(_)) => ("glm_tbl_get_any", &mut tbl_decls.get_any),
+        (true, TableKey::Str(_)) => ("glm_tbl_get_any_skey", &mut tbl_decls.get_any_skey),
+        (false, TableKey::Int(_)) => ("glm_tbl_get", &mut tbl_decls.get),
+        (false, TableKey::Str(_)) => ("glm_tbl_get_skey", &mut tbl_decls.get_skey),
+    };
+    *flag = true;
     if E::REG_FACE {
-        *needs_tbl_get_any_decl = true;
         code.push_str(&format!(
-            "  %v{target} = call i128 @glm_tbl_get_any(ptr %v{table}, i64 %v{index})\n",
+            "  %v{target} = call i128 @{sym}(ptr %v{table}, i64 %v{index})\n",
             target = target.id,
+            sym = sym,
             table = table.id,
-            index = index.id
+            index = index.id()
         ));
         return;
     }
-    *needs_tbl_get_decl = true;
     let ety = E::storage();
     let f = seam;
 
     allocas.push_str(&format!("  %ts{f}.dst = alloca {ety}\n", f = f, ety = ety));
 
     code.push_str(&format!(
-        "  call void @glm_tbl_get(ptr %v{table}, i64 %v{index}, ptr %ts{f}.dst, i64 {esize})\n",
+        "  call void @{sym}(ptr %v{table}, i64 %v{index}, ptr %ts{f}.dst, i64 {esize})\n",
+        sym = sym,
         f = f,
         table = table.id,
-        index = index.id,
+        index = index.id(),
         esize = E::esize()
     ));
 
@@ -1556,8 +1528,7 @@ fn emit_table_set_fast<E: Repr>(
     code: &mut String,
     seam: usize,
     needs_hdr_md: &mut bool,
-    needs_tbl_set_decl: &mut bool,
-    needs_tbl_set_any_decl: &mut bool,
+    tbl_decls: &mut TableDecls,
 ) {
     *needs_hdr_md = true;
     let ety = E::storage();
@@ -1607,15 +1578,7 @@ fn emit_table_set_fast<E: Repr>(
                    {checked}\
                    br label %b{cont}\n",
                 val_cast = val_cast,
-                checked = checked_store::<E>(
-                    f,
-                    table,
-                    index,
-                    &val_use,
-                    ety,
-                    needs_tbl_set_decl,
-                    needs_tbl_set_any_decl
-                ),
+                checked = checked_store::<E>(f, table, index, &val_use, ety, tbl_decls),
                 cont = cont
             ));
         }
@@ -1635,15 +1598,7 @@ fn emit_table_set_fast<E: Repr>(
                    {checked}\
                    br label %b{cont}\n",
                 val_cast = val_cast,
-                checked = checked_store::<E>(
-                    f,
-                    table,
-                    index,
-                    &val_use,
-                    ety,
-                    needs_tbl_set_decl,
-                    needs_tbl_set_any_decl
-                ),
+                checked = checked_store::<E>(f, table, index, &val_use, ety, tbl_decls),
                 f = f,
                 table = table.id,
                 index = index.id,
@@ -1662,11 +1617,10 @@ fn checked_store<E: Repr>(
     index: &Reg<Int>,
     val_use: &str,
     ety: &str,
-    needs_tbl_set_decl: &mut bool,
-    needs_tbl_set_any_decl: &mut bool,
+    tbl_decls: &mut TableDecls,
 ) -> String {
     if E::REG_FACE {
-        *needs_tbl_set_any_decl = true;
+        tbl_decls.set_any = true;
         format!(
             "  call void @glm_tbl_set_any(ptr %v{table}, i64 %v{index}, i128 {v})\n",
             table = table.id,
@@ -1674,7 +1628,7 @@ fn checked_store<E: Repr>(
             v = val_use
         )
     } else {
-        *needs_tbl_set_decl = true;
+        tbl_decls.set = true;
         format!(
             "  store {ety} {v}, ptr %ts{f}.valp\n\
                call void @glm_tbl_set(ptr %v{table}, i64 %v{index}, ptr %ts{f}.valp)\n",
@@ -1690,25 +1644,32 @@ fn checked_store<E: Repr>(
 #[allow(clippy::too_many_arguments)]
 fn emit_table_set<E: Repr>(
     table: &Reg<Ptr>,
-    index: &Reg<Int>,
+    index: &TableKey,
     value: &Reg<E>,
     allocas: &mut String,
     code: &mut String,
     seam: usize,
-    needs_tbl_set_decl: &mut bool,
-    needs_tbl_set_any_decl: &mut bool,
+    tbl_decls: &mut TableDecls,
 ) {
+    // same lane split as emit_table_get: the key kind names the entry
+    // point, so integer traffic and record traffic cannot cross
+    let (sym, flag) = match (E::REG_FACE, index) {
+        (true, TableKey::Int(_)) => ("glm_tbl_set_any", &mut tbl_decls.set_any),
+        (true, TableKey::Str(_)) => ("glm_tbl_set_any_skey", &mut tbl_decls.set_any_skey),
+        (false, TableKey::Int(_)) => ("glm_tbl_set", &mut tbl_decls.set),
+        (false, TableKey::Str(_)) => ("glm_tbl_set_skey", &mut tbl_decls.set_skey),
+    };
+    *flag = true;
     if E::REG_FACE {
-        *needs_tbl_set_any_decl = true;
         code.push_str(&format!(
-            "  call void @glm_tbl_set_any(ptr %v{table}, i64 %v{index}, i128 %v{value})\n",
+            "  call void @{sym}(ptr %v{table}, i64 %v{index}, i128 %v{value})\n",
+            sym = sym,
             table = table.id,
-            index = index.id,
+            index = index.id(),
             value = value.id
         ));
         return;
     }
-    *needs_tbl_set_decl = true;
     let ety = E::storage();
     let f = seam;
 
@@ -1730,9 +1691,10 @@ fn emit_table_set<E: Repr>(
         ));
     }
     code.push_str(&format!(
-        "  call void @glm_tbl_set(ptr %v{table}, i64 %v{index}, ptr %ts{f}.valp)\n",
+        "  call void @{sym}(ptr %v{table}, i64 %v{index}, ptr %ts{f}.valp)\n",
+        sym = sym,
         table = table.id,
-        index = index.id,
+        index = index.id(),
         f = f
     ));
 }
@@ -2022,7 +1984,7 @@ mod label_closure_tests {
 
 #[cfg(test)]
 mod fast_store_tail_tests {
-    use super::{assert_labels_closed, emit_table_set_fast};
+    use super::{TableDecls, assert_labels_closed, emit_table_set_fast};
     use crate::ir::{Int, Ptr, Reg};
     use crate::shape::LayoutVerdict;
 
@@ -2034,8 +1996,7 @@ mod fast_store_tail_tests {
         let mut allocas = String::new();
         let mut code = String::new();
         let mut hdr_md = false;
-        let mut set_decl = false;
-        let mut set_any_decl = false;
+        let mut tbl_decls = TableDecls::default();
         emit_table_set_fast::<Int>(
             &table,
             &index,
@@ -2046,8 +2007,7 @@ mod fast_store_tail_tests {
             &mut code,
             7,
             &mut hdr_md,
-            &mut set_decl,
-            &mut set_any_decl,
+            &mut tbl_decls,
         );
         assert_eq!(code.matches("br label %b5").count(), 2);
         assert!(!code.contains("cont:"));

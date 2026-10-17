@@ -35,6 +35,10 @@ pub enum Token<'a> {
     Else,
     #[token("while")]
     While,
+    #[token("for")]
+    For,
+    #[token("break")]
+    Break,
     #[token("return")]
     Return,
     #[token("function")]

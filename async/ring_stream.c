@@ -18,8 +18,7 @@ EXPORT int vx_stream_acquire(int win_id) {
     int ready  = L(g_ring.ready_idx[win_id]);
     int offset = win_id * 4;
     // FIFO ring: only (ready+1)%4 is ever a valid write; locked here means
-    // the ring is full. (The old i=2..4 scan was the out-of-rotation race —
-    // fixed in lockstep with demo_engine/host/ipc/ring_stream.c.)
+    // the ring is full.
     int local_curr = (ready == -1) ? -1 : (ready - offset);
     int next_local = (local_curr + 1) % 4;
     int global_idx = offset + next_local;

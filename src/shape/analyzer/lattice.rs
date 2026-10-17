@@ -1,6 +1,16 @@
 use super::*;
-impl Recorded {
-    pub(super) fn report_conflict(&mut self, id: usize) -> crate::ast::StaticType {
+// elem_type_of_tbl lives on Analyzer (not Recorded): the static-elem
+// table is computed BEFORE the recorded pass so the checker checks
+// against the exact table the assembled facts carry. These are not
+// language conversions but the elem table's MATERIALIZATION policy over
+// the one type language — a top-level Pending site rides as
+// `Unknown(site)` (its pins close in the constraint store), a NESTED
+// Pending rides as a fresh ghost `Unknown` (the MAX/2-down ghost
+// discipline), Conflict reports.
+// Downstream of the table only decided kinds and Unknowns exist — the
+// invariant the artifact path's `unreachable!` arms rest on.
+impl Analyzer {
+    pub(super) fn report_conflict(&mut self, id: usize) -> Ty {
         if self.ledger.conflict_reported.insert(id) {
             let line = self.ctor_lines[id];
             self.ledger.diagnostics.push(format!(
@@ -9,125 +19,136 @@ impl Recorded {
                  (table site #{id})"
             ));
         }
-        crate::ast::StaticType::Unknown(id)
+        Ty::Unknown(id)
     }
 
-    pub(super) fn elem_type_of_tbl(&mut self, id: usize) -> crate::ast::StaticType {
+    pub(super) fn elem_type_of_tbl(&mut self, id: usize) -> Ty {
         if self.lattice.site_elem[id] == Conflict {
-            signal!(self.recording, trace::TRACE_SHAPE_CONFLICT_GUARD);
+            signal!(trace::TRACE_SHAPE_CONFLICT_GUARD);
             return self.report_conflict(id);
         }
 
         if let Some(children) = self.lattice.child_sites.get(&id).cloned() {
-            signal!(self.recording, trace::TRACE_CHILD_FAST_PATH);
-            let mut uniform_type: Option<crate::ast::StaticType> = None;
+            signal!(trace::TRACE_CHILD_FAST_PATH);
+            let mut uniform_type: Option<Ty> = None;
 
             for &child_id in &children {
                 if self.lattice.site_elem[child_id] == Conflict {
-                    signal!(self.recording, trace::TRACE_ELEM_CHILD_CONFLICT);
+                    signal!(trace::TRACE_ELEM_CHILD_CONFLICT);
                     return self.report_conflict(child_id);
                 }
 
                 let child_ty = self.elem_type_of_tbl(child_id);
 
-                let child_pending = matches!(child_ty, crate::ast::StaticType::Unknown(_));
+                let child_pending = matches!(child_ty, Ty::Unknown(_));
                 match &uniform_type {
                     None => {
-                        signal!(self.recording, trace::TRACE_ELEM_CHILD_FIRST);
+                        signal!(trace::TRACE_ELEM_CHILD_FIRST);
                         uniform_type = Some(child_ty.clone());
                     }
                     Some(expected) => {
-                        let expected_pending =
-                            matches!(expected, crate::ast::StaticType::Unknown(_));
+                        let expected_pending = matches!(expected, Ty::Unknown(_));
                         if !child_pending && !expected_pending && *expected != child_ty {
-                            signal!(self.recording, trace::TRACE_ELEM_CHILD_MISMATCH);
+                            signal!(trace::TRACE_ELEM_CHILD_MISMATCH);
                             return self.report_conflict(child_id);
                         }
                         if expected_pending && !child_pending {
                             uniform_type = Some(child_ty.clone());
                         }
-                        signal!(self.recording, trace::TRACE_ELEM_CHILD_MATCH);
+                        signal!(trace::TRACE_ELEM_CHILD_MATCH);
                     }
                 }
             }
 
             if let Some(ty) = uniform_type {
-                signal!(self.recording, trace::TRACE_ELEM_CHILD_UNIFORM);
-                return crate::ast::StaticType::Table(Box::new(ty));
+                signal!(trace::TRACE_ELEM_CHILD_UNIFORM);
+                return Ty::Tbl(Box::new(ty));
             }
         }
 
-        signal!(self.recording, trace::TRACE_FALLBACK_RESOLVE);
+        signal!(trace::TRACE_FALLBACK_RESOLVE);
         match self.lattice.site_elem[id].clone() {
             Tbl(inner) => {
-                signal!(self.recording, trace::TRACE_ELEM_FALLBACK_TBL);
-                crate::ast::StaticType::Table(Box::new(self.ty_to_static(&inner, id)))
+                signal!(trace::TRACE_ELEM_FALLBACK_TBL);
+                Ty::Tbl(Box::new(self.materialize_elem(&inner, id)))
             }
             Int => {
-                signal!(self.recording, trace::TRACE_ELEM_FALLBACK_INT);
-                crate::ast::StaticType::Integer
+                signal!(trace::TRACE_ELEM_FALLBACK_INT);
+                Int
             }
             Pending => {
-                signal!(self.recording, trace::TRACE_ANALYZE_PENDING);
-                crate::ast::StaticType::Unknown(id)
+                signal!(trace::TRACE_ANALYZE_PENDING);
+                Ty::Unknown(id)
             }
             Flt => {
-                signal!(self.recording, trace::TRACE_ELEM_FALLBACK_FLT);
-                crate::ast::StaticType::Float
+                signal!(trace::TRACE_ELEM_FALLBACK_FLT);
+                Flt
             }
             Bool => {
-                signal!(self.recording, trace::TRACE_ELEM_FALLBACK_BOOL);
-                crate::ast::StaticType::Boolean
+                signal!(trace::TRACE_ELEM_FALLBACK_BOOL);
+                Bool
             }
             Str => {
-                signal!(self.recording, trace::TRACE_ELEM_FALLBACK_STR);
-                crate::ast::StaticType::String
+                signal!(trace::TRACE_ELEM_FALLBACK_STR);
+                Str
             }
-            Any => crate::ast::StaticType::Any,
-            Ffi => crate::ast::StaticType::Ffi,
-            FfiLib => crate::ast::StaticType::FfiLib,
-            Coro => crate::ast::StaticType::Coro,
+            Any => Any,
+            Ffi => Ffi,
+            FfiLib => FfiLib,
+            Coro => Coro,
+            Ty::Unknown(_) => unreachable!(
+                "site_elem holds no nominal unknowns — the walk mints none; unknowns live in \
+                 the constraint store"
+            ),
             Conflict => {
-                signal!(self.recording, trace::TRACE_ELEM_FALLBACK_CONFLICT);
+                signal!(trace::TRACE_ELEM_FALLBACK_CONFLICT);
                 self.report_conflict(id)
             }
         }
     }
 
-    pub(super) fn ty_to_static(&mut self, ty: &Ty, site: usize) -> crate::ast::StaticType {
+    /// The NESTED-elem materialization (was `ty_to_static`, the language
+    /// bridge — the bridge is gone, the policy stays): identity on every
+    /// decided kind, a nested Pending rides as a fresh ghost Unknown, a
+    /// nested Conflict reports and rides as `Unknown(site)`.
+    fn materialize_elem(&mut self, ty: &Ty, site: usize) -> Ty {
         match ty {
             Int => {
-                signal!(self.recording, trace::TRACE_TY_STATIC_INT);
-                crate::ast::StaticType::Integer
+                signal!(trace::TRACE_TY_STATIC_INT);
+                Int
             }
             Pending => {
-                signal!(self.recording, trace::TRACE_TY_STATIC_PENDING);
+                signal!(trace::TRACE_TY_STATIC_PENDING);
                 let ghost = self.lattice.ghost_next;
                 self.lattice.ghost_next -= 1;
-                crate::ast::StaticType::Unknown(ghost)
+                Ty::Unknown(ghost)
             }
             Flt => {
-                signal!(self.recording, trace::TRACE_TY_STATIC_FLT);
-                crate::ast::StaticType::Float
+                signal!(trace::TRACE_TY_STATIC_FLT);
+                Flt
             }
             Bool => {
-                signal!(self.recording, trace::TRACE_TY_STATIC_BOOL);
-                crate::ast::StaticType::Boolean
+                signal!(trace::TRACE_TY_STATIC_BOOL);
+                Bool
             }
             Str => {
-                signal!(self.recording, trace::TRACE_TY_STATIC_STR);
-                crate::ast::StaticType::String
+                signal!(trace::TRACE_TY_STATIC_STR);
+                Str
             }
-            Any => crate::ast::StaticType::Any,
-            Ffi => crate::ast::StaticType::Ffi,
-            FfiLib => crate::ast::StaticType::FfiLib,
-            Coro => crate::ast::StaticType::Coro,
+            Any => Any,
+            Ffi => Ffi,
+            FfiLib => FfiLib,
+            Coro => Coro,
             Tbl(inner) => {
-                signal!(self.recording, trace::TRACE_TY_STATIC_TBL);
-                crate::ast::StaticType::Table(Box::new(self.ty_to_static(inner, site)))
+                signal!(trace::TRACE_TY_STATIC_TBL);
+                Ty::Tbl(Box::new(self.materialize_elem(inner, site)))
             }
+            Ty::Unknown(_) => unreachable!(
+                "site_elem holds no nominal unknowns — the walk mints none; unknowns live in \
+                 the constraint store"
+            ),
             Conflict => {
-                signal!(self.recording, trace::TRACE_TY_STATIC_CONFLICT);
+                signal!(trace::TRACE_TY_STATIC_CONFLICT);
                 self.report_conflict(site)
             }
         }
@@ -135,19 +156,19 @@ impl Recorded {
 }
 
 pub(super) fn propagate_elem_down(
-    elems: &mut [crate::ast::StaticType],
+    elems: &mut [Ty],
     child_sites: &BTreeMap<usize, BTreeSet<usize>>,
     site: usize,
 ) {
-    let crate::ast::StaticType::Table(elem) = elems[site].clone() else {
+    let Ty::Tbl(elem) = elems[site].clone() else {
         return;
     };
-    if matches!(*elem, crate::ast::StaticType::Unknown(_)) {
+    if matches!(*elem, Ty::Unknown(_)) {
         return;
     }
     if let Some(children) = child_sites.get(&site) {
         for &child in children {
-            if matches!(elems[child], crate::ast::StaticType::Unknown(_)) {
+            if matches!(elems[child], Ty::Unknown(_)) {
                 elems[child] = (*elem).clone();
                 propagate_elem_down(elems, child_sites, child);
             }
@@ -164,6 +185,13 @@ impl Analyzer {
         }
 
         let joined = join_ty(&self.lattice.site_elem[site], vt);
+        if matches!(joined, Conflict) && self.lattice.site_elem[site] != joined {
+            crate::glm_dbgln!(
+                "[decide] site {site}: {:?} -> Conflict (vt={:?})",
+                self.lattice.site_elem[site],
+                vt
+            );
+        }
         if self.lattice.site_elem[site] != joined {
             self.probe(rec, trace::TRACE_JOIN_RETYPED);
             self.lattice.site_elem[site] = joined.clone();
@@ -183,11 +211,23 @@ impl Analyzer {
             ..
         } = self;
         for scope in scopes.iter_mut() {
-            for ts in scope.values_mut() {
+            for (nm, ts) in scope.iter_mut() {
+                // Only bindings that ARE the table (or are still Pending) may
+                // adopt the table shape. A pinned scalar here is a cell read
+                // (dot access or index) that merely rides the table's sites
+                // for row-lifetime tracking — overwriting Int with Tbl(Int)
+                // makes the later scope-merge join Int + Tbl(Int) = Conflict.
                 if ts.aliases.contains(&site)
                     && !is_root(&site)
-                    && (ts.ty == Pending || ts.ty != expected_var_ty)
+                    && (ts.ty == Pending || matches!(ts.ty, Tbl(_)))
+                    && ts.ty != expected_var_ty
                 {
+                    crate::glm_dbgln!(
+                        "[decide-rewrite] site {site}: '{nm}' {:?} -> {:?} (vt={:?})",
+                        ts.ty,
+                        expected_var_ty,
+                        vt
+                    );
                     if rec.on() {
                         trace::compiler_trace_signal(trace::TRACE_DECIDE_UPDATE);
                     } else {

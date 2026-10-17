@@ -1,4 +1,4 @@
-/* async/glm_tenant.c — NEW (glm-owned, not engine-vendored): the
+/* async/glm_tenant.c (glm-owned, not engine-vendored): the
    multi-exec tenant registry + the sole-owner trace plate.
 
    Because this file lives in the ONE shared object the dynamic loader
@@ -6,9 +6,8 @@
    per-artifact glm_rt copy ever could:
      - .glm_rt_trace.bin is opened/mapped exactly once per process (CAS
        once-guard); every poke from every glm artifact and foreign C
-       companion lands on the same MAP_SHARED inode. The old
-       /proc/self/maps witness dance is gone — nobody else creates the
-       file, so nobody needs to detect an existing mapping.
+       companion lands on the same MAP_SHARED inode — nobody else
+       creates the file, so nobody needs to detect an existing mapping.
      - the exit-time leak report is installed once (atexit) and walks
        every registered exec's census mirror, so a leak names the module
        that leaked instead of whichever runtime copy happened to notice.

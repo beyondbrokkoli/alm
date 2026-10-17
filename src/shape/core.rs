@@ -53,6 +53,9 @@ impl TableShape {
         let mut changed = false;
 
         let new_ty = join_ty(&self.ty, &other.ty);
+        if matches!(new_ty, Ty::Conflict) && !matches!(self.ty, Ty::Conflict) {
+            crate::glm_dbgln!("[shape-join] {:?} join {:?} = Conflict", self.ty, other.ty);
+        }
         if self.ty != new_ty {
             self.ty = new_ty;
             changed = true;

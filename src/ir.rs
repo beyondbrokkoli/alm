@@ -1,4 +1,4 @@
-use crate::ast::StaticType;
+use crate::shape::Ty;
 use glm_rt::GlmElem;
 use std::marker::PhantomData;
 
@@ -20,6 +20,16 @@ pub struct Ptr;
 pub struct Byte;
 #[derive(Debug, Clone, Copy)]
 pub struct Any;
+/// The register class of a table's string-key lane: an i64 that carries a
+/// negative interned identity (STR_KEY_TAG | fnv1a_62, async/str_pool.c).
+/// Phantom-typed so ONLY the two key-derivation instructions
+/// (`StrKeyConst` for folded literals, `StrKey` for dynamic handles) can
+/// produce one — a user integer, however produced at runtime, can never
+/// address a record cell because it never shares a register class with
+/// `Reg<StrKey>` and the backend routes the two to distinct runtime
+/// entry points (`glm_tbl_set_skey` vs `glm_tbl_set`).
+#[derive(Debug, Clone, Copy)]
+pub struct StrKey;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Reg<R: Repr + ?Sized> {
@@ -60,6 +70,20 @@ impl Repr for Int {
     }
     fn any(reg: Reg<Self>) -> AnyReg {
         AnyReg::Int(reg)
+    }
+}
+
+impl Repr for StrKey {
+    fn llvm() -> &'static str {
+        "i64"
+    }
+    fn emit_move(target: &Reg<Self>, source: &Reg<Self>, code: &mut String) {
+        code.push_str(&format!("  %v{} = add i64 %v{}, 0\n", target.id, source.id));
+    }
+    // unreachable in practice: keys are addressing lanes, never packed
+    // into Any cells — the impl exists only because Reg<R: Repr> demands it
+    fn any(reg: Reg<Self>) -> AnyReg {
+        AnyReg::Int(Reg::new(reg.id))
     }
 }
 
@@ -230,14 +254,17 @@ impl RegKind {
     }
 }
 
-pub fn repr_of(ty: &StaticType) -> RegKind {
+pub fn repr_of(ty: &Ty) -> RegKind {
     match ty {
-        StaticType::Integer => RegKind::Int,
-        StaticType::Float => RegKind::Float,
-        StaticType::Boolean => RegKind::Bool,
-        StaticType::Any => RegKind::Any,
-        StaticType::String | StaticType::Table(_) | StaticType::Unknown(_) => RegKind::Ptr,
-        StaticType::Ffi | StaticType::FfiLib | StaticType::Coro => RegKind::Ptr,
+        Ty::Int => RegKind::Int,
+        Ty::Flt => RegKind::Float,
+        Ty::Bool => RegKind::Bool,
+        Ty::Any => RegKind::Any,
+        Ty::Str | Ty::Tbl(_) | Ty::Unknown(_) => RegKind::Ptr,
+        Ty::Ffi | Ty::FfiLib | Ty::Coro => RegKind::Ptr,
+        // the artifact path sees only decided kinds and unknowns — the
+        // elem table materializes flow state before facts assemble
+        Ty::Pending | Ty::Conflict => unreachable!("flow state never rides the artifact path"),
     }
 }
 
@@ -270,16 +297,15 @@ pub enum CellTy {
 }
 
 impl CellTy {
-    pub fn of(ty: &StaticType) -> Self {
+    pub fn of(ty: &Ty) -> Self {
         match ty {
-            StaticType::Integer => CellTy::Int,
-            StaticType::Float => CellTy::Float,
-            StaticType::Boolean => CellTy::Bool,
-            StaticType::Any => CellTy::Any,
-            StaticType::String | StaticType::Table(_) => CellTy::Ptr,
-            StaticType::Ffi | StaticType::FfiLib | StaticType::Coro | StaticType::Unknown(_) => {
-                CellTy::Byte
-            }
+            Ty::Int => CellTy::Int,
+            Ty::Flt => CellTy::Float,
+            Ty::Bool => CellTy::Bool,
+            Ty::Any => CellTy::Any,
+            Ty::Str | Ty::Tbl(_) => CellTy::Ptr,
+            Ty::Ffi | Ty::FfiLib | Ty::Coro | Ty::Unknown(_) => CellTy::Byte,
+            Ty::Pending | Ty::Conflict => unreachable!("flow state never rides the artifact path"),
         }
     }
 }
@@ -316,37 +342,57 @@ pub enum MoveRegs {
     },
 }
 
+/// The addressing lane of one table access: a user Integer index, or a
+/// string-key lane produced only by the key derivations. Constructed
+/// solely by the lowerer's `lower_index_key` — the two register classes
+/// cannot be confused, and the backend picks the runtime entry point
+/// (int vs skey) from this tag.
+#[derive(Debug, Clone, Copy)]
+pub enum TableKey {
+    Int(Reg<Int>),
+    Str(Reg<StrKey>),
+}
+
+impl TableKey {
+    pub fn id(&self) -> RegId {
+        match self {
+            TableKey::Int(r) => r.id,
+            TableKey::Str(r) => r.id,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CellGet {
     Int {
         target: Reg<Int>,
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
     },
     Float {
         target: Reg<Float>,
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
     },
     Bool {
         target: Reg<Bool>,
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
     },
     Ptr {
         target: Reg<Ptr>,
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
     },
     Byte {
         target: Reg<Byte>,
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
     },
     Any {
         target: Reg<Any>,
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
     },
 }
 
@@ -354,32 +400,32 @@ pub enum CellGet {
 pub enum CellSet {
     Int {
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
         value: Reg<Int>,
     },
     Float {
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
         value: Reg<Float>,
     },
     Bool {
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
         value: Reg<Bool>,
     },
     Ptr {
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
         value: Reg<Ptr>,
     },
     Byte {
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
         value: Reg<Byte>,
     },
     Any {
         table: Reg<Ptr>,
-        index: Reg<Int>,
+        index: TableKey,
         value: Reg<Any>,
     },
 }
@@ -633,8 +679,8 @@ impl NumRepr for Float {
 
 pub trait CellRepr: Repr {
     const TAG: CellTy;
-    fn get(target: Reg<Self>, table: Reg<Ptr>, index: Reg<Int>) -> CellGet;
-    fn set(table: Reg<Ptr>, index: Reg<Int>, value: Reg<Self>) -> CellSet;
+    fn get(target: Reg<Self>, table: Reg<Ptr>, index: TableKey) -> CellGet;
+    fn set(table: Reg<Ptr>, index: TableKey, value: Reg<Self>) -> CellSet;
     fn set_fast(
         table: Reg<Ptr>,
         index: Reg<Int>,
@@ -646,14 +692,14 @@ pub trait CellRepr: Repr {
 
 impl CellRepr for Int {
     const TAG: CellTy = CellTy::Int;
-    fn get(target: Reg<Self>, table: Reg<Ptr>, index: Reg<Int>) -> CellGet {
+    fn get(target: Reg<Self>, table: Reg<Ptr>, index: TableKey) -> CellGet {
         CellGet::Int {
             target,
             table,
             index,
         }
     }
-    fn set(table: Reg<Ptr>, index: Reg<Int>, value: Reg<Self>) -> CellSet {
+    fn set(table: Reg<Ptr>, index: TableKey, value: Reg<Self>) -> CellSet {
         CellSet::Int {
             table,
             index,
@@ -679,14 +725,14 @@ impl CellRepr for Int {
 
 impl CellRepr for Float {
     const TAG: CellTy = CellTy::Float;
-    fn get(target: Reg<Self>, table: Reg<Ptr>, index: Reg<Int>) -> CellGet {
+    fn get(target: Reg<Self>, table: Reg<Ptr>, index: TableKey) -> CellGet {
         CellGet::Float {
             target,
             table,
             index,
         }
     }
-    fn set(table: Reg<Ptr>, index: Reg<Int>, value: Reg<Self>) -> CellSet {
+    fn set(table: Reg<Ptr>, index: TableKey, value: Reg<Self>) -> CellSet {
         CellSet::Float {
             table,
             index,
@@ -712,14 +758,14 @@ impl CellRepr for Float {
 
 impl CellRepr for Bool {
     const TAG: CellTy = CellTy::Bool;
-    fn get(target: Reg<Self>, table: Reg<Ptr>, index: Reg<Int>) -> CellGet {
+    fn get(target: Reg<Self>, table: Reg<Ptr>, index: TableKey) -> CellGet {
         CellGet::Bool {
             target,
             table,
             index,
         }
     }
-    fn set(table: Reg<Ptr>, index: Reg<Int>, value: Reg<Self>) -> CellSet {
+    fn set(table: Reg<Ptr>, index: TableKey, value: Reg<Self>) -> CellSet {
         CellSet::Bool {
             table,
             index,
@@ -745,14 +791,14 @@ impl CellRepr for Bool {
 
 impl CellRepr for Ptr {
     const TAG: CellTy = CellTy::Ptr;
-    fn get(target: Reg<Self>, table: Reg<Ptr>, index: Reg<Int>) -> CellGet {
+    fn get(target: Reg<Self>, table: Reg<Ptr>, index: TableKey) -> CellGet {
         CellGet::Ptr {
             target,
             table,
             index,
         }
     }
-    fn set(table: Reg<Ptr>, index: Reg<Int>, value: Reg<Self>) -> CellSet {
+    fn set(table: Reg<Ptr>, index: TableKey, value: Reg<Self>) -> CellSet {
         CellSet::Ptr {
             table,
             index,
@@ -778,14 +824,14 @@ impl CellRepr for Ptr {
 
 impl CellRepr for Byte {
     const TAG: CellTy = CellTy::Byte;
-    fn get(target: Reg<Self>, table: Reg<Ptr>, index: Reg<Int>) -> CellGet {
+    fn get(target: Reg<Self>, table: Reg<Ptr>, index: TableKey) -> CellGet {
         CellGet::Byte {
             target,
             table,
             index,
         }
     }
-    fn set(table: Reg<Ptr>, index: Reg<Int>, value: Reg<Self>) -> CellSet {
+    fn set(table: Reg<Ptr>, index: TableKey, value: Reg<Self>) -> CellSet {
         CellSet::Byte {
             table,
             index,
@@ -811,14 +857,14 @@ impl CellRepr for Byte {
 
 impl CellRepr for Any {
     const TAG: CellTy = CellTy::Any;
-    fn get(target: Reg<Self>, table: Reg<Ptr>, index: Reg<Int>) -> CellGet {
+    fn get(target: Reg<Self>, table: Reg<Ptr>, index: TableKey) -> CellGet {
         CellGet::Any {
             target,
             table,
             index,
         }
     }
-    fn set(table: Reg<Ptr>, index: Reg<Int>, value: Reg<Self>) -> CellSet {
+    fn set(table: Reg<Ptr>, index: TableKey, value: Reg<Self>) -> CellSet {
         CellSet::Any {
             table,
             index,
@@ -990,6 +1036,22 @@ pub enum Instruction {
         target: Reg<Int>,
         val: i64,
     },
+    /// glm_str_key: the negative table key of a pooled string — one
+    /// unaligned load of the 8-byte prefix off the canonical handle
+    /// (async/str_pool.c). The ONLY runtime derivation of a StrKey
+    /// register; the constant-fold twin is StrKeyConst.
+    StrKey {
+        target: Reg<StrKey>,
+        s: Reg<Str>,
+    },
+    /// The compile-time fold of a literal string key: STR_KEY_TAG |
+    /// fnv1a_62 of the bytes, baked as an i64 constant (rt's
+    /// str_key_of_bytes — the ABI twin of str_pool.c's derive). The ONLY
+    /// constant producer of a StrKey register.
+    StrKeyConst {
+        target: Reg<StrKey>,
+        val: i64,
+    },
     LoadFloat {
         target: Reg<Float>,
         val: f64,
@@ -1031,7 +1093,7 @@ pub enum Instruction {
 
     TableNew {
         target: Reg<Ptr>,
-        elem: StaticType,
+        elem: Ty,
         flags: u8,
     },
     TableGet(CellGet),
@@ -1120,7 +1182,7 @@ pub enum Instruction {
     Phi(PhiRegs),
 
     Print {
-        operands: Vec<(RegId, StaticType)>,
+        operands: Vec<(RegId, Ty)>,
     },
 }
 

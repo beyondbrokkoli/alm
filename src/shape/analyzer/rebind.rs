@@ -14,6 +14,26 @@ pub(super) enum MixedPlan {
 
 impl Analyzer {
     pub(super) fn poison_moved(&mut self, depth: usize, name: &str) {
+        // the move-slot law: the binding becomes the MOVED marker, but
+        // the name's element slot survives it (exactly as `t = nil`
+        // keeps its slot) — record the severed sites so a later rebind's
+        // adoption bridges the history and the name→type view can still
+        // answer the pre-move table type
+        if let Some(bind) = self.walk.scopes[depth].get(name) {
+            let severed: BTreeSet<usize> = bind
+                .aliases
+                .iter()
+                .copied()
+                .filter(|s| !is_root(s) && !is_ghost(s))
+                .collect();
+            if !severed.is_empty() {
+                self.holds
+                    .moved_severed
+                    .entry(name.to_string())
+                    .or_default()
+                    .extend(severed);
+            }
+        }
         self.walk.scopes[depth].insert(
             name.to_string(),
             TableShape {
@@ -190,6 +210,16 @@ impl Analyzer {
             .copied()
             .filter(|r| !is_root(r))
             .collect();
+        if !roots.is_empty() {
+            let owned: Vec<usize> = roots.iter().copied().filter(|r| !is_ghost(r)).collect();
+            if !owned.is_empty() {
+                self.holds
+                    .nil_severed
+                    .entry(name.to_string())
+                    .or_default()
+                    .extend(owned);
+            }
+        }
         if !roots.is_empty() && rec.on() {
             let mixed_ghost = roots.iter().any(is_ghost);
             let mixed_site = roots.iter().any(|s| !is_ghost(s));
