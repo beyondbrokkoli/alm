@@ -326,6 +326,8 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
     let mut needs_tbl_set_any_decl = false;
     let mut needs_str_len_decl = false;
     let mut needs_sys_alloc_count_decl = false;
+    let mut needs_sys_exec_count_decl = false;
+    let mut needs_coro_decls = false;
     let mut needs_ffi_load_decl = false;
     let mut needs_ffi_arg_kind_decl = false;
     let mut needs_ffi_call_decl = false;
@@ -334,7 +336,6 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
     let mut needs_any_len_decl = false;
     let mut needs_tbl_len_decl = false;
     let mut needs_any_from: u8 = 0;
-    let mut has_print = false;
     let mut needs_hdr_md = false;
     let mut ks = 0usize;
     let seam_plan = plan_seams(program);
@@ -566,6 +567,49 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                         target.id
                     ));
                 }
+                Instruction::SysExecCount { target } => {
+                    needs_sys_exec_count_decl = true;
+                    code.push_str(&format!("  %v{} = call i64 @sys_exec_count()\n", target.id));
+                }
+                Instruction::CoroCreate { target, lib } => {
+                    needs_coro_decls = true;
+                    code.push_str(&format!(
+                        "  %v{} = call i64 @glm_coro_create(ptr %v{})\n",
+                        target.id, lib.id
+                    ));
+                }
+                Instruction::CoroResume {
+                    target,
+                    handle,
+                    args,
+                } => {
+                    needs_coro_decls = true;
+                    code.push_str(&format!(
+                        "  %v{} = call i64 @glm_coro_resume(i64 %v{}, ptr %v{})\n",
+                        target.id, handle.id, args.id
+                    ));
+                }
+                Instruction::CoroYield { target, value } => {
+                    needs_coro_decls = true;
+                    code.push_str(&format!(
+                        "  %v{} = call i64 @glm_coro_yield(i64 %v{})\n",
+                        target.id, value.id
+                    ));
+                }
+                Instruction::CoroStatus { target, handle } => {
+                    needs_coro_decls = true;
+                    code.push_str(&format!(
+                        "  %v{} = call ptr @glm_coro_status(i64 %v{})\n",
+                        target.id, handle.id
+                    ));
+                }
+                Instruction::CoroClose { target, handle } => {
+                    needs_coro_decls = true;
+                    code.push_str(&format!(
+                        "  %v{} = call i64 @glm_coro_close(i64 %v{})\n",
+                        target.id, handle.id
+                    ));
+                }
                 Instruction::FfiLoad { target, path } => {
                     needs_ffi_load_decl = true;
                     code.push_str(&format!(
@@ -652,7 +696,6 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                     emit_phi(target, args, &mut code)
                 }
                 Instruction::Print { operands } => {
-                    has_print = true;
                     for (i, (r, ty)) in operands.iter().enumerate() {
                         if i > 0 {
                             code.push_str("  call void @glm_print_sep()\n");
@@ -683,9 +726,9 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                                     "Type Error: tables cannot be printed".to_string(),
                                 ]);
                             }
-                            StaticType::Ffi | StaticType::FfiLib => {
+                            StaticType::Ffi | StaticType::FfiLib | StaticType::Coro => {
                                 return Err(vec![
-                                    "Type Error: the ffi surface cannot be printed".to_string(),
+                                    "Type Error: the module surfaces cannot be printed".to_string(),
                                 ]);
                             }
                             StaticType::Unknown(_) => {
@@ -869,6 +912,16 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
     if needs_sys_alloc_count_decl {
         head.push_str("declare i64 @sys_alloc_count()\n");
     }
+    if needs_sys_exec_count_decl {
+        head.push_str("declare i64 @sys_exec_count()\n");
+    }
+    if needs_coro_decls {
+        head.push_str("declare i64 @glm_coro_create(ptr)\n");
+        head.push_str("declare i64 @glm_coro_resume(i64, ptr)\n");
+        head.push_str("declare i64 @glm_coro_yield(i64)\n");
+        head.push_str("declare ptr @glm_coro_status(i64)\n");
+        head.push_str("declare i64 @glm_coro_close(i64)\n");
+    }
     if needs_ffi_load_decl {
         head.push_str("declare ptr @glm_ffi_load(ptr)\n");
     }
@@ -915,33 +968,30 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
         head.push_str("declare i32 @glm_exec_main(i32, ptr, i32, ptr)\n");
     }
 
-    let rt_referenced = needs_tbl_new_decl
-        || needs_tbl_reserve_decl
-        || needs_tbl_free_decl
-        || needs_tbl_free_except_decl
-        || needs_tbl_free_except_n_decl
-        || needs_tbl_get_decl
-        || needs_tbl_set_decl
-        || needs_tbl_get_any_decl
-        || needs_tbl_set_any_decl
-        || needs_str_len_decl
-        || needs_sys_alloc_count_decl
-        || needs_ffi_load_decl
-        || needs_ffi_arg_kind_decl
-        || needs_ffi_call_decl
-        || needs_any_print_decl
-        || needs_any_eq_decl
-        || needs_div_guard
-        || needs_exec_main_decl
-        || !registry.is_empty()
-        || has_print;
     let mut anchor = String::new();
-    if !rt_referenced && matches!(program.entry, EntryKind::Lib) {
+    /* unconditional for every .so: ANY module can be spawned as a
+     * coroutine, and the coro thread wrapper dlsym's glm_tbl_new/set/free
+     * to build the boundary table on the worker thread — the anchor keeps
+     * the full runtime surface exported even when the module's own IR
+     * never references it (the linker would drop the unreferenced archive
+     * members otherwise). Each declare is emitted only when the module's
+     * own needs_* flag hasn't already declared it (LLVM refuses
+     * redeclaration); glm_str_intern has no needs flag — only the anchor
+     * and the .init_array registry ever reference it. */
+    if matches!(program.entry, EntryKind::Lib) {
+        if !needs_tbl_new_decl {
+            anchor.push_str("declare ptr @glm_tbl_new(i64, i8)\n");
+        }
+        if !needs_tbl_set_decl {
+            anchor.push_str("declare void @glm_tbl_set(ptr, i64, ptr)\n");
+        }
+        if !needs_tbl_get_decl {
+            anchor.push_str("declare void @glm_tbl_get(ptr, i64, ptr, i64)\n");
+        }
+        if !needs_tbl_free_decl {
+            anchor.push_str("declare void @glm_tbl_free(ptr)\n");
+        }
         anchor.push_str(concat!(
-            "declare ptr @glm_tbl_new(i64, i8)\n",
-            "declare void @glm_tbl_set(ptr, i64, ptr)\n",
-            "declare void @glm_tbl_get(ptr, i64, ptr, i64)\n",
-            "declare void @glm_tbl_free(ptr)\n",
             "declare ptr @glm_str_intern(ptr, i64)\n",
             "@.glm_rt_anchor = internal constant [5 x i64] [\n",
             "  i64 ptrtoint (ptr @glm_tbl_new to i64),\n",

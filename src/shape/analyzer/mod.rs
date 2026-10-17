@@ -11,7 +11,7 @@ use super::facts;
 use super::facts::ShapeFacts;
 use super::helpers::{const_key_value, extract_guard, merge_table_scopes};
 use super::ty::{Ty, arith_ty, contains_any, join_ty, pinned_scalar, value_kind};
-use Ty::{Any, Bool, Conflict, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
+use Ty::{Any, Bool, Conflict, Coro, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
 
 mod checks;
 mod exits;

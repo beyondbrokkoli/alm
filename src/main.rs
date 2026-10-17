@@ -111,7 +111,9 @@ fn references_arg(stmts: &[Stmt]) -> bool {
             | ast::Expr::String(_)
             | ast::Expr::Nil
             | ast::Expr::SysAllocCount
-            | ast::Expr::FfiModule => false,
+            | ast::Expr::SysExecCount
+            | ast::Expr::FfiModule
+            | ast::Expr::CoroModule => false,
             ast::Expr::Field { obj, .. } => expr(obj),
         }
     }
@@ -153,6 +155,8 @@ fn uses_ffi(stmts: &[Stmt]) -> bool {
             | ast::Expr::String(_)
             | ast::Expr::Nil
             | ast::Expr::SysAllocCount
+            | ast::Expr::SysExecCount
+            | ast::Expr::CoroModule
             | ast::Expr::Identifier(_) => false,
         }
     }
@@ -529,6 +533,13 @@ it defaults to libglm_out.so (or glm_out for --exe).";
         env!("CARGO_MANIFEST_DIR"),
         profile
     );
+    // the C11 async substrate lives next to the runtime archive; every
+    // artifact links it so process-wide glm state (exec registry, trace
+    // plate, exit report) has exactly one home per process
+    let async_dir = std::path::Path::new(&runtime)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".into());
 
     let link_kind = if standalone {
         "executable"
@@ -552,6 +563,10 @@ it defaults to libglm_out.so (or glm_out for --exe).";
     let status = link
         .arg(&ll_name)
         .arg(&runtime)
+        .arg(format!("-L{async_dir}"))
+        .arg("-lglm_async")
+        .arg(format!("-Wl,-rpath,{async_dir}"))
+        .arg("-Wl,-rpath,$ORIGIN")
         .arg("-lpthread")
         .arg("-ldl")
         .arg("-lm")

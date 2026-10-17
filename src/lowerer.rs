@@ -32,7 +32,7 @@ pub fn boundary_elem_of(elem: StaticType) -> glm_rt::GlmElem {
         StaticType::Integer | StaticType::Table(_) | StaticType::Unknown(_) => {
             glm_rt::GlmElem::Integer
         }
-        StaticType::Ffi | StaticType::FfiLib => glm_rt::GlmElem::Integer,
+        StaticType::Ffi | StaticType::FfiLib | StaticType::Coro => glm_rt::GlmElem::Integer,
     }
 }
 
@@ -644,7 +644,7 @@ impl<'a> IrLowerer<'a> {
                             });
                             AnyReg::Ptr(Reg::new(reg_id))
                         }
-                        StaticType::Ffi | StaticType::FfiLib => {
+                        StaticType::Ffi | StaticType::FfiLib | StaticType::Coro => {
                             self.emit(Instruction::LoadNull {
                                 target: Reg::new(reg_id),
                             });
@@ -1391,6 +1391,110 @@ impl<'a> IrLowerer<'a> {
                      the checker and the lowerer disagree"
                 ))),
             },
+            StaticType::Coro => match name {
+                "create" => {
+                    if args.len() != 1 {
+                        return Err(LowerError(
+                            "Lower Error: coroutine.create arity — \
+                             the checker and the lowerer disagree"
+                                .into(),
+                        ));
+                    }
+                    let lib = self.lower_expr(&args[0], None)?;
+                    let lib_reg = ptr_lane(lib.reg)?;
+                    self.emit(Instruction::CoroCreate {
+                        target: Reg::new(reg),
+                        lib: lib_reg,
+                    });
+                    Ok(TypedReg {
+                        reg: AnyReg::Int(Reg::new(reg)),
+                        ty: StaticType::Integer,
+                    })
+                }
+                "resume" => {
+                    if args.len() != 2 {
+                        return Err(LowerError(
+                            "Lower Error: coroutine.resume arity — \
+                             the checker and the lowerer disagree"
+                                .into(),
+                        ));
+                    }
+                    let handle = self.lower_expr(&args[0], None)?;
+                    let handle_reg = int_of(handle.reg)?;
+                    let tbl = self.lower_expr(&args[1], None)?;
+                    let tbl_reg = ptr_of(tbl.reg)?;
+                    self.emit(Instruction::CoroResume {
+                        target: Reg::new(reg),
+                        handle: handle_reg,
+                        args: tbl_reg,
+                    });
+                    Ok(TypedReg {
+                        reg: AnyReg::Int(Reg::new(reg)),
+                        ty: StaticType::Integer,
+                    })
+                }
+                "yield" => {
+                    if args.len() != 1 {
+                        return Err(LowerError(
+                            "Lower Error: coroutine.yield arity — \
+                             the checker and the lowerer disagree"
+                                .into(),
+                        ));
+                    }
+                    let value = self.lower_expr(&args[0], None)?;
+                    let value_reg = int_of(value.reg)?;
+                    self.emit(Instruction::CoroYield {
+                        target: Reg::new(reg),
+                        value: value_reg,
+                    });
+                    Ok(TypedReg {
+                        reg: AnyReg::Int(Reg::new(reg)),
+                        ty: StaticType::Integer,
+                    })
+                }
+                "status" => {
+                    if args.len() != 1 {
+                        return Err(LowerError(
+                            "Lower Error: coroutine.status arity — \
+                             the checker and the lowerer disagree"
+                                .into(),
+                        ));
+                    }
+                    let handle = self.lower_expr(&args[0], None)?;
+                    let handle_reg = int_of(handle.reg)?;
+                    self.emit(Instruction::CoroStatus {
+                        target: Reg::new(reg),
+                        handle: handle_reg,
+                    });
+                    Ok(TypedReg {
+                        reg: AnyReg::Str(Reg::new(reg)),
+                        ty: StaticType::String,
+                    })
+                }
+                "close" => {
+                    if args.len() != 1 {
+                        return Err(LowerError(
+                            "Lower Error: coroutine.close arity — \
+                             the checker and the lowerer disagree"
+                                .into(),
+                        ));
+                    }
+                    let handle = self.lower_expr(&args[0], None)?;
+                    let handle_reg = int_of(handle.reg)?;
+                    self.emit(Instruction::CoroClose {
+                        target: Reg::new(reg),
+                        handle: handle_reg,
+                    });
+                    Ok(TypedReg {
+                        reg: AnyReg::Int(Reg::new(reg)),
+                        ty: StaticType::Integer,
+                    })
+                }
+                _ => Err(LowerError(format!(
+                    "Lower Error: unknown coroutine member '{name}' — \
+                     the checker and the lowerer disagree"
+                ))),
+            },
             StaticType::FfiLib => {
                 if args.len() != 1 {
                     return Err(LowerError(
@@ -1480,6 +1584,15 @@ impl<'a> IrLowerer<'a> {
                     ty: StaticType::Integer,
                 })
             }
+            Expr::SysExecCount => {
+                self.emit(Instruction::SysExecCount {
+                    target: Reg::new(reg),
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Int(Reg::new(reg)),
+                    ty: StaticType::Integer,
+                })
+            }
             Expr::FfiModule => {
                 self.emit(Instruction::LoadNull {
                     target: Reg::new(reg),
@@ -1487,6 +1600,15 @@ impl<'a> IrLowerer<'a> {
                 Ok(TypedReg {
                     reg: AnyReg::Ptr(Reg::new(reg)),
                     ty: StaticType::Ffi,
+                })
+            }
+            Expr::CoroModule => {
+                self.emit(Instruction::LoadNull {
+                    target: Reg::new(reg),
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Ptr(Reg::new(reg)),
+                    ty: StaticType::Coro,
                 })
             }
             Expr::Field { .. } => Err(LowerError(

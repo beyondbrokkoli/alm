@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn die(line_no: usize, raw: &str, msg: String) -> ! {
     panic!("trace_signals.txt:{line_no}: {msg}\n  > {raw}")
@@ -19,8 +19,78 @@ fn take_field(line: &str) -> (&str, &str) {
     }
 }
 
+/// Compile the C11 async substrate (async) into ONE shared object under
+/// target/<profile>/ — the process-global glm state must live in a .so so
+/// the loader guarantees a single copy per process no matter how many glm
+/// artifacts link it. Every artifact the compiler emits gains
+/// DT_NEEDED libglm_async.so (see main.rs's clang link line).
+fn build_async_core() {
+    const SOURCES: [&str; 7] = [
+        "sys_sync.c",
+        "state_globals.c",
+        "mailbox.c",
+        "ring_stream.c",
+        "mailbox_accessors.c",
+        "glm_tenant.c",
+        "glm_coro.c",
+    ];
+
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let c_dir = manifest.join("async");
+    // OUT_DIR = target/<profile>/build/<pkg>/<hash>/out (layout varies across
+    // cargo versions) — walk up to the "build" dir, its parent is the profile
+    let target_profile = {
+        let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
+        let build_dir = out
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "build"))
+            .expect("OUT_DIR lives under target/<profile>/build/");
+        build_dir
+            .parent()
+            .expect("build/ has a parent")
+            .to_path_buf()
+    };
+
+    let cc = env::var("CC").unwrap_or_else(|_| "clang".into());
+    let so = target_profile.join("libglm_async.so");
+    let mut cmd = std::process::Command::new(&cc);
+    cmd.arg("-shared")
+        .arg("-fPIC")
+        .arg("-O2")
+        // gnu11, not c11: the substrate calls POSIX (usleep, ftruncate, mmap)
+        .arg("-std=gnu11")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg(format!("-I{}", c_dir.display()));
+    for src in SOURCES {
+        cmd.arg(c_dir.join(src));
+        println!("cargo:rerun-if-changed=async/{src}");
+    }
+    cmd.arg("-lpthread").arg("-o").arg(&so);
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("failed to spawn {cc} for libglm_async.so: {e}"));
+    if !status.success() {
+        panic!("building libglm_async.so failed");
+    }
+
+    // the glm bin (and its rlib link) resolves the vx_* surface from here;
+    // the rpath keeps the compiler's own dev-loop host able to dlopen the
+    // artifacts it just built, which DT_NEEDED this .so
+    println!(
+        "cargo:rustc-link-search=native={}",
+        target_profile.display()
+    );
+    println!("cargo:rustc-link-lib=dylib=glm_async");
+    println!(
+        "cargo:rustc-link-arg=-Wl,-rpath,{}",
+        target_profile.display()
+    );
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=trace_signals.txt");
+    build_async_core();
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
     let ssot = fs::read_to_string("trace_signals.txt")
         .expect("trace_signals.txt (the signal SSOT) must sit next to Cargo.toml");

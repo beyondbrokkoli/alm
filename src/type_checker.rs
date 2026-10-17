@@ -352,7 +352,7 @@ impl<'a> TypeChecker<'a> {
                                     .to_string(),
                             );
                         }
-                        StaticType::Ffi | StaticType::FfiLib => {
+                        StaticType::Ffi | StaticType::FfiLib | StaticType::Coro => {
                             return Err("Type Error: an Any table's cells hold scalars — the ffi \
                                  surface cannot enter a dynamic cell"
                                 .to_string());
@@ -548,13 +548,138 @@ impl<'a> TypeChecker<'a> {
                     "Type Error: unknown ffi member '{name}' — load, cdef, arg_kind"
                 )),
             },
+            StaticType::Coro => {
+                match name {
+                    "create" => {
+                        if args.len() != 1 {
+                            return Err("Type Error: coroutine.create takes exactly one library"
+                                .to_string());
+                        }
+                        let raw = self.check_expr(&args[0])?;
+                        let t = self.resolve_var(&raw);
+                        match t {
+                            StaticType::FfiLib => Ok(StaticType::Integer),
+                            other => Err(format!(
+                                "Type Error: coroutine.create takes a library handle, got {}",
+                                type_name(&other)
+                            )),
+                        }
+                    }
+                    "resume" => {
+                        if args.len() != 2 {
+                            return Err(
+                                "Type Error: coroutine.resume takes a coroutine handle and one \
+                             table — the spawn inputs (its first three cells ride the \
+                             worker's boundary)"
+                                    .to_string(),
+                            );
+                        }
+                        let raw = self.check_expr(&args[0])?;
+                        let t = self.resolve_var(&raw);
+                        let t = if let StaticType::Unknown(id) = t {
+                            self.bind(id, StaticType::Integer)?;
+                            StaticType::Integer
+                        } else {
+                            t
+                        };
+                        match t {
+                            StaticType::Integer => {}
+                            other => {
+                                return Err(format!(
+                                    "Type Error: coroutine.resume's first argument is a \
+                                 coroutine handle, got {}",
+                                    type_name(&other)
+                                ));
+                            }
+                        }
+                        let raw = self.check_expr(&args[1])?;
+                        let t = self.resolve_var(&raw);
+                        match t {
+                            StaticType::Table(_) => Ok(StaticType::Integer),
+                            other => Err(format!(
+                                "Type Error: coroutine.resume's second argument is the input \
+                             table, got {}",
+                                type_name(&other)
+                            )),
+                        }
+                    }
+                    "yield" => {
+                        if args.len() != 1 {
+                            return Err(
+                                "Type Error: coroutine.yield takes exactly one integer".to_string()
+                            );
+                        }
+                        let raw = self.check_expr(&args[0])?;
+                        let t = self.resolve_var(&raw);
+                        let t = if let StaticType::Unknown(id) = t {
+                            self.bind(id, StaticType::Integer)?;
+                            StaticType::Integer
+                        } else {
+                            t
+                        };
+                        match t {
+                            StaticType::Integer => Ok(StaticType::Integer),
+                            other => Err(format!(
+                                "Type Error: coroutine.yield streams one integer, got {}",
+                                type_name(&other)
+                            )),
+                        }
+                    }
+                    "status" => {
+                        if args.len() != 1 {
+                            return Err("Type Error: coroutine.status takes exactly one coroutine"
+                                .to_string());
+                        }
+                        let raw = self.check_expr(&args[0])?;
+                        let t = self.resolve_var(&raw);
+                        let t = if let StaticType::Unknown(id) = t {
+                            self.bind(id, StaticType::Integer)?;
+                            StaticType::Integer
+                        } else {
+                            t
+                        };
+                        match t {
+                            StaticType::Integer => Ok(StaticType::String),
+                            other => Err(format!(
+                                "Type Error: coroutine.status takes a coroutine handle, got {}",
+                                type_name(&other)
+                            )),
+                        }
+                    }
+                    "close" => {
+                        if args.len() != 1 {
+                            return Err("Type Error: coroutine.close takes exactly one coroutine"
+                                .to_string());
+                        }
+                        let raw = self.check_expr(&args[0])?;
+                        let t = self.resolve_var(&raw);
+                        let t = if let StaticType::Unknown(id) = t {
+                            self.bind(id, StaticType::Integer)?;
+                            StaticType::Integer
+                        } else {
+                            t
+                        };
+                        match t {
+                            StaticType::Integer => Ok(StaticType::Integer),
+                            other => Err(format!(
+                                "Type Error: coroutine.close takes a coroutine handle, got {}",
+                                type_name(&other)
+                            )),
+                        }
+                    }
+                    _ => Err(format!(
+                        "Type Error: unknown coroutine member '{name}' — create, resume, yield, \
+                     status, close"
+                    )),
+                }
+            }
             StaticType::FfiLib => Err(format!(
                 "Type Error: {base}.{name} is the drive verb — a statement on its own line; \
                  the module's result stays in the module's world, nothing comes back to bind"
             )),
             _ => Err(format!(
-                "Type Error: '{base}' is not the ffi module or a loaded library — '.' is \
-                 the ffi surface's, tables use '[]'"
+                "Type Error: '{base}' is not a module surface — '.' is the ffi/coroutine \
+                 surface's, tables use '[]'"
             )),
         }
     }
@@ -831,8 +956,9 @@ impl<'a> TypeChecker<'a> {
                     },
                 }
             }
-            Expr::SysAllocCount => Ok(StaticType::Integer),
+            Expr::SysAllocCount | Expr::SysExecCount => Ok(StaticType::Integer),
             Expr::FfiModule => Ok(StaticType::Ffi),
+            Expr::CoroModule => Ok(StaticType::Coro),
             Expr::Field { .. } => Err(
                 "Type Error: '.' is the ffi surface's — use it in call position: \
                  ffi.load(path), ffi.arg_kind(lib), lib.sym(args)"
@@ -1165,6 +1291,7 @@ fn static_join(l: &StaticType, r: &StaticType) -> Option<StaticType> {
             StaticType::Table(inner) => Ty::Tbl(Box::new(to_ty(inner)?)),
             StaticType::Ffi => Ty::Ffi,
             StaticType::FfiLib => Ty::FfiLib,
+            StaticType::Coro => Ty::Coro,
             StaticType::Unknown(_) => return None,
         })
     }
@@ -1177,6 +1304,7 @@ fn static_join(l: &StaticType, r: &StaticType) -> Option<StaticType> {
             Ty::Any => StaticType::Any,
             Ty::Ffi => StaticType::Ffi,
             Ty::FfiLib => StaticType::FfiLib,
+            Ty::Coro => StaticType::Coro,
             Ty::Tbl(inner) => StaticType::Table(Box::new(to_static(inner)?)),
             Ty::Pending | Ty::Conflict => return None,
         })
@@ -1203,6 +1331,7 @@ fn type_name(ty: &StaticType) -> String {
         StaticType::Unknown(_) => "?".to_string(),
         StaticType::Ffi => "Ffi".to_string(),
         StaticType::FfiLib => "FfiLib".to_string(),
+        StaticType::Coro => "Coro".to_string(),
         StaticType::Any => "Any".to_string(),
     }
 }

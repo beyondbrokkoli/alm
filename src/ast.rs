@@ -8,6 +8,7 @@ pub enum StaticType {
     Unknown(usize),
     Ffi,
     FfiLib,
+    Coro,
     Any,
 }
 
@@ -22,6 +23,7 @@ impl std::fmt::Display for StaticType {
             StaticType::Unknown(_) => write!(f, "?"),
             StaticType::Ffi => write!(f, "Ffi"),
             StaticType::FfiLib => write!(f, "FfiLib"),
+            StaticType::Coro => write!(f, "Coro"),
             StaticType::Any => write!(f, "Any"),
         }
     }
@@ -81,7 +83,9 @@ pub enum Expr {
         expr: Box<Expr>,
     },
     SysAllocCount,
+    SysExecCount,
     FfiModule,
+    CoroModule,
     Field {
         obj: Box<Expr>,
         name: String,

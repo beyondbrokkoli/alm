@@ -237,7 +237,7 @@ pub fn repr_of(ty: &StaticType) -> RegKind {
         StaticType::Boolean => RegKind::Bool,
         StaticType::Any => RegKind::Any,
         StaticType::String | StaticType::Table(_) | StaticType::Unknown(_) => RegKind::Ptr,
-        StaticType::Ffi | StaticType::FfiLib => RegKind::Ptr,
+        StaticType::Ffi | StaticType::FfiLib | StaticType::Coro => RegKind::Ptr,
     }
 }
 
@@ -277,7 +277,9 @@ impl CellTy {
             StaticType::Boolean => CellTy::Bool,
             StaticType::Any => CellTy::Any,
             StaticType::String | StaticType::Table(_) => CellTy::Ptr,
-            StaticType::Ffi | StaticType::FfiLib | StaticType::Unknown(_) => CellTy::Byte,
+            StaticType::Ffi | StaticType::FfiLib | StaticType::Coro | StaticType::Unknown(_) => {
+                CellTy::Byte
+            }
         }
     }
 }
@@ -1049,6 +1051,32 @@ pub enum Instruction {
 
     SysAllocCount {
         target: Reg<Int>,
+    },
+
+    SysExecCount {
+        target: Reg<Int>,
+    },
+
+    CoroCreate {
+        target: Reg<Int>,
+        lib: Reg<Ptr>,
+    },
+    CoroResume {
+        target: Reg<Int>,
+        handle: Reg<Int>,
+        args: Reg<Ptr>,
+    },
+    CoroYield {
+        target: Reg<Int>,
+        value: Reg<Int>,
+    },
+    CoroStatus {
+        target: Reg<Str>,
+        handle: Reg<Int>,
+    },
+    CoroClose {
+        target: Reg<Int>,
+        handle: Reg<Int>,
     },
 
     FfiLoad {

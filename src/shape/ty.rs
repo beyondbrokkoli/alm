@@ -9,6 +9,7 @@ pub enum Ty {
     Tbl(Box<Ty>),
     Ffi,
     FfiLib,
+    Coro,
     Any,
     Conflict,
 }

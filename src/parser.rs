@@ -540,23 +540,39 @@ impl<'a> Parser<'a> {
                     self.expect(Token::RightParen)?;
                     return Ok(Expr::SysAllocCount);
                 }
+                if name == "sys_exec_count" && matches!(self.tokens.peek(), Some(Token::LeftParen))
+                {
+                    self.tokens.next();
+                    self.expect(Token::RightParen)?;
+                    return Ok(Expr::SysExecCount);
+                }
                 if name == "require" && matches!(self.tokens.peek(), Some(Token::LeftParen)) {
                     self.tokens.next();
-                    match self.tokens.next() {
-                        Some(Token::String(module)) if module.trim_matches('"') == "ffi" => {}
-                        Some(Token::String(other)) => {
-                            return Err(ParseError(format!(
-                                "Syntax Error: require(\"{}\") — the dialect provides only \
-                                 require(\"ffi\") (the mocked LuaJIT ffi surface)",
-                                other.trim_matches('"')
-                            )));
-                        }
+                    let module = match self.tokens.next() {
+                        Some(Token::String(module)) => module,
                         _ => {
                             return Err(ParseError(
                                 "Syntax Error: require takes one string literal — \
-                                 require(\"ffi\") is the one module the dialect provides"
+                                 require(\"ffi\") and require(\"coroutine\") are the \
+                                 modules the dialect provides"
                                     .into(),
                             ));
+                        }
+                    };
+                    let name = module.trim_matches('"');
+                    match name {
+                        "ffi" => {}
+                        "coroutine" => {
+                            self.expect(Token::RightParen)?;
+                            return Ok(Expr::CoroModule);
+                        }
+                        other => {
+                            return Err(ParseError(format!(
+                                "Syntax Error: require(\"{other}\") — the dialect provides \
+                                 only require(\"ffi\") (the mocked LuaJIT ffi surface) and \
+                                 require(\"coroutine\") (the OS-thread parody of Lua's \
+                                 cooperative coroutines)"
+                            )));
                         }
                     }
                     self.expect(Token::RightParen)?;

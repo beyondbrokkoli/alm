@@ -86,6 +86,7 @@ impl Recorded {
             Any => crate::ast::StaticType::Any,
             Ffi => crate::ast::StaticType::Ffi,
             FfiLib => crate::ast::StaticType::FfiLib,
+            Coro => crate::ast::StaticType::Coro,
             Conflict => {
                 signal!(self.recording, trace::TRACE_ELEM_FALLBACK_CONFLICT);
                 self.report_conflict(id)
@@ -120,6 +121,7 @@ impl Recorded {
             Any => crate::ast::StaticType::Any,
             Ffi => crate::ast::StaticType::Ffi,
             FfiLib => crate::ast::StaticType::FfiLib,
+            Coro => crate::ast::StaticType::Coro,
             Tbl(inner) => {
                 signal!(self.recording, trace::TRACE_TY_STATIC_TBL);
                 crate::ast::StaticType::Table(Box::new(self.ty_to_static(inner, site)))

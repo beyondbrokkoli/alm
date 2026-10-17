@@ -224,7 +224,9 @@ fn number_expr(expr: &Expr, sites: &mut BTreeMap<*const Expr, usize>) {
             }
         }
         Expr::SysAllocCount => {}
+        Expr::SysExecCount => {}
         Expr::FfiModule => {}
+        Expr::CoroModule => {}
         Expr::Field { obj, .. } => {
             number_expr(obj, sites);
         }

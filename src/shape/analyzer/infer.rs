@@ -560,9 +560,14 @@ impl Analyzer {
                 signal!(rec.on(), trace::TRACE_INFER_SYSALLOC);
                 Ok((Int, BTreeSet::new(), BTreeMap::new()))
             }
+            Expr::SysExecCount => {
+                signal!(rec.on(), trace::TRACE_INFER_SYS_EXEC);
+                Ok((Int, BTreeSet::new(), BTreeMap::new()))
+            }
             Expr::FfiModule => Ok((Ffi, BTreeSet::new(), BTreeMap::new())),
+            Expr::CoroModule => Ok((Coro, BTreeSet::new(), BTreeMap::new())),
             Expr::Field { .. } => Err(ShapeError(
-                "Scope Error: '.' is the ffi surface's — use it in call position".into(),
+                "Scope Error: '.' is the ffi/coroutine surface's — use it in call position".into(),
             )),
             Expr::Function { .. } => {
                 signal!(rec.on(), trace::TRACE_INFER_IDENT);
@@ -592,9 +597,19 @@ impl Analyzer {
                             (Pending, BTreeSet::new(), BTreeMap::new())
                         });
                     }
+                    if bind.ty == Coro {
+                        for a in args {
+                            self.infer_expr(rec, a)?;
+                        }
+                        return Ok(if name.as_str() == "status" {
+                            (Str, BTreeSet::new(), BTreeMap::new())
+                        } else {
+                            (Int, BTreeSet::new(), BTreeMap::new())
+                        });
+                    }
                     return Err(ShapeError(format!(
-                        "Scope Error: '{base}' is not the ffi module or a loaded library — \
-                         '.' is the ffi surface's, tables use '[]'"
+                        "Scope Error: '{base}' is not the ffi module, a loaded library, or \
+                         the coroutine module — '.' is the module surfaces', tables use '[]'"
                     )));
                 }
                 let name = match callee.as_ref() {

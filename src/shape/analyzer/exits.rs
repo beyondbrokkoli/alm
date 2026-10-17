@@ -565,6 +565,7 @@ impl Analyzer {
             Expr::UnaryOp { expr, .. } => self.collect_temp_sites(expr, Fate::Dies, out),
             Expr::Function { .. } => {}
             Expr::FfiModule => {}
+            Expr::CoroModule => {}
             Expr::Field { obj, .. } => {
                 self.collect_temp_sites(obj, Fate::Dies, out);
             }
@@ -574,7 +575,8 @@ impl Analyzer {
             | Expr::String(_)
             | Expr::Nil
             | Expr::Identifier(_)
-            | Expr::SysAllocCount => {}
+            | Expr::SysAllocCount
+            | Expr::SysExecCount => {}
         }
     }
 

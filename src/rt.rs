@@ -2,16 +2,15 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc, realloc};
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::fs::OpenOptions;
-use std::os::unix::io::AsRawFd;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use crate::trace::{
-    TRACE_FAIL_ANY_LEN, TRACE_FAIL_DIV_ZERO, TRACE_FAIL_FFI_LOAD, TRACE_FAIL_FFI_SYM,
-    TRACE_FAIL_LEAK_DETECTED, TRACE_FAIL_NULL_ROW_STORE, TRACE_RT_ALLOC, TRACE_RT_FFI_LOAD,
-    TRACE_RT_FREE, TRACE_RT_FREE_CHILD, TRACE_RT_GROW_NULL, TRACE_RT_RESERVE_NULL,
-    TRACE_RT_STR_INTERN, TRACE_RT_STR_POOL_HIT,
+    TRACE_CORO_CLOSE, TRACE_CORO_DEAD, TRACE_CORO_RESUME, TRACE_CORO_SPAWN, TRACE_CORO_YIELD,
+    TRACE_CORO_YIELD_DROPPED, TRACE_FAIL_ANY_LEN, TRACE_FAIL_CORO_CREATE, TRACE_FAIL_DIV_ZERO,
+    TRACE_FAIL_FFI_LOAD, TRACE_FAIL_FFI_SYM, TRACE_FAIL_LEAK_DETECTED, TRACE_FAIL_NULL_ROW_STORE,
+    TRACE_RT_ALLOC, TRACE_RT_FFI_LOAD, TRACE_RT_FREE, TRACE_RT_FREE_CHILD, TRACE_RT_GROW_NULL,
+    TRACE_RT_RESERVE_NULL, TRACE_RT_STR_INTERN, TRACE_RT_STR_POOL_HIT,
 };
 
 #[repr(u8)]
@@ -53,63 +52,123 @@ const _: () = {
 };
 
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-const TRACE_SLOTS: usize = 256;
-const TRACE_FILE: &str = ".glm_rt_trace.bin";
+// --- exec tenancy: this copy's handle into the shared C11 substrate -----
+//
+// Every process-wide glm concern (the trace plate file, the exit-time leak
+// report, cross-instance visibility) lives in libglm_async.so — one copy
+// per process, loader-guaranteed. glm_rt keeps only its exec_id handle and
+// the fast local counters it mirrors into its ExecSlot.
 
-static TRACE_MAP: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
-static LEAK_HOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const EXEC_UNREGISTERED: i32 = -2;
+const EXEC_REGISTERING: i32 = -3;
+static EXEC_ID: AtomicI32 = AtomicI32::new(EXEC_UNREGISTERED);
+static IS_EXE: AtomicBool = AtomicBool::new(false);
+static LOCAL_LEAK_HOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-fn sidecar_mapped_in_this_process() -> bool {
-    std::fs::read_to_string("/proc/self/maps")
-        .is_ok_and(|maps| maps.lines().any(|l| l.contains(TRACE_FILE)))
+// set by the unified exit report in the .so; kept for the registry-full
+// fallback path, where this copy owes its own leak check
+unsafe extern "C" {
+    fn vx_trace_poke_exec(exec_id: i32, slot: u8);
+    fn vx_exec_register(name: *const i8, flags: u32) -> i32;
+    fn vx_exec_census_set(id: i32, live: i64, total: i64);
+    fn vx_exec_state_set(id: i32, state: u32);
+    fn vx_exec_count() -> i32;
+    fn vx_coro_create(lib: *mut c_void) -> i32;
+    fn vx_coro_send(id: i32, a: u64, b: u64, c: u64);
+    fn vx_coro_start(id: i32) -> i32;
+    fn vx_coro_pull(id: i32) -> i64;
+    fn vx_coro_yield(value: u64) -> i64;
+    fn vx_coro_status(id: i32) -> u32;
+    fn vx_coro_join(id: i32);
+    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
 }
 
-pub unsafe fn init_trace_map() {
-    if !sidecar_mapped_in_this_process() {
-        let _ = std::fs::remove_file(TRACE_FILE);
+#[repr(C)]
+struct DlInfo {
+    dli_fname: *const i8,
+    dli_fbase: *mut c_void,
+    dli_sname: *const i8,
+    dli_saddr: *mut c_void,
+}
+
+// lives in this copy's .data: dladdr on its address names the artifact
+// (exe or .so) this glm_rt copy was linked into
+static MODULE_MARK: u8 = 0;
+
+/// The exec_id this copy registered under (single-flight; -1 if the
+/// registry is full). Registering names the module via dladdr and hands
+/// the shared substrate the census it will report at process exit.
+fn exec_id() -> i32 {
+    match EXEC_ID.load(Ordering::Relaxed) {
+        id if id != EXEC_UNREGISTERED => id,
+        _ => {
+            if EXEC_ID
+                .compare_exchange(
+                    EXEC_UNREGISTERED,
+                    EXEC_REGISTERING,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                while EXEC_ID.load(Ordering::Relaxed) == EXEC_REGISTERING {
+                    std::hint::spin_loop();
+                }
+                return EXEC_ID.load(Ordering::Relaxed);
+            }
+            let id = unsafe { register_now() };
+            EXEC_ID.store(id, Ordering::Relaxed);
+            id
+        }
     }
-    let Ok(file) = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(TRACE_FILE)
-    else {
-        return;
+}
+
+unsafe fn register_now() -> i32 {
+    let mut info: DlInfo = std::mem::zeroed();
+    let name: Vec<u8> = if unsafe { dladdr(ptr::addr_of!(MODULE_MARK).cast::<c_void>(), &mut info) }
+        != 0
+        && !info.dli_fname.is_null()
+    {
+        let full = unsafe { cstr_bytes(info.dli_fname.cast()) };
+        match full.iter().rposition(|&b| b == b'/') {
+            Some(at) => full[at + 1..].to_vec(),
+            None => full.to_vec(),
+        }
+    } else {
+        b"glm".to_vec()
     };
-    let _ = file.set_len(TRACE_SLOTS as u64);
-    let ptr = unsafe {
-        mmap(
-            ptr::null_mut(),
-            TRACE_SLOTS,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED,
-            file.as_raw_fd(),
-            0,
-        )
+    let mut nul = name;
+    nul.push(0);
+    // VX_EXEC_F_EXE (0x1) when glm_exec_main ran first, else VX_EXEC_F_SO (0x2)
+    let flags: u32 = if IS_EXE.load(Ordering::Relaxed) {
+        0x1
+    } else {
+        0x2
     };
-    if is_map_failed(ptr) {
-        return;
-    }
-    TRACE_MAP.store(ptr.cast::<u8>(), Ordering::Relaxed);
+    unsafe { vx_exec_register(nul.as_ptr().cast(), flags) }
 }
 
-#[inline]
-fn trace_map() -> *mut u8 {
-    let map = TRACE_MAP.load(Ordering::Relaxed);
-    if !map.is_null() {
-        return map;
-    }
-    unsafe { init_trace_map() };
-    TRACE_MAP.load(Ordering::Relaxed)
-}
-
+/// Sticky trace byte on the process-wide plate — the single C11 shared
+/// object owns the file; pokes from every glm_rt copy and foreign C
+/// companions land on the same MAP_SHARED inode.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn glm_trace_set(slot: u8) {
-    let map = trace_map();
-    if !map.is_null() {
-        unsafe { *map.add(slot as usize) = 1 };
+    // a raw load, not exec_id(): a poke never forces registration (out-of-
+    // range ids ride the anonymous 0xFF event tag in the substrate)
+    unsafe { vx_trace_poke_exec(EXEC_ID.load(Ordering::Relaxed), slot) };
+}
+
+unsafe fn mirror_census(id: i32) {
+    if id >= 0 {
+        unsafe {
+            vx_exec_census_set(
+                id,
+                ALLOC_COUNT.load(Ordering::Relaxed) as i64,
+                TOTAL_COUNT.load(Ordering::Relaxed) as i64,
+            )
+        };
     }
 }
 
@@ -167,11 +226,16 @@ pub unsafe extern "C" fn glm_tbl_new(esize: usize, flags: u8) -> *mut GlmTable {
         border: 0,
     }));
     ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+    TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
+    let id = exec_id();
+    unsafe { mirror_census(id) };
     unsafe { glm_trace_set(TRACE_RT_ALLOC) };
-    if LEAK_HOOK
-        .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
+    if id == -1
+        && LOCAL_LEAK_HOOK
+            .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     {
+        // registry full: this copy owes its own exit leak check
         unsafe { atexit(glm_trace_leak_check) };
     }
     hdr
@@ -574,7 +638,6 @@ const PROT_NONE: i32 = 0x0;
 const PROT_READ: i32 = 0x1;
 const PROT_WRITE: i32 = 0x2;
 const MAP_PRIVATE: i32 = 0x02;
-const MAP_SHARED: i32 = 0x01;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
 const MREMAP_MAYMOVE: i32 = 1;
@@ -769,6 +832,7 @@ unsafe fn free_tbl(t: *mut GlmTable, keeps: &[*mut GlmTable]) {
     }
     unsafe { glm_trace_set(TRACE_RT_FREE) };
     let prev_allocs = ALLOC_COUNT.fetch_sub(1, Ordering::Relaxed);
+    unsafe { mirror_census(EXEC_ID.load(Ordering::Relaxed)) };
     unsafe { validate_header_before_free(t, prev_allocs) };
     let mut tbl = unsafe { Box::from_raw(t) };
 
@@ -1148,6 +1212,23 @@ pub unsafe extern "C" fn glm_exec_main(
     kind: i32,
     exec: unsafe extern "C" fn(*mut GlmTable) -> *mut GlmTable,
 ) -> i32 {
+    // the exe registers before any code runs (its constructors precede
+    // every dlopen), so the main binary deterministically takes slot 0
+    IS_EXE.store(true, Ordering::Relaxed);
+    let id = exec_id();
+    let rc = unsafe { exec_main_inner(argc, argv, kind, exec) };
+    if id >= 0 {
+        unsafe { vx_exec_state_set(id, 3) }; // VX_EXEC_FINISHED
+    }
+    rc
+}
+
+unsafe fn exec_main_inner(
+    argc: i32,
+    argv: *const *const u8,
+    kind: i32,
+    exec: unsafe extern "C" fn(*mut GlmTable) -> *mut GlmTable,
+) -> i32 {
     if kind == GLM_ARG_NONE {
         let result = exec(std::ptr::null_mut());
         unsafe { glm_tbl_free(result) };
@@ -1312,4 +1393,99 @@ pub extern "C" fn glm_print_nl() {
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_alloc_count() -> i64 {
     ALLOC_COUNT.load(Ordering::Relaxed) as i64
+}
+
+/// The dialect's window into the shared C11 session: how many glm
+/// runtimes (this exe + every loaded .so module) have registered in the
+/// process — reads the exec registry owned by libglm_async.so, not this
+/// copy's state.
+#[unsafe(no_mangle)]
+pub extern "C" fn sys_exec_count() -> i64 {
+    unsafe { vx_exec_count() as i64 }
+}
+
+/// The coroutine thread wrapper's FINISHED hook: this copy's exec handle
+/// in the shared registry (the substrate calls it after glm_exec returns
+/// on the worker thread).
+#[unsafe(no_mangle)]
+pub extern "C" fn glm_rt_exec_id() -> i32 {
+    EXEC_ID.load(Ordering::Relaxed)
+}
+
+// --- the coroutine.* parody's runtime face ---------------------------------
+//
+// The substrate owns threads, lanes, and packets; these wrappers marshal
+// table cells on the CALLER's thread/heap (read-only borrows — no
+// GlmTable pointer ever crosses a thread) and intern the status words.
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn glm_coro_create(lib: *mut c_void) -> i64 {
+    let id = unsafe { vx_coro_create(lib) };
+    if id < 0 {
+        unsafe { glm_trace_set(TRACE_FAIL_CORO_CREATE) };
+    }
+    id as i64
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn glm_coro_resume(co: i64, t: *mut GlmTable) -> i64 {
+    let id = co as i32;
+    if id >= 0 && unsafe { vx_coro_status(id) } == 1 && !t.is_null() {
+        // VX_CORO_CREATED: marshal t[0..2] as the spawn inputs (reads on
+        // this thread, this heap); later resumes' tables are ignored
+        let mut lanes = [0u64; 3];
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let mut buf = [0u8; 16];
+            unsafe { glm_tbl_get(t, i as i64, buf.as_mut_ptr(), 16) };
+            *lane = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+        }
+        unsafe { vx_coro_send(id, lanes[0], lanes[1], lanes[2]) };
+    }
+    let r = if id >= 0 {
+        unsafe { vx_coro_start(id) };
+        unsafe { glm_trace_set(TRACE_CORO_SPAWN) };
+        unsafe { vx_coro_pull(id) }
+    } else {
+        -1
+    };
+    unsafe {
+        glm_trace_set(if r < 0 {
+            TRACE_CORO_DEAD
+        } else {
+            TRACE_CORO_RESUME
+        })
+    };
+    r
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn glm_coro_yield(value: i64) -> i64 {
+    let r = unsafe { vx_coro_yield(value as u64) };
+    unsafe {
+        glm_trace_set(if r < 0 {
+            TRACE_CORO_YIELD_DROPPED
+        } else {
+            TRACE_CORO_YIELD
+        })
+    };
+    r
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn glm_coro_status(co: i64) -> *const u8 {
+    // the parody's punchline, straight-faced: "running" because it IS —
+    // on its own pthread (CREATED answers Lua's "suspended")
+    let word: &[u8] = match unsafe { vx_coro_status(co as i32) } {
+        1 => b"suspended",
+        2 => b"running",
+        _ => b"dead",
+    };
+    unsafe { glm_str_intern(word.as_ptr(), word.len()) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn glm_coro_close(co: i64) -> i64 {
+    unsafe { glm_trace_set(TRACE_CORO_CLOSE) };
+    unsafe { vx_coro_join(co as i32) };
+    0
 }
