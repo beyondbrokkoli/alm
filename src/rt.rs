@@ -1544,7 +1544,20 @@ pub unsafe extern "C" fn alm_coro_create(lib: *mut c_void) -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_coro_resume(co: i64, t: *mut AlmTable) -> i64 {
     let id = co as i32;
-    if id >= 0 && unsafe { vx_coro_status(id) } == 1 && !t.is_null() {
+    if id < 0 {
+        // R9: slot exhaustion must NEVER masquerade as the EOF sentinel
+        // (a drained lane's -1). A negative handle can only come from an
+        // exhausted create — a loud, distinct death, not a silent
+        // truncation.
+        unsafe { alm_trace_set(TRACE_FAIL_CORO_CREATE) };
+        eprintln!(
+            "alm fatal: coroutine.resume on handle {co} — the coroutine registry \
+             was exhausted at create time (all lanes live); test \
+             coroutine.create's result before resuming"
+        );
+        std::process::abort();
+    }
+    if unsafe { vx_coro_status(id) } == 1 && !t.is_null() {
         // VX_CORO_CREATED: marshal t[0..2] as the spawn inputs (reads on
         // this thread, this heap); later resumes' tables are ignored
         let mut lanes = [0u64; 3];
@@ -1555,12 +1568,10 @@ pub unsafe extern "C" fn alm_coro_resume(co: i64, t: *mut AlmTable) -> i64 {
         }
         unsafe { vx_coro_send(id, lanes[0], lanes[1], lanes[2]) };
     }
-    let r = if id >= 0 {
-        unsafe { vx_coro_start(id) };
-        unsafe { alm_trace_set(TRACE_CORO_SPAWN) };
-        unsafe { vx_coro_pull(id) }
-    } else {
-        -1
+    let r = unsafe {
+        vx_coro_start(id);
+        alm_trace_set(TRACE_CORO_SPAWN);
+        vx_coro_pull(id)
     };
     unsafe {
         alm_trace_set(if r < 0 {

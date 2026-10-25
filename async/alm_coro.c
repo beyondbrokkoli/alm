@@ -103,6 +103,19 @@ static CoroSlot* coro_slot(int32_t id) {
     return &g_coros.slots[id];
 }
 
+/* R9's retirement discipline: a drained/closed lane walks
+ * RUNNING-or-CREATED -> DEAD -> EMPTY, both steps CASed by the one
+ * thread that owns the transition. DEAD stays observable only
+ * transiently (status maps DEAD and EMPTY to the same "dead" word), and
+ * EMPTY is exactly what the create-side CAS wants — slots RECYCLE, so
+ * exhaustion means "all lanes live", never "lanes were leaked". */
+static void coro_retire(CoroSlot* co, uint32_t from) {
+    uint32_t expected = from;
+    if (!CXS(co->state, expected, VX_CORO_DEAD)) return;
+    expected = VX_CORO_DEAD;
+    CXS(co->state, expected, VX_CORO_EMPTY);
+}
+
 EXPORT int32_t vx_coro_create(void* lib) {
     vx_async_ready();
     for (int i = 0; i < VX_CORO_MAX; i++) {
@@ -144,6 +157,17 @@ EXPORT int32_t vx_coro_start(int32_t id) {
         /* in_* were written before this release CAS; pthread_create also
          * orders them against the wrapper's plain reads */
         co->thread = vx_thread_start(coro_thread_fn, co);
+        if (co->thread == 0) {
+            /* pthread_create failed: no thread will ever flip
+             * thread_done — retire the lane honestly (drains at the
+             * next pull) instead of hanging or joining garbage */
+            fprintf(stderr,
+                    "alm coro: lane %d — pthread_create failed; lane retired\n",
+                    id);
+            S(co->thread_done, 1);
+            coro_retire(co, VX_CORO_RUNNING);
+            return -1;
+        }
         return id;
     }
     return (L(co->state) == VX_CORO_RUNNING || L(co->state) == VX_CORO_DEAD)
@@ -172,7 +196,7 @@ EXPORT int64_t vx_coro_pull(int32_t id) {
         }
         if (L(co->thread_done) == 1) {
             /* drained and dead: retire the held slot, join exactly once,
-             * recycle */
+             * recycle the lane back to EMPTY */
             if (co->held_idx != -1) {
                 vx_stream_release(id, co->held_idx);
                 co->held_idx = -1;
@@ -181,7 +205,7 @@ EXPORT int64_t vx_coro_pull(int32_t id) {
             if (CXS(co->joined, expected, 1)) {
                 vx_thread_join(co->thread);
             }
-            S(co->state, VX_CORO_DEAD);
+            coro_retire(co, VX_CORO_RUNNING);
             return -1;
         }
         if (L_R(g_coros.shutdown)) return -1; /* exit in flight */
@@ -227,7 +251,7 @@ EXPORT void vx_coro_join(int32_t id) {
     CoroSlot* co = coro_slot(id);
     if (co == NULL) return;
     if (L(co->state) == VX_CORO_CREATED) {
-        S(co->state, VX_CORO_DEAD); /* never started */
+        coro_retire(co, VX_CORO_CREATED); /* never started */
         return;
     }
     if (L(co->state) != VX_CORO_RUNNING) return;
@@ -240,7 +264,7 @@ EXPORT void vx_coro_join(int32_t id) {
     if (CXS(co->joined, expected, 1)) {
         vx_thread_join(co->thread);
     }
-    S(co->state, VX_CORO_DEAD);
+    coro_retire(co, VX_CORO_RUNNING);
 }
 
 EXPORT void vx_coro_quiesce(void) {
@@ -254,6 +278,6 @@ EXPORT void vx_coro_quiesce(void) {
         if (CXS(co->joined, expected, 1)) {
             vx_thread_join(co->thread);
         }
-        S(co->state, VX_CORO_DEAD);
+        coro_retire(co, VX_CORO_RUNNING);
     }
 }

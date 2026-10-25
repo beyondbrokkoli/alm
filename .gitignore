@@ -10,6 +10,7 @@ async/probe/probe_1lane
 async/probe/libalm_async.so
 async/probe/probe_tenant
 async/probe/probe_backpressure
+async/probe/probe_recycle
 examples
 run.lua
 diff
