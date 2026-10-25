@@ -32,6 +32,7 @@ use super::super::facts::{FfiVerb, FnDef, KeyLane};
 use super::super::{is_ghost, is_root, join_ty};
 use super::WalkState;
 use super::constraints::UnknownStore;
+use super::{calls_through_fn_var_msg, dotted_callee, not_a_function_msg};
 use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
 use crate::shape::ty::Ty;
 use alm_rt::{signal, trace};
@@ -241,6 +242,35 @@ impl Checker {
             return; // top level: the walk's own fn binding is the truth
         };
         self.frames[depth].fns.insert(name.to_string(), ptr);
+    }
+
+    /// THE HYGIENE LAW's name resolution, one definition for every
+    /// consumer: the current expansion's own frames (its params,
+    /// locals, same-body blocks), then the defining-scope chain
+    /// recorded at the literal's definition (None = a non-fn binding
+    /// shadows), then the top-level map — read late, at the current
+    /// statement's textual position. Frames below the innermost
+    /// expansion boundary are the caller's and never participate.
+    /// Returns the innermost HIT (Some(ptr) = an expansion binding,
+    /// Some(None) = a shadowing non-fn binding, None = no binding).
+    fn resolve_fn_binding(&self, name: &str) -> Option<Option<*const Expr>> {
+        let base = self.expansion_frame_bases.last().copied().unwrap_or(0);
+        self.frames[base..]
+            .iter()
+            .rev()
+            .find_map(|f| f.fns.get(name).copied())
+            .or_else(|| {
+                self.inline_stack
+                    .last()
+                    .and_then(|&cur| self.ctx.fn_def_sites.get(&cur)?.get(name).copied())
+            })
+            .or_else(|| self.snap.fns.get(name).copied())
+    }
+
+    /// Whether a name read as a VALUE names an expansion (the Expansion
+    /// Law's reject set: no runtime representation, not a value).
+    fn resolves_to_fn(&self, name: &str) -> bool {
+        self.resolve_fn_binding(name).flatten().is_some()
     }
 
     fn bind_function(&mut self, lat: &mut UnknownStore, name: &str, expr: &Expr) -> Ty {
@@ -1323,7 +1353,20 @@ impl Checker {
                 let _key_ty = self.check_index_key(lat, key)?;
                 Ok(elem)
             }
-            Expr::Identifier(name) => self.var_type(lat, name),
+            Expr::Identifier(name) => {
+                // THE EXPANSION LAW's value boundary: a fn binding read as
+                // a VALUE (argument, operand, store, print, return) is a
+                // rejection at the checker — the expansion has no runtime
+                // representation. Call arms resolve callees through the fn
+                // maps directly and never reach here.
+                if self.resolves_to_fn(name) {
+                    return Err(format!(
+                        "Type Error: '{name}' is an expansion, not a value — \
+                         functions in alm have no runtime representation"
+                    ));
+                }
+                self.var_type(lat, name)
+            }
             Expr::BinaryOp { op, left, right } => {
                 let l = self.check_expr(lat, left)?;
                 let r = self.check_expr(lat, right)?;
@@ -1487,49 +1530,39 @@ impl Checker {
                     .to_string(),
             ),
             Expr::Call { callee, args } => {
-                if let Expr::Field { obj, name } = callee.as_ref() {
-                    return self.check_ffi_call(lat, expr, obj, name, args);
-                }
                 let name = match callee.as_ref() {
                     Expr::Identifier(n) => n.clone(),
+                    Expr::Field { obj, name } => {
+                        // D4 call precedence: a dotted callee chain
+                        // ("A.b", "A.B.c") that resolves through the fn
+                        // maps is an expansion call — the expansion map
+                        // wins; module surfaces are the fallback.
+                        if let Some(dotted) = dotted_callee(callee.as_ref())
+                            && self.resolve_fn_binding(&dotted).is_some()
+                        {
+                            dotted
+                        } else {
+                            return self.check_ffi_call(lat, expr, obj, name, args);
+                        }
+                    }
                     _ => {
-                        return Err("Type Error: calls go through a function variable — only \
-                             anonymous functions assigned directly to variables are callable"
-                            .to_string());
+                        return Err(calls_through_fn_var_msg());
                     }
                 };
-                // THE HYGIENE LAW: the caller's frames never participate
-                // in fn resolution. A name inside an expansion resolves
-                // through (1) the expansion's own frames (its params,
-                // locals, same-body blocks), (2) the defining-scope
-                // chain recorded at the literal's definition (params
-                // shadow; None = a non-fn binding shadows), (3) the
-                // top-level map — read late, at this call site's own
-                // textual position. Frames below the innermost
-                // expansion boundary are the caller's and are skipped.
-                let base = self.expansion_frame_bases.last().copied().unwrap_or(0);
+                // THE HYGIENE LAW (see `resolve_fn_binding`): caller
+                // frames never participate; a parameter shadows every fn
+                // name (fn values are never arguments); top-level names
+                // are read late, at this call site's textual position.
                 let param_shadows = self
                     .expansion_params
                     .last()
                     .is_some_and(|ps| ps.iter().any(|p| p == &name));
-                let fn_ptr = self.frames[base..]
-                    .iter()
-                    .rev()
-                    .find_map(|f| f.fns.get(&name).copied())
-                    .or_else(|| {
-                        self.inline_stack
-                            .last()
-                            .and_then(|&cur| self.ctx.fn_def_sites.get(&cur)?.get(&name).copied())
-                    })
-                    .or_else(|| self.snap.fns.get(&name).copied())
-                    .flatten();
-                let fn_ptr = if param_shadows { None } else { fn_ptr };
-                let fn_ptr = fn_ptr.ok_or_else(|| {
-                    format!(
-                        "Type Error: '{name}' is not a function — only anonymous \
-                         functions assigned directly to variables are callable"
-                    )
-                })?;
+                let fn_ptr = if param_shadows {
+                    None
+                } else {
+                    self.resolve_fn_binding(&name).flatten()
+                };
+                let fn_ptr = fn_ptr.ok_or_else(|| not_a_function_msg(&name))?;
                 if self.inline_stack.contains(&fn_ptr) {
                     return Err(format!(
                         "Type Error: '{name}' is recursive — inline closures expand at \

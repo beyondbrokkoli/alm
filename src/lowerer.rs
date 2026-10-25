@@ -121,6 +121,10 @@ pub struct IrLowerer<'a> {
     /// identical AST in the identical order, so the sites agree without
     /// any shared counter.
     expansion_sites: Vec<*const Expr>,
+    /// the break-ctx depth each expansion began at — defense in depth:
+    /// a break inside an expansion may only bind a loop of its OWN
+    /// body, never the caller's (whose ctx would sit below the base).
+    expansion_break_bases: Vec<usize>,
 }
 
 impl<'a> IrLowerer<'a> {
@@ -148,6 +152,7 @@ impl<'a> IrLowerer<'a> {
             break_ctxs: Vec::new(),
             inline_stack: Vec::new(),
             expansion_sites: Vec::new(),
+            expansion_break_bases: Vec::new(),
         }
     }
 
@@ -806,6 +811,18 @@ impl<'a> IrLowerer<'a> {
                 self.emit_stmt_temp_frees(stmt);
             }
             Stmt::Assignment { name, expr } => {
+                // the sugar's #define face (D4): a fn-literal assignment
+                // to a name the lowering tables do not hold DECLARES it —
+                // the same placeholder slot `local f = function` gets
+                // (expansions resolve through the call-site facts, the
+                // name slot never carries a value)
+                if matches!(expr, Expr::Function { .. }) && !self.has_var(name) {
+                    let target_reg = self.next_reg();
+                    let TypedReg { reg, ty } = self.lower_expr(expr, Some(target_reg))?;
+                    let layout = self.lookup_layout_for(expr)?;
+                    self.declare_var(name.clone(), reg, ty, layout);
+                    return Ok(());
+                }
                 if matches!(expr, Expr::Nil) {
                     let local = self.read_var(name)?;
                     if self.shape.is_free(stmt) {
@@ -1213,6 +1230,19 @@ impl<'a> IrLowerer<'a> {
                 self.emit_stmt_temp_frees(stmt);
             }
             Stmt::Break => {
+                // defense in depth: a break inside an expansion may only
+                // bind a loop of its OWN body — the innermost ctx below
+                // the expansion's base belongs to the caller and must
+                // never catch an expansion's break
+                if let Some(&base) = self.expansion_break_bases.last()
+                    && self.break_ctxs.len() <= base
+                {
+                    return Err(LowerError(
+                        "Lower Error: 'break' crossing an expansion boundary — \
+                         the checker and the lowerer disagree"
+                            .into(),
+                    ));
+                }
                 let phi_vars = self
                     .break_ctxs
                     .last()
@@ -1724,14 +1754,20 @@ impl<'a> IrLowerer<'a> {
                 })
             }
             Expr::Call { callee, args } => {
-                if let Expr::Field { .. } = callee.as_ref() {
-                    return self.lower_ffi_call(expr, args, reg);
-                }
                 // the per-instantiation fact key, derived exactly as the
                 // checker derives it: the OUTERMOST expansion this call
                 // is lowered inside (the call itself at no expansion)
                 let call_ptr = expr as *const Expr;
                 let site = self.expansion_sites.first().copied().unwrap_or(call_ptr);
+                // D4 precedence, lower half: a Field callee is a module
+                // surface call UNLESS the checker resolved it as an
+                // expansion (call_defs carries the decision — the lowerer
+                // never re-derives precedence)
+                if let Expr::Field { .. } = callee.as_ref()
+                    && !self.shape.call_defs.contains_key(&(call_ptr, site))
+                {
+                    return self.lower_ffi_call(expr, args, reg);
+                }
                 let fn_ptr = self
                     .shape
                     .call_defs
@@ -1782,6 +1818,7 @@ impl<'a> IrLowerer<'a> {
 
                 self.inline_stack.push(fn_ptr);
                 self.expansion_sites.push(call_ptr);
+                self.expansion_break_bases.push(self.break_ctxs.len());
                 self.return_ctxs.push(ReturnCtx {
                     kind: ReturnKind::Inline {
                         ty: call_ret.clone(),
@@ -1845,6 +1882,7 @@ impl<'a> IrLowerer<'a> {
                 }
                 self.inline_stack.pop();
                 self.expansion_sites.pop();
+                self.expansion_break_bases.pop();
                 Ok(TypedReg {
                     reg: result,
                     ty: call_ret,
@@ -2583,5 +2621,33 @@ mod break_gate_tests {
             body: vec![Stmt::Break],
         }];
         assert!(!has_break(&nested));
+    }
+
+    #[test]
+    fn break_inside_a_function_body_is_not_this_loops() {
+        // R8's AST half: has_break does not recurse into Expr::Function —
+        // a body's break binds to a loop written in THAT body, never to
+        // the loop enclosing the definition. The walk's cross-boundary
+        // gate and the lowerer's BreakCtx base guard this same law.
+        let fn_with_break = Stmt::LocalDecl {
+            names: vec!["f".to_string()],
+            exprs: vec![Expr::Function {
+                params: vec![],
+                body: vec![Stmt::Break],
+            }],
+        };
+        assert!(!has_break(&[fn_with_break]));
+
+        let fn_with_own_loop = Stmt::LocalDecl {
+            names: vec!["f".to_string()],
+            exprs: vec![Expr::Function {
+                params: vec![],
+                body: vec![Stmt::While {
+                    condition: Expr::Boolean(true),
+                    body: vec![Stmt::Break],
+                }],
+            }],
+        };
+        assert!(!has_break(&[fn_with_own_loop]));
     }
 }

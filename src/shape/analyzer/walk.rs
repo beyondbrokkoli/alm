@@ -369,6 +369,27 @@ impl Analyzer {
                     }
                     return Ok(());
                 }
+                if matches!(expr, Expr::Function { .. }) {
+                    // the sugar's #define face: `function f()` /
+                    // `function A.b()` assigns a fn literal to a name no
+                    // type-scope holds. The fn binding was taken above
+                    // (assign_fn_binding); carry the matching type-side
+                    // binding — a definition INTRODUCES the name (the
+                    // Lexical Law), it is not a typo'd assignment.
+                    signal!(rec.on(), trace::TRACE_BIND_SCALAR);
+                    let depth = self.walk.scopes.len() - 1;
+                    self.walk.scopes[depth].insert(
+                        name.clone(),
+                        TableShape {
+                            ty: Pending,
+                            layout: LayoutVerdict::default(),
+                            aliases: BTreeSet::new(),
+                            lineage: BTreeMap::new(),
+                        },
+                    );
+                    self.walk.prov[depth].insert(name.clone(), None);
+                    return Ok(());
+                }
                 return Err(ShapeError(format!(
                     "Scope Error: assignment to undeclared variable '{}'",
                     name
@@ -836,6 +857,25 @@ impl Analyzer {
             }
 
             Stmt::Break => {
+                // R8: a break may only leave a loop of the BODY it is
+                // written in — never cross a fn boundary (an expansion
+                // has no enclosing loop of the caller's to leave). The
+                // checker's inline gate (loop_depth resets per expansion)
+                // only guards CALLED bodies; this walk-side gate covers
+                // the never-called ones too, so no body can compile an
+                // ignored break.
+                if let Some(&fn_entry) = self.fn_scope_entries.last()
+                    && !self
+                        .loop_scope_entries
+                        .last()
+                        .is_some_and(|&loop_entry| loop_entry > fn_entry)
+                {
+                    return Err(ShapeError(
+                        "Type Error: 'break' cannot leave a function body — \
+                         write the break inside a loop of the same body"
+                            .into(),
+                    ));
+                }
                 if rec.on() {
                     self.plan_break_exits(stmt as *const Stmt);
                 }

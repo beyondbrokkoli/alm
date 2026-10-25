@@ -119,6 +119,26 @@ impl<'a> Parser<'a> {
         match self.tokens.peek().cloned() {
             Some(Token::Local) => {
                 self.tokens.next();
+                // `local function f(...) ... end` — the named-sugar local
+                // flavor: desugars to the plain LocalDecl binding shape
+                // (no new semantics)
+                if matches!(self.tokens.peek(), Some(Token::Function)) {
+                    self.tokens.next();
+                    let name = match self.tokens.next() {
+                        Some(Token::Identifier(n)) => n.to_string(),
+                        _ => {
+                            return Err(ParseError(
+                                "Syntax Error: Expected function name after 'local function'"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    let expr = self.parse_fn_literal()?;
+                    return Ok(Stmt::LocalDecl {
+                        names: vec![name],
+                        exprs: vec![expr],
+                    });
+                }
                 let mut names = Vec::new();
                 loop {
                     let name = match self.tokens.next() {
@@ -335,6 +355,22 @@ impl<'a> Parser<'a> {
                 };
                 Ok(Stmt::Return { value })
             }
+            Some(Token::Function) => {
+                // D4 surface sugar, pure desugar — no new semantics:
+                // `function f(args) body end` and `function A.b(args)
+                // body end` become today's fn-ASSIGNMENT shape — a
+                // REDEFINITION (the Lexical Law: last textual definition
+                // wins), so a second declaration rebinds rather than
+                // redeclares. The dotted name rides as ONE string key
+                // (the fn maps are String-keyed); deeper chains `A.B.c`
+                // fall out the same way. The desugar is 1 AST stmt per
+                // parse_stmt call, so the stmt_line_seq pre-push stays
+                // exact (H5).
+                self.tokens.next();
+                let name = self.parse_fn_stmt_name()?;
+                let expr = self.parse_fn_literal()?;
+                Ok(Stmt::Assignment { name, expr })
+            }
             Some(Token::Identifier(_)) => {
                 let lhs = self.parse_expr()?;
                 if matches!(self.tokens.peek(), Some(Token::Assign)) {
@@ -384,6 +420,47 @@ impl<'a> Parser<'a> {
             self.tokens.peek(),
             Some(Token::End) | Some(Token::Else) | Some(Token::ElseIf) | None
         )
+    }
+
+    /// The statement-sugar name: `f`, `A.b`, `A.B.c` — one dotted
+    /// string. Colon methods reject with their dedicated message.
+    fn parse_fn_stmt_name(&mut self) -> Result<String, ParseError> {
+        let mut name = match self.tokens.next() {
+            Some(Token::Identifier(n)) => n.to_string(),
+            _ => {
+                return Err(ParseError(
+                    "Syntax Error: Expected function name after 'function'".into(),
+                ));
+            }
+        };
+        loop {
+            match self.tokens.peek() {
+                Some(Token::Dot) => {
+                    self.tokens.next();
+                    match self.tokens.next() {
+                        Some(Token::Identifier(seg)) => {
+                            name.push('.');
+                            name.push_str(seg);
+                        }
+                        _ => {
+                            return Err(ParseError(
+                                "Syntax Error: Expected name segment after '.' in function \
+                                 declaration"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                Some(Token::Colon) => {
+                    return Err(ParseError(format!(
+                        "Syntax Error: 'function {name}:...' — colon methods are not surface; \
+                         declare 'function {name}.<method>(receiver, ...)' and pass the \
+                         receiver as an explicit first parameter"
+                    )));
+                }
+                _ => return Ok(name),
+            }
+        }
     }
 
     /// Unlike has_break, assignments to the loop variable are rejected even
@@ -712,48 +789,59 @@ impl<'a> Parser<'a> {
                 self.expect(Token::RightParen)?;
                 Ok(inner)
             }
-            Some(Token::Function) => {
-                self.expect(Token::LeftParen)?;
-                let mut params = Vec::new();
-                if !matches!(self.tokens.peek(), Some(Token::RightParen)) {
-                    loop {
-                        let name = match self.tokens.next() {
-                            Some(Token::Identifier(n)) => n.to_string(),
-                            _ => {
-                                return Err(ParseError(
-                                    "Syntax Error: Expected parameter name in function header"
-                                        .into(),
-                                ));
-                            }
-                        };
-                        if params.contains(&name) {
-                            return Err(ParseError(format!(
-                                "Syntax Error: duplicate parameter '{name}'"
-                            )));
-                        }
-                        params.push(name);
-                        if matches!(self.tokens.peek(), Some(Token::Comma)) {
-                            self.tokens.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                self.expect(Token::RightParen)?;
-                let mut body = Vec::new();
-                while self.tokens.peek() != Some(&Token::End) {
-                    if self.tokens.peek().is_none() {
-                        return Err(ParseError(
-                            "Syntax Error: 'function' body not closed by 'end'".into(),
-                        ));
-                    }
-                    body.push(self.parse_stmt()?);
-                }
-                self.expect(Token::End)?;
-                Ok(Expr::Function { params, body })
-            }
+            Some(Token::Function) => self.parse_fn_literal(),
             _ => Err(ParseError("Syntax Error: Expected expression".into())),
         }
+    }
+
+    /// The one fn-literal producer: everything after the `function`
+    /// keyword — `(params) body end`. Shared by the expression face and
+    /// the D4 statement sugar.
+    fn parse_fn_literal(&mut self) -> Result<Expr, ParseError> {
+        self.expect(Token::LeftParen)?;
+        let mut params = Vec::new();
+        if !matches!(self.tokens.peek(), Some(Token::RightParen)) {
+            loop {
+                if matches!(self.tokens.peek(), Some(Token::Dot)) {
+                    return Err(ParseError(
+                        "Syntax Error: the dialect has no varargs — \
+                         name your parameters"
+                            .into(),
+                    ));
+                }
+                let name = match self.tokens.next() {
+                    Some(Token::Identifier(n)) => n.to_string(),
+                    _ => {
+                        return Err(ParseError(
+                            "Syntax Error: Expected parameter name in function header".into(),
+                        ));
+                    }
+                };
+                if params.contains(&name) {
+                    return Err(ParseError(format!(
+                        "Syntax Error: duplicate parameter '{name}'"
+                    )));
+                }
+                params.push(name);
+                if matches!(self.tokens.peek(), Some(Token::Comma)) {
+                    self.tokens.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(Token::RightParen)?;
+        let mut body = Vec::new();
+        while self.tokens.peek() != Some(&Token::End) {
+            if self.tokens.peek().is_none() {
+                return Err(ParseError(
+                    "Syntax Error: 'function' body not closed by 'end'".into(),
+                ));
+            }
+            body.push(self.parse_stmt()?);
+        }
+        self.expect(Token::End)?;
+        Ok(Expr::Function { params, body })
     }
 
     fn parse_table_ctor(&mut self) -> Result<Expr, ParseError> {

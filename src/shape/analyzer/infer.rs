@@ -157,6 +157,55 @@ impl Analyzer {
         Ok(())
     }
 
+    /// The module-surface half of a dotted call (`A.b(x)` where "A.b" is
+    /// NOT an expansion binding): ffi load/arg_kind, loaded libraries,
+    /// the coroutine verbs. The D4 expansion-map precedence in
+    /// `infer_expr`'s Call arm decides which half a dotted call is.
+    fn infer_module_call(
+        &mut self,
+        rec: Gate,
+        obj: &Expr,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<(Ty, BTreeSet<usize>, RowLineage), ShapeError> {
+        let base = match obj {
+            Expr::Identifier(n) => n.as_str(),
+            _ => {
+                return Err(ShapeError(
+                    "Scope Error: the ffi surface's '.' base must be a name".into(),
+                ));
+            }
+        };
+        let (_, bind) = self.resolve(rec, base)?;
+        let module = bind.ty == Ffi;
+        if module || bind.ty == FfiLib {
+            for a in args {
+                self.infer_expr(rec, a)?;
+            }
+            return Ok(if module && name == "load" {
+                (FfiLib, BTreeSet::new(), BTreeMap::new())
+            } else if module && name == "arg_kind" {
+                (Int, BTreeSet::new(), BTreeMap::new())
+            } else {
+                (Pending, BTreeSet::new(), BTreeMap::new())
+            });
+        }
+        if bind.ty == Coro {
+            for a in args {
+                self.infer_expr(rec, a)?;
+            }
+            return Ok(if name == "status" {
+                (Str, BTreeSet::new(), BTreeMap::new())
+            } else {
+                (Int, BTreeSet::new(), BTreeMap::new())
+            });
+        }
+        Err(ShapeError(format!(
+            "Scope Error: '{base}' is not the ffi module, a loaded library, or the coroutine \
+             module — '.' is the module surfaces', tables use '[]'"
+        )))
+    }
+
     pub(super) fn infer_expr(
         &mut self,
         rec: Gate,
@@ -674,61 +723,29 @@ impl Analyzer {
                 Ok((Pending, BTreeSet::new(), BTreeMap::new()))
             }
             Expr::Call { callee, args } => {
-                if let Expr::Field { obj, name } = callee.as_ref() {
-                    let base = match obj.as_ref() {
-                        Expr::Identifier(n) => n.as_str(),
-                        _ => {
-                            return Err(ShapeError(
-                                "Scope Error: the ffi surface's '.' base must be a name".into(),
-                            ));
-                        }
-                    };
-                    let (_, bind) = self.resolve(rec, base)?;
-                    let module = bind.ty == Ffi;
-                    if module || bind.ty == FfiLib {
-                        for a in args {
-                            self.infer_expr(rec, a)?;
-                        }
-                        return Ok(if module && name.as_str() == "load" {
-                            (FfiLib, BTreeSet::new(), BTreeMap::new())
-                        } else if module && name.as_str() == "arg_kind" {
-                            (Int, BTreeSet::new(), BTreeMap::new())
+                let name: String = match callee.as_ref() {
+                    Expr::Field { obj, name } => {
+                        // D4 precedence, walk half: a dotted callee chain
+                        // ("A.b", "A.B.c") that resolves through the fn
+                        // maps is an expansion call — the expansion map
+                        // wins; module surfaces are the fallback.
+                        if let Some(dotted) = dotted_callee(callee.as_ref())
+                            && self.resolve_fn(&dotted).is_some()
+                        {
+                            dotted
                         } else {
-                            (Pending, BTreeSet::new(), BTreeMap::new())
-                        });
-                    }
-                    if bind.ty == Coro {
-                        for a in args {
-                            self.infer_expr(rec, a)?;
+                            return self.infer_module_call(rec, obj, name, args);
                         }
-                        return Ok(if name.as_str() == "status" {
-                            (Str, BTreeSet::new(), BTreeMap::new())
-                        } else {
-                            (Int, BTreeSet::new(), BTreeMap::new())
-                        });
                     }
-                    return Err(ShapeError(format!(
-                        "Scope Error: '{base}' is not the ffi module, a loaded library, or \
-                         the coroutine module — '.' is the module surfaces', tables use '[]'"
-                    )));
-                }
-                let name = match callee.as_ref() {
-                    Expr::Identifier(n) => n.as_str(),
+                    Expr::Identifier(n) => n.clone(),
                     _ => {
-                        return Err(ShapeError(
-                            "Scope Error: calls go through a function variable — only \
-                             anonymous functions assigned directly to variables are \
-                             callable"
-                                .into(),
-                        ));
+                        return Err(ShapeError(calls_through_fn_var_msg()));
                     }
                 };
-                let fn_ptr = self.resolve_fn(name).ok_or_else(|| {
-                    ShapeError(format!(
-                        "Scope Error: '{name}' is not a function — only anonymous \
-                         functions assigned directly to variables are callable"
-                    ))
-                })?;
+                let name = name.as_str();
+                let fn_ptr = self
+                    .resolve_fn(name)
+                    .ok_or_else(|| ShapeError(not_a_function_msg(name)))?;
                 let params = self.fn_params.get(&fn_ptr).cloned().unwrap_or_default();
                 let stored_params = self.fn_store_params.get(&fn_ptr).cloned();
                 let moved_params = self.fn_moved_params.get(&fn_ptr).cloned();

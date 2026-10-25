@@ -334,8 +334,9 @@ impl Analyzer {
             return;
         };
         // A break inside an inline function body never binds to the
-        // outer loop — the checker rejects it (loop_depth resets in
-        // function bodies). If one is walked anyway, its scopes sit
+        // outer loop — the walk rejects cross-boundary breaks outright
+        // (see the Break arm) and the checker's inline gate rejects the
+        // called-body flavor. If one is walked anyway, its scopes sit
         // inside the function's window (fn_scope_entries), below the
         // loop's body entry, and there is nothing this loop can plan
         // for it.

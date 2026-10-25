@@ -763,3 +763,37 @@ fn get_base_identifier(expr: &Expr) -> Option<&String> {
         _ => None,
     }
 }
+
+/// The ONE "not a function" diagnostic (R5's double-prefix closure):
+/// both halves print this exact text — whichever fires first. Post-F5
+/// sugar the wording carries no "anonymous" (a named `function f()` is
+/// the same binding).
+pub(super) fn not_a_function_msg(name: &str) -> String {
+    format!(
+        "Type Error: '{name}' is not a function — only functions assigned \
+         directly to variables are callable"
+    )
+}
+
+/// Flatten a dotted callee chain (`A.b`, `A.B.c`, …) into its ONE
+/// string key. None when the chain does not bottom out at a plain
+/// identifier (that face is a module-surface call, not a name).
+pub(super) fn dotted_callee(callee: &Expr) -> Option<String> {
+    let Expr::Field { obj, name } = callee else {
+        return None;
+    };
+    let base = match obj.as_ref() {
+        Expr::Identifier(b) => b.clone(),
+        Expr::Field { .. } => dotted_callee(obj.as_ref())?,
+        _ => return None,
+    };
+    Some(format!("{base}.{name}"))
+}
+
+/// The ONE non-identifier-callee diagnostic, same discipline as
+/// `not_a_function_msg`.
+pub(super) fn calls_through_fn_var_msg() -> String {
+    "Type Error: calls go through a function variable — only functions \
+     assigned directly to variables are callable"
+        .to_string()
+}
