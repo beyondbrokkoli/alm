@@ -118,7 +118,24 @@ pub struct ShapeFacts {
     pub fn_scope_keys: BTreeMap<*const Expr, (*const Stmt, u8)>,
     pub fn_touched: BTreeMap<*const Expr, BTreeSet<String>>,
     pub fn_defs: BTreeMap<*const Expr, FnDef>,
-    pub call_defs: BTreeMap<*const Expr, *const Expr>,
+    /// KEYING DISCIPLINE (the R1 law): keyed by the pair
+    /// `(call expr, expansion site)` where the expansion site is the
+    /// OUTERMOST call whose inline expansion the call expr is being
+    /// checked/lowered inside — the call expr itself when it sits at no
+    /// expansion. One AST node lowers once PER EXPANSION SITE; the pair
+    /// key restores that one-write-one-read discipline for a body
+    /// inlined at many call sites. Both halves derive the site from
+    /// their own recursion (no counters, no clocks): the checker checks
+    /// and the lowerer lowers the identical AST in the identical order.
+    /// Union consumers (fn_touched scans) must range over all sites of
+    /// a call expr, never assume a single entry.
+    pub call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
+    /// KEYING DISCIPLINE: same `(call expr, expansion site)` pairs as
+    /// `call_defs` — the RESOLVED return type of that one expansion.
+    /// `FnDef.ret` stays the per-definition lattice anchor (the
+    /// monomorphic law is per-definition); the resolved truth a call
+    /// site's lowering consumes is per-instantiation, recorded here.
+    pub call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
     pub ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
     pub index_key_lanes: BTreeMap<*const Expr, KeyLane>,
     /// The element face of one table access base, keyed by the base

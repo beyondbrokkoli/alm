@@ -352,6 +352,10 @@ struct Analyzer {
     fn_ret_reaches: Vec<BTreeSet<usize>>,
     fn_walk: Vec<(*const Expr, Vec<String>)>,
     fn_scope_entries: Vec<usize>,
+    /// the Hygiene Law's definition-side record: per fn literal, the
+    /// defining-scope chain snapshot taken at its definition walk (see
+    /// `walk_fn_def`). Read by the checking half's call resolution.
+    fn_def_sites: BTreeMap<*const Expr, BTreeMap<String, Option<*const Expr>>>,
     loop_scope_entries: Vec<usize>,
 }
 
@@ -447,6 +451,7 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
         fn_ret_reaches: Vec::new(),
         fn_walk: Vec::new(),
         fn_scope_entries: Vec::new(),
+        fn_def_sites: BTreeMap::new(),
         loop_scope_entries: Vec::new(),
     };
 
@@ -460,6 +465,7 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
         a.walk.fn_scopes = vec![BTreeMap::new()];
         a.walk.prov = vec![BTreeMap::new()];
         a.walk.scalar_nodes = vec![BTreeMap::new()];
+        a.fn_def_sites.clear();
         a.walk_stmts(None, ctx.ast);
         let end = a.walk.scopes.clone();
         let stable = end == prev_end && !a.walk.changed;
@@ -526,6 +532,7 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
         adopt_lines: adopt_lines.clone(),
         sites: a.lattice.sites.clone(),
         elems: static_elems.clone(),
+        fn_def_sites: a.fn_def_sites.clone(),
     });
     let mut checker_ran = elems_diags.is_empty();
     for stmt in ctx.ast {
@@ -737,6 +744,7 @@ impl Recorded {
             fn_touched: BTreeMap::new(),
             fn_defs: self.chk.fn_defs,
             call_defs: self.chk.call_defs,
+            call_rets: self.chk.call_rets,
             ffi_verbs: self.chk.ffi_verbs,
             index_key_lanes: self.chk.index_key_lanes,
             access_elems: self.chk.access_elems,

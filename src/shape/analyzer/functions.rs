@@ -36,6 +36,22 @@ impl Analyzer {
         key: (*const Stmt, u8),
     ) -> Result<(), ShapeError> {
         self.fn_scope_keys.insert(fn_ptr, key);
+        // THE HYGIENE LAW, definition half: snapshot the defining-scope
+        // chain — every name this body's free names could lexically see
+        // BELOW top level, at exactly this definition's textual position
+        // (the walk's fn map holds names declared before it; None marks
+        // a non-fn binding — a shadow that must reject, not capture).
+        // Top-level names are deliberately EXCLUDED: their values are
+        // read late, at each call site's own textual position. The
+        // checking half resolves an expansion's free names through this
+        // snapshot — the caller's lexical state never participates.
+        let mut chain: BTreeMap<String, Option<*const Expr>> = BTreeMap::new();
+        for scope in self.walk.fn_scopes.iter().skip(1) {
+            for (n, p) in scope {
+                chain.insert(n.clone(), *p);
+            }
+        }
+        self.fn_def_sites.insert(fn_ptr, chain);
         // anchor the function's return node in the lattice's unknown
         // store — the checking half's bind_function reads the same node
         self.lattice.unknowns.ensure_fn_ret(fn_ptr);

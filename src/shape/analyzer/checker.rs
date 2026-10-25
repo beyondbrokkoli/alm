@@ -90,6 +90,12 @@ pub(super) struct CheckCtx {
     pub adopt_lines: BTreeMap<String, usize>,
     pub sites: BTreeMap<*const Expr, usize>,
     pub elems: Vec<Ty>,
+    /// the Hygiene Law's definition-side record: per fn literal, the
+    /// defining-scope chain snapshot the walk took at its definition
+    /// (names below top level, None = a non-fn shadow). The call arm
+    /// resolves an expansion's free names through it — never through
+    /// the caller's frames.
+    pub fn_def_sites: BTreeMap<*const Expr, BTreeMap<String, Option<*const Expr>>>,
 }
 
 /// Everything the checker records for the lowerer, handed to `analyze` at
@@ -98,7 +104,8 @@ pub(super) struct CheckCtx {
 pub(super) struct CheckFacts {
     pub local_types: BTreeMap<(*const Stmt, String), Ty>,
     pub fn_defs: BTreeMap<*const Expr, FnDef>,
-    pub call_defs: BTreeMap<*const Expr, *const Expr>,
+    pub call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
+    pub call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
     pub ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
     pub index_key_lanes: BTreeMap<*const Expr, KeyLane>,
     pub access_elems: BTreeMap<*const Expr, Ty>,
@@ -125,12 +132,26 @@ pub(super) struct Checker {
     ctx: CheckCtx,
     return_ctxs: Vec<ReturnCtx>,
     inline_stack: Vec<*const Expr>,
+    /// the OUTERMOST call expr of every inline expansion currently being
+    /// checked (bottom = outermost site). The pair `(call expr,
+    /// first-of-this-stack or the call itself)` is the per-instantiation
+    /// fact key both halves share — see the KEYING DISCIPLINE note at
+    /// `call_defs` in facts.rs.
+    expansion_sites: Vec<*const Expr>,
+    /// the checker frame depth each expansion began at: frames BELOW the
+    /// innermost boundary belong to the caller — the Hygiene Law keeps
+    /// them out of fn resolution.
+    expansion_frame_bases: Vec<usize>,
+    /// the params of the fn each expansion is inlining — a parameter
+    /// shadows every fn name (fn values are never arguments).
+    expansion_params: Vec<Vec<String>>,
     seed_read: bool,
     len_deferrals: Vec<(Ty, Option<usize>)>,
     cur_stmt: Option<*const Stmt>,
     loop_depth: usize,
     fn_defs: BTreeMap<*const Expr, FnDef>,
-    call_defs: BTreeMap<*const Expr, *const Expr>,
+    call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
+    call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
     ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
     index_key_lanes: BTreeMap<*const Expr, KeyLane>,
     access_elems: BTreeMap<*const Expr, Ty>,
@@ -160,12 +181,16 @@ impl Checker {
             ctx,
             return_ctxs: vec![ReturnCtx::Boundary],
             inline_stack: Vec::new(),
+            expansion_sites: Vec::new(),
+            expansion_frame_bases: Vec::new(),
+            expansion_params: Vec::new(),
             seed_read: false,
             len_deferrals: Vec::new(),
             cur_stmt: None,
             loop_depth: 0,
             fn_defs: BTreeMap::new(),
             call_defs: BTreeMap::new(),
+            call_rets: BTreeMap::new(),
             ffi_verbs: BTreeMap::new(),
             index_key_lanes: BTreeMap::new(),
             access_elems: BTreeMap::new(),
@@ -236,8 +261,74 @@ impl Checker {
                 signature: None,
             },
         );
+        // the Lexical Law's collection half (R3): the walk registers a
+        // nested fn rebind the moment it walks THIS definition, so the
+        // fn maps can point at a literal whose body the checker has not
+        // registered (it registers bodies at inline time only). Collect
+        // the nested literals now — a read of the rebound name must
+        // compile whether or not the container is ever called.
+        self.collect_nested_fn_defs(lat, body);
         self.declare_fn_binding(name, Some(expr as *const Expr));
         Ty::Unknown(lat.ensure_fn_value(expr as *const Expr))
+    }
+
+    /// Registers every fn literal bound inside `body` — lexically, at
+    /// collection time, recursion into nested bodies included. Purely
+    /// additive: an already-registered literal (bound by an inline
+    /// check, signature already pinned by a call) keeps its entry.
+    fn collect_nested_fn_defs(&mut self, lat: &mut UnknownStore, body: &[Stmt]) {
+        for stmt in body {
+            match stmt {
+                Stmt::Assignment { expr, .. } => {
+                    if let Expr::Function { params, body } = expr {
+                        self.register_collected_fn(lat, expr, params, body);
+                    }
+                }
+                Stmt::LocalDecl { exprs, .. } => {
+                    for expr in exprs {
+                        if let Expr::Function { params, body } = expr {
+                            self.register_collected_fn(lat, expr, params, body);
+                        }
+                    }
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.collect_nested_fn_defs(lat, then_body);
+                    self.collect_nested_fn_defs(lat, else_body);
+                }
+                Stmt::While { body, .. } | Stmt::Do { body } => {
+                    self.collect_nested_fn_defs(lat, body);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn register_collected_fn(
+        &mut self,
+        lat: &mut UnknownStore,
+        expr: &Expr,
+        params: &[String],
+        body: &[Stmt],
+    ) {
+        let ptr = expr as *const Expr;
+        if self.fn_defs.contains_key(&ptr) {
+            return;
+        }
+        let ret = Ty::Unknown(lat.ensure_fn_ret(ptr));
+        self.fn_defs.insert(
+            ptr,
+            FnDef {
+                params: params.to_vec(),
+                body: body as *const [Stmt],
+                ret,
+                signature: None,
+            },
+        );
+        self.collect_nested_fn_defs(lat, body);
     }
 
     fn push_return_ctx(&mut self, expected: Ty) {
@@ -259,6 +350,7 @@ impl Checker {
             local_types,
             fn_defs,
             call_defs,
+            call_rets,
             ffi_verbs,
             index_key_lanes,
             access_elems,
@@ -270,6 +362,7 @@ impl Checker {
             local_types,
             fn_defs,
             call_defs,
+            call_rets,
             ffi_verbs,
             index_key_lanes,
             access_elems,
@@ -341,6 +434,9 @@ impl Checker {
                     *ty = lat.resolve(ty);
                 }
             }
+        }
+        for ret in self.call_rets.values_mut() {
+            *ret = lat.resolve(ret);
         }
     }
 
@@ -1402,21 +1498,38 @@ impl Checker {
                             .to_string());
                     }
                 };
-                // the fn binding: checker frames first (inlined bodies
-                // hold their own), then the walk's top-level fn map
-                let fn_ptr = self
-                    .frames
+                // THE HYGIENE LAW: the caller's frames never participate
+                // in fn resolution. A name inside an expansion resolves
+                // through (1) the expansion's own frames (its params,
+                // locals, same-body blocks), (2) the defining-scope
+                // chain recorded at the literal's definition (params
+                // shadow; None = a non-fn binding shadows), (3) the
+                // top-level map — read late, at this call site's own
+                // textual position. Frames below the innermost
+                // expansion boundary are the caller's and are skipped.
+                let base = self.expansion_frame_bases.last().copied().unwrap_or(0);
+                let param_shadows = self
+                    .expansion_params
+                    .last()
+                    .is_some_and(|ps| ps.iter().any(|p| p == &name));
+                let fn_ptr = self.frames[base..]
                     .iter()
                     .rev()
                     .find_map(|f| f.fns.get(&name).copied())
+                    .or_else(|| {
+                        self.inline_stack
+                            .last()
+                            .and_then(|&cur| self.ctx.fn_def_sites.get(&cur)?.get(&name).copied())
+                    })
                     .or_else(|| self.snap.fns.get(&name).copied())
-                    .flatten()
-                    .ok_or_else(|| {
-                        format!(
-                            "Type Error: '{name}' is not a function — only anonymous \
-                             functions assigned directly to variables are callable"
-                        )
-                    })?;
+                    .flatten();
+                let fn_ptr = if param_shadows { None } else { fn_ptr };
+                let fn_ptr = fn_ptr.ok_or_else(|| {
+                    format!(
+                        "Type Error: '{name}' is not a function — only anonymous \
+                         functions assigned directly to variables are callable"
+                    )
+                })?;
                 if self.inline_stack.contains(&fn_ptr) {
                     return Err(format!(
                         "Type Error: '{name}' is recursive — inline closures expand at \
@@ -1464,7 +1577,17 @@ impl Checker {
 
                 let body = unsafe { def.body() };
 
+                // the per-instantiation fact key: the OUTERMOST expansion
+                // this call is checked inside (the call itself at no
+                // expansion). One call expr may be checked once per site;
+                // the pair key keeps every site's resolution its own.
+                let call_ptr = expr as *const Expr;
+                let site = self.expansion_sites.first().copied().unwrap_or(call_ptr);
+
                 self.inline_stack.push(fn_ptr);
+                self.expansion_sites.push(call_ptr);
+                self.expansion_frame_bases.push(self.frames.len());
+                self.expansion_params.push(def.params.clone());
                 self.begin_scope();
                 for (p, aty) in def.params.iter().zip(arg_tys) {
                     let pty = lat.fresh();
@@ -1481,11 +1604,16 @@ impl Checker {
                 };
                 self.end_scope();
                 self.inline_stack.pop();
+                self.expansion_sites.pop();
+                self.expansion_frame_bases.pop();
+                self.expansion_params.pop();
 
-                if let Some(d) = self.fn_defs.get_mut(&fn_ptr) {
-                    d.ret = ret.clone();
-                }
-                self.call_defs.insert(expr as *const Expr, fn_ptr);
+                // the resolved return type is per-instantiation; the
+                // def's own `ret` stays the shared lattice anchor the
+                // next expansion seeds its return context from (the
+                // monomorphic law is per-definition)
+                self.call_rets.insert((call_ptr, site), ret.clone());
+                self.call_defs.insert((call_ptr, site), fn_ptr);
                 Ok(ret)
             }
         }

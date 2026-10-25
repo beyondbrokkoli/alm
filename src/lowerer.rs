@@ -114,6 +114,13 @@ pub struct IrLowerer<'a> {
     return_ctxs: Vec<ReturnCtx>,
     break_ctxs: Vec<BreakCtx>,
     inline_stack: Vec<*const Expr>,
+    /// the OUTERMOST call expr of every inline expansion currently being
+    /// lowered (bottom = outermost site) — the lowerer's derivation of
+    /// the `(call expr, expansion site)` fact keys it shares with the
+    /// checker. Derived from this stack alone: both halves walk the
+    /// identical AST in the identical order, so the sites agree without
+    /// any shared counter.
+    expansion_sites: Vec<*const Expr>,
 }
 
 impl<'a> IrLowerer<'a> {
@@ -140,6 +147,7 @@ impl<'a> IrLowerer<'a> {
             return_ctxs: Vec::new(),
             break_ctxs: Vec::new(),
             inline_stack: Vec::new(),
+            expansion_sites: Vec::new(),
         }
     }
 
@@ -1719,10 +1727,15 @@ impl<'a> IrLowerer<'a> {
                 if let Expr::Field { .. } = callee.as_ref() {
                     return self.lower_ffi_call(expr, args, reg);
                 }
+                // the per-instantiation fact key, derived exactly as the
+                // checker derives it: the OUTERMOST expansion this call
+                // is lowered inside (the call itself at no expansion)
+                let call_ptr = expr as *const Expr;
+                let site = self.expansion_sites.first().copied().unwrap_or(call_ptr);
                 let fn_ptr = self
                     .shape
                     .call_defs
-                    .get(&(expr as *const Expr))
+                    .get(&(call_ptr, site))
                     .copied()
                     .ok_or_else(|| {
                         LowerError(
@@ -1745,6 +1758,18 @@ impl<'a> IrLowerer<'a> {
                             .into(),
                     )
                 })?;
+                let call_ret = self
+                    .shape
+                    .call_rets
+                    .get(&(call_ptr, site))
+                    .cloned()
+                    .ok_or_else(|| {
+                        LowerError(
+                            "Lower Error: a call site with no resolved return — \
+                             the checker and the lowerer disagree"
+                                .into(),
+                        )
+                    })?;
                 let scope_key = self.shape.fn_scope_keys.get(&fn_ptr).copied();
                 let body = unsafe { def.body() };
 
@@ -1756,9 +1781,10 @@ impl<'a> IrLowerer<'a> {
                 }
 
                 self.inline_stack.push(fn_ptr);
+                self.expansion_sites.push(call_ptr);
                 self.return_ctxs.push(ReturnCtx {
                     kind: ReturnKind::Inline {
-                        ty: def.ret.clone(),
+                        ty: call_ret.clone(),
                     },
                     exit: None,
                     args: Vec::new(),
@@ -1818,9 +1844,10 @@ impl<'a> IrLowerer<'a> {
                         .insert(expr as *const Expr, Reg::new(tag_reg));
                 }
                 self.inline_stack.pop();
+                self.expansion_sites.pop();
                 Ok(TypedReg {
                     reg: result,
-                    ty: def.ret,
+                    ty: call_ret,
                 })
             }
             Expr::TableCtor(entries) => {
@@ -2286,10 +2313,18 @@ fn find_moved_names(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
 fn calls_touched(expr: &Expr, shape: &ShapeFacts, out: &mut BTreeSet<String>) {
     match expr {
         Expr::Call { callee, args } => {
-            if let Some(&fn_ptr) = shape.call_defs.get(&(expr as *const Expr))
-                && let Some(touched) = shape.fn_touched.get(&fn_ptr)
+            // union read: every instantiation of this call expr (all its
+            // expansion sites) contributes its fn's touched names — the
+            // order-insensitive consumer the per-instantiation keys were
+            // designed to leave alone
+            let key = expr as *const Expr;
+            for (_, &fn_ptr) in shape
+                .call_defs
+                .range((key, std::ptr::null::<Expr>())..=(key, usize::MAX as *const Expr))
             {
-                out.extend(touched.iter().cloned());
+                if let Some(touched) = shape.fn_touched.get(&fn_ptr) {
+                    out.extend(touched.iter().cloned());
+                }
             }
             calls_touched(callee, shape, out);
             for a in args {
