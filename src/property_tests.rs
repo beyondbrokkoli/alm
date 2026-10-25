@@ -5,9 +5,9 @@
 //!
 //! 1. valid-by-construction single-table programs (the generator below)
 //!    must compile clean end to end, and the emitted `.ll` must be
-//!    elem-congruent — every `glm_tbl_new` esize/kind, the any/scalar
-//!    family of every `glm_tbl_get*`/`glm_tbl_set*` call, the trailing
-//!    cell size on scalar `glm_tbl_get` calls, and the LLVM storage type
+//!    elem-congruent — every `alm_tbl_new` esize/kind, the any/scalar
+//!    family of every `alm_tbl_get*`/`alm_tbl_set*` call, the trailing
+//!    cell size on scalar `alm_tbl_get` calls, and the LLVM storage type
 //!    of every scalar cell seam (`%ts*.dst`/`%ts*.valp` alloca) must
 //!    match the oracle's expected element type — Int/Flt/Bool/Str are
 //!    verified beyond esize: the flags byte names the kind, the seams
@@ -32,7 +32,7 @@
 //!
 //! Every program the generator emits owns exactly ONE table name, so
 //! module-global face counting in the `.ll` is a sound congruence
-//! oracle: the only `glm_tbl_new` calls are that name's ctors.
+//! oracle: the only `alm_tbl_new` calls are that name's ctors.
 
 use crate::analysis;
 use crate::ast::Stmt;
@@ -468,10 +468,10 @@ fn ctor_line(rng: &mut Rng, locked: Option<Elem>, elem: &mut Option<Elem>) -> St
 
 // ---- the congruence oracle over the .ll text ----
 
-/// Every `glm_tbl_new` must allocate the expected elem's cell size AND
+/// Every `alm_tbl_new` must allocate the expected elem's cell size AND
 /// name the expected elem kind in its flags byte; every table access
 /// face must belong to the expected family (`_any` iff Any); scalar
-/// `glm_tbl_get` calls must carry the expected trailing cell size; and
+/// `alm_tbl_get` calls must carry the expected trailing cell size; and
 /// every scalar cell seam alloca must use the expected storage type
 /// (Any programs must carry no scalar seams at all) — the ctor/access
 /// congruence whose violation is the §2 bug class (an esize-8 header
@@ -486,14 +486,14 @@ fn assert_elem_congruence(ll: &str, expected: Elem, context: &str) {
         if line.contains("ptrtoint") {
             continue; // the coro wrapper anchor names table symbols without calling them
         }
-        if let Some(rest) = line.split("@glm_tbl_new(i64 ").nth(1) {
+        if let Some(rest) = line.split("@alm_tbl_new(i64 ").nth(1) {
             news += 1;
             let esize: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             let esize: u64 = esize.parse().unwrap_or(u64::MAX);
             assert_eq!(
                 esize,
                 expected.esize(),
-                "{context}: glm_tbl_new allocated esize {esize}, expected {} for elem {}\
+                "{context}: alm_tbl_new allocated esize {esize}, expected {} for elem {}\
                  \noffending line: {line}",
                 expected.esize(),
                 elem_name(expected),
@@ -512,7 +512,7 @@ fn assert_elem_congruence(ll: &str, expected: Elem, context: &str) {
             assert_eq!(
                 (flags >> 1) & 0x07,
                 expected.kind_flag() >> 1,
-                "{context}: glm_tbl_new flags byte names elem kind {}, expected {} for elem {}\
+                "{context}: alm_tbl_new flags byte names elem kind {}, expected {} for elem {}\
                  \noffending line: {line}",
                 (flags >> 1) & 0x07,
                 expected.kind_flag() >> 1,
@@ -525,11 +525,11 @@ fn assert_elem_congruence(ll: &str, expected: Elem, context: &str) {
                  \noffending line: {line}"
             );
         }
-        if line.contains("call") && line.contains("@glm_tbl_") {
-            let sym_start = line.find("@glm_tbl_").expect("checked above");
+        if line.contains("call") && line.contains("@alm_tbl_") {
+            let sym_start = line.find("@alm_tbl_").expect("checked above");
             let tail = &line[sym_start..];
             let sym: &str = &tail[..tail.find('(').unwrap_or(tail.len())];
-            if sym.starts_with("@glm_tbl_get") || sym.starts_with("@glm_tbl_set") {
+            if sym.starts_with("@alm_tbl_get") || sym.starts_with("@alm_tbl_set") {
                 accesses += 1;
                 assert_eq!(
                     sym.contains("_any"),
@@ -548,7 +548,7 @@ fn assert_elem_congruence(ll: &str, expected: Elem, context: &str) {
                     },
                     elem_name(expected),
                 );
-                if sym == "@glm_tbl_get" {
+                if sym == "@alm_tbl_get" {
                     // the scalar int-lane get carries the cell size it
                     // will validate against as its trailing argument
                     let tail_size: String = line
@@ -562,7 +562,7 @@ fn assert_elem_congruence(ll: &str, expected: Elem, context: &str) {
                     assert_eq!(
                         tail_size,
                         expected.esize(),
-                        "{context}: scalar glm_tbl_get names cell size {tail_size}, expected {} \
+                        "{context}: scalar alm_tbl_get names cell size {tail_size}, expected {} \
                          for elem {}\noffending line: {line}",
                         expected.esize(),
                         elem_name(expected),
@@ -595,11 +595,11 @@ fn assert_elem_congruence(ll: &str, expected: Elem, context: &str) {
     }
     assert!(
         news >= 1,
-        "{context}: the artifact contains no glm_tbl_new — the ctor never lowered"
+        "{context}: the artifact contains no alm_tbl_new — the ctor never lowered"
     );
     assert!(
         accesses >= 1,
-        "{context}: the artifact contains no @glm_tbl_get*/@glm_tbl_set* calls — \
+        "{context}: the artifact contains no @alm_tbl_get*/@alm_tbl_set* calls — \
          table accesses never lowered"
     );
     if !expected.is_any() {
@@ -863,7 +863,7 @@ fn rebind_adoption_probes_stay_pinned() {
         let inner_esize16 = ll
             .lines()
             .filter(|l| !l.contains("ptrtoint"))
-            .filter(|l| l.contains("@glm_tbl_new(i64 16"))
+            .filter(|l| l.contains("@alm_tbl_new(i64 16"))
             .count();
         assert_eq!(
             inner_esize16,
@@ -874,7 +874,7 @@ fn rebind_adoption_probes_stay_pinned() {
         );
         assert!(
             ll.lines()
-                .any(|l| l.contains("@glm_tbl_get_any") || l.contains("@glm_tbl_set_any")),
+                .any(|l| l.contains("@alm_tbl_get_any") || l.contains("@alm_tbl_set_any")),
             "nested adoption probe: no Any face in the artifact — the packed cells lost \
              their dynamic faces\nprogram:\n{}",
             indent(source)
@@ -1165,7 +1165,7 @@ fn token_soup_never_panics_or_desyncs() {
 /// two different cells for one field name.
 #[test]
 fn str_key_derives_agree_across_the_abi() {
-    use glm_rt::rt::{glm_str_intern, glm_str_key, is_str_key, str_key_of_bytes};
+    use alm_rt::rt::{alm_str_intern, alm_str_key, is_str_key, str_key_of_bytes};
 
     let mut words: Vec<Vec<u8>> = Vec::new();
     // random strings over a corpus-flavored alphabet
@@ -1221,13 +1221,13 @@ fn str_key_derives_agree_across_the_abi() {
     );
 
     for word in &words {
-        let interned = unsafe { glm_str_intern(word.as_ptr(), word.len()) };
+        let interned = unsafe { alm_str_intern(word.as_ptr(), word.len()) };
         assert!(
             !interned.is_null(),
             "the C pool refused to intern {:?} (malloc failure?)",
             String::from_utf8_lossy(word)
         );
-        let c_derive = unsafe { glm_str_key(interned) };
+        let c_derive = unsafe { alm_str_key(interned) };
         let rust_derive = str_key_of_bytes(word);
         assert_eq!(
             c_derive,

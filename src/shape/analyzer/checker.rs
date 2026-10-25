@@ -34,7 +34,7 @@ use super::WalkState;
 use super::constraints::UnknownStore;
 use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
 use crate::shape::ty::Ty;
-use glm_rt::{signal, trace};
+use alm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn snap_of(walk: &WalkState, severed: &BTreeMap<String, BTreeSet<usize>>) -> WalkSnap {

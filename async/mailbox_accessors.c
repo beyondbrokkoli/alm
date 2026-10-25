@@ -1,5 +1,5 @@
 /* async/mailbox_accessors.c — NEW: function-only accessors so foreign
-   runtimes (glm_rt, probes) never need the struct layout; the unity build
+   runtimes (alm_rt, probes) never need the struct layout; the unity build
    touches g_engine directly, which only C can afford. */
 
 #include "state_types.c"

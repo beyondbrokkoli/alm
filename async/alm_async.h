@@ -1,5 +1,5 @@
-#ifndef GLM_ASYNC_H
-#define GLM_ASYNC_H
+#ifndef ALM_ASYNC_H
+#define ALM_ASYNC_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -11,10 +11,10 @@ extern "C" {
 #define VX_MAX_WINDOWS 4
 #define VX_RING_SIZE   16
 
-/* --- glm tenant & trace layer (glm-owned additions, not engine-vendored) ---
+/* --- alm tenant & trace layer (alm-owned additions, not engine-vendored) ---
    One .so per OS process (the loader's guarantee) owns every piece of
-   process-wide glm state: the multi-exec registry, the trace plate file,
-   and the exit-time leak report. Per-artifact glm_rt copies hold only
+   process-wide alm state: the multi-exec registry, the trace plate file,
+   and the exit-time leak report. Per-artifact alm_rt copies hold only
    their exec_id handle. */
 
 #define VX_EXEC_MAX          8
@@ -29,8 +29,8 @@ extern "C" {
 #define VX_EXEC_FINISHED 3u
 #define VX_EXEC_FAILED   4u
 
-#define VX_EXEC_F_EXE 0x1u   /* a --exe glm binary (glm_exec_main world) */
-#define VX_EXEC_F_SO  0x2u   /* a glm shared module (driven over the C ABI) */
+#define VX_EXEC_F_EXE 0x1u   /* --exe alm binary (alm_exec_main world) */
+#define VX_EXEC_F_SO  0x2u   /* alm shared module (driven over the C ABI) */
 
 /* must match FAIL_LEAK_DETECTED in trace_signals.txt (the SSOT lives in
    the Rust crate; the substrate hardcodes the one slot it owns) */
@@ -74,7 +74,7 @@ void        vx_exec_census_set(int32_t id, int64_t live, int64_t total);
 int32_t     vx_exec_count(void);
 void        vx_exec_dump(void);
 
-/* trace plate: the .so is the sole owner/writer of .glm_rt_trace.bin
+/* trace plate: the .so is the sole owner/writer of .alm_rt_trace.bin
    (sticky 256-byte mmap, CWD-relative — plate.py contract unchanged);
    anonymous pokes (exec tag 0xFF) serve foreign C companions */
 void    vx_trace_poke(uint8_t slot);
@@ -86,12 +86,12 @@ uint8_t vx_trace_fired(uint8_t slot);
 uint64_t vx_trace_event_count(void);
 uint32_t vx_trace_event_get(uint64_t seq);
 
-/* --- glm coroutine layer (glm-owned): the coroutine.* parody ------------
-   A glm "coroutine" is a compiled .so module running its glm_exec
+/* --- alm coroutine layer (alm-owned): the coroutine.* parody ------------
+   An alm "coroutine" is a compiled .so module running its alm_exec
    PREEMPTIVELY on its own OS pthread; coroutine.yield streams RingPackets
    to the spawning host thread's coroutine.resume over this library's
    lock-free ring (slot i owns ring lane i). The substrate never touches a
-   GlmTable: initial inputs ride the LWW in_* cells, and the worker's args
+   AlmTable: initial inputs ride the LWW in_* cells, and the worker's args
    table is built AND freed inside the thread by the module's own runtime. */
 
 #define VX_CORO_MAX VX_MAX_WINDOWS   /* one ring lane per coroutine */

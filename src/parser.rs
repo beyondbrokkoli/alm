@@ -100,7 +100,7 @@ impl<'a> Parser<'a> {
                 Err(e) => {
                     let line = self.err_line();
                     self.diagnostics.push(format!("line {line}: {}", e.0));
-                    glm_rt::trace::compiler_trace_signal(glm_rt::trace::TRACE_GHOST_BAIL_PARSER);
+                    alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_GHOST_BAIL_PARSER);
                     break;
                 }
             }
@@ -346,8 +346,8 @@ impl<'a> Parser<'a> {
                             // dot write sugar desugars to a string-keyed
                             // index at parse time (the checker later
                             // rejects a non-table receiver)
-                            glm_rt::trace::compiler_trace_signal(
-                                glm_rt::trace::TRACE_PARSE_STRKEY_DOT,
+                            alm_rt::trace::compiler_trace_signal(
+                                alm_rt::trace::TRACE_PARSE_STRKEY_DOT,
                             );
                             Ok(Stmt::IndexAssign {
                                 obj: *obj,
@@ -466,7 +466,7 @@ impl<'a> Parser<'a> {
         if self.depth > MAX_EXPR_DEPTH {
             self.depth -= 1;
             return Err(ParseError(format!(
-                "Syntax Error: expression nesting too deep (limit {MAX_EXPR_DEPTH} — glm's \
+                "Syntax Error: expression nesting too deep (limit {MAX_EXPR_DEPTH} — alm's \
                  static analyses are finite; deeper source is rejected, not crashed on)"
             )));
         }
@@ -760,7 +760,7 @@ impl<'a> Parser<'a> {
         self.ctor_line_seq.push(self.line_of(self.tokens.last_off));
         if matches!(self.tokens.peek(), Some(Token::RightBrace)) {
             self.tokens.next();
-            glm_rt::trace::compiler_trace_signal(glm_rt::trace::TRACE_PARSE_TBL_EMPTY);
+            alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_TBL_EMPTY);
             return Ok(Expr::TableCtor(Vec::new()));
         }
 
@@ -783,7 +783,7 @@ impl<'a> Parser<'a> {
                     if !slots.insert(*slot) {
                         return Err(ParseError(format!(
                             "Syntax Error: duplicate index {slot} in constructor — each slot may \
-                             be written once (last-wins is not glm's rule)"
+                             be written once (last-wins is not alm's rule)"
                         )));
                     }
                     if !names.is_empty() {
@@ -799,7 +799,7 @@ impl<'a> Parser<'a> {
                     if !names.insert(name.to_string()) {
                         return Err(ParseError(format!(
                             "Syntax Error: duplicate key '{name}' in constructor — each field may \
-                             be written once (last-wins is not glm's rule)"
+                             be written once (last-wins is not alm's rule)"
                         )));
                     }
                     if !slots.is_empty() {
@@ -823,7 +823,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Token::RightBrace)?;
-        glm_rt::trace::compiler_trace_signal(glm_rt::trace::TRACE_PARSE_TBL_CTOR);
+        alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_TBL_CTOR);
         Ok(Expr::TableCtor(entries))
     }
 
@@ -844,7 +844,7 @@ impl<'a> Parser<'a> {
                     Ok((CtorKey::Const(k), value))
                 }
                 _ => {
-                    glm_rt::trace::compiler_trace_signal(glm_rt::trace::TRACE_PARSE_TBL_EXPR_KEY);
+                    alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_TBL_EXPR_KEY);
                     Ok((CtorKey::Expr(key), value))
                 }
             }
@@ -862,7 +862,7 @@ impl<'a> Parser<'a> {
                     };
                     self.tokens.next(); // consume '='
                     let v = self.parse_expr()?;
-                    glm_rt::trace::compiler_trace_signal(glm_rt::trace::TRACE_PARSE_STRKEY_NAMED);
+                    alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_STRKEY_NAMED);
                     Ok((CtorKey::Str(name), v))
                 }
                 _ => {

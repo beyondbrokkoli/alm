@@ -17,20 +17,20 @@ mod shape;
 use ast::Stmt;
 
 // The boundary type, shared by construction: the same #[repr(C)] struct
-use glm_rt::rt::GlmTable;
+use alm_rt::rt::AlmTable;
 
-type GlmExec = unsafe extern "C" fn(args: *mut GlmTable) -> *mut GlmTable;
-type GlmTblNew = unsafe extern "C" fn(esize: usize, flags: u8) -> *mut GlmTable;
-type GlmTblSet = unsafe extern "C" fn(t: *mut GlmTable, index: i64, val: *const u8);
-type GlmTblSetAny = unsafe extern "C" fn(t: *mut GlmTable, index: i64, val: i128);
-type GlmTblGet = unsafe extern "C" fn(t: *mut GlmTable, index: i64, dst: *mut u8, esize: usize);
-type GlmTblFree = unsafe extern "C" fn(t: *mut GlmTable);
-type GlmStrIntern = unsafe extern "C" fn(s: *const u8, len: usize) -> *const u8;
-type GlmArgKind = unsafe extern "C" fn() -> i32;
+type AlmExec = unsafe extern "C" fn(args: *mut AlmTable) -> *mut AlmTable;
+type AlmTblNew = unsafe extern "C" fn(esize: usize, flags: u8) -> *mut AlmTable;
+type AlmTblSet = unsafe extern "C" fn(t: *mut AlmTable, index: i64, val: *const u8);
+type AlmTblSetAny = unsafe extern "C" fn(t: *mut AlmTable, index: i64, val: i128);
+type AlmTblGet = unsafe extern "C" fn(t: *mut AlmTable, index: i64, dst: *mut u8, esize: usize);
+type AlmTblFree = unsafe extern "C" fn(t: *mut AlmTable);
+type AlmStrIntern = unsafe extern "C" fn(s: *const u8, len: usize) -> *const u8;
+type AlmArgKind = unsafe extern "C" fn() -> i32;
 
 fn poke_build_fail() {
-    glm_rt::trace::compiler_trace_signal(glm_rt::trace::TRACE_BUILD_FAIL);
-    eprintln!("GLM_TRACE: slot 1 — build failed");
+    alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_BUILD_FAIL);
+    eprintln!("ALM_TRACE: slot 1 — build failed");
 }
 
 fn fail_build(diags: &[String]) -> ! {
@@ -51,24 +51,24 @@ enum HostArg {
 
 fn parse_word(raw: &str, kind: i32) -> Result<HostArg, ()> {
     match kind {
-        glm_rt::rt::GLM_ARG_INT => raw.parse::<i64>().map(HostArg::Int).map_err(|_| ()),
-        glm_rt::rt::GLM_ARG_FLOAT => raw.parse::<f64>().map(HostArg::Float).map_err(|_| ()),
-        glm_rt::rt::GLM_ARG_BOOL => match raw {
+        alm_rt::rt::ALM_ARG_INT => raw.parse::<i64>().map(HostArg::Int).map_err(|_| ()),
+        alm_rt::rt::ALM_ARG_FLOAT => raw.parse::<f64>().map(HostArg::Float).map_err(|_| ()),
+        alm_rt::rt::ALM_ARG_BOOL => match raw {
             "true" => Ok(HostArg::Bool(true)),
             "false" => Ok(HostArg::Bool(false)),
             _ => Err(()),
         },
-        glm_rt::rt::GLM_ARG_STRING => Ok(HostArg::Str(raw.as_bytes().to_vec())),
-        glm_rt::rt::GLM_ARG_ANY => {
-            use glm_rt::rt::GLM_ARG_FLOAT as K_FLOAT;
-            use glm_rt::rt::GLM_ARG_INT as K_INT;
-            let cell = match glm_rt::classify_word(raw.as_bytes()) {
-                glm_rt::AnyWord::Int(v) => glm_rt::glm_any_pack(K_INT, v as u64),
-                glm_rt::AnyWord::Float(v) => glm_rt::glm_any_pack(K_FLOAT, v.to_bits()),
-                glm_rt::AnyWord::Bool(v) => {
-                    glm_rt::glm_any_pack(glm_rt::rt::GLM_ARG_BOOL, u64::from(v))
+        alm_rt::rt::ALM_ARG_STRING => Ok(HostArg::Str(raw.as_bytes().to_vec())),
+        alm_rt::rt::ALM_ARG_ANY => {
+            use alm_rt::rt::ALM_ARG_FLOAT as K_FLOAT;
+            use alm_rt::rt::ALM_ARG_INT as K_INT;
+            let cell = match alm_rt::classify_word(raw.as_bytes()) {
+                alm_rt::AnyWord::Int(v) => alm_rt::alm_any_pack(K_INT, v as u64),
+                alm_rt::AnyWord::Float(v) => alm_rt::alm_any_pack(K_FLOAT, v.to_bits()),
+                alm_rt::AnyWord::Bool(v) => {
+                    alm_rt::alm_any_pack(alm_rt::rt::ALM_ARG_BOOL, u64::from(v))
                 }
-                glm_rt::AnyWord::Str => {
+                alm_rt::AnyWord::Str => {
                     return Ok(HostArg::Str(raw.as_bytes().to_vec()));
                 }
             };
@@ -196,36 +196,36 @@ unsafe fn run_boundary(words: &[String], out_path: &str) -> Result<(), String> {
         return Err(format!("dlopen: could not load {out_path}"));
     }
 
-    let glm_exec: GlmExec = unsafe { resolve_symbol(dylib, b"glm_exec\0")? };
-    let glm_tbl_new: GlmTblNew = unsafe { resolve_symbol(dylib, b"glm_tbl_new\0")? };
-    let glm_tbl_set: GlmTblSet = unsafe { resolve_symbol(dylib, b"glm_tbl_set\0")? };
-    let glm_tbl_set_any: GlmTblSetAny = unsafe { resolve_symbol(dylib, b"glm_tbl_set_any\0")? };
-    let glm_tbl_get: GlmTblGet = unsafe { resolve_symbol(dylib, b"glm_tbl_get\0")? };
-    let glm_tbl_free: GlmTblFree = unsafe { resolve_symbol(dylib, b"glm_tbl_free\0")? };
-    let glm_str_intern: GlmStrIntern = unsafe { resolve_symbol(dylib, b"glm_str_intern\0")? };
-    let glm_arg_kind: GlmArgKind = unsafe { resolve_symbol(dylib, b"glm_arg_kind\0")? };
+    let alm_exec: AlmExec = unsafe { resolve_symbol(dylib, b"alm_exec\0")? };
+    let alm_tbl_new: AlmTblNew = unsafe { resolve_symbol(dylib, b"alm_tbl_new\0")? };
+    let alm_tbl_set: AlmTblSet = unsafe { resolve_symbol(dylib, b"alm_tbl_set\0")? };
+    let alm_tbl_set_any: AlmTblSetAny = unsafe { resolve_symbol(dylib, b"alm_tbl_set_any\0")? };
+    let alm_tbl_get: AlmTblGet = unsafe { resolve_symbol(dylib, b"alm_tbl_get\0")? };
+    let alm_tbl_free: AlmTblFree = unsafe { resolve_symbol(dylib, b"alm_tbl_free\0")? };
+    let alm_str_intern: AlmStrIntern = unsafe { resolve_symbol(dylib, b"alm_str_intern\0")? };
+    let alm_arg_kind: AlmArgKind = unsafe { resolve_symbol(dylib, b"alm_arg_kind\0")? };
 
-    let kind = unsafe { glm_arg_kind() };
-    let mut args = std::ptr::null_mut::<GlmTable>();
-    if kind != glm_rt::rt::GLM_ARG_NONE {
+    let kind = unsafe { alm_arg_kind() };
+    let mut args = std::ptr::null_mut::<AlmTable>();
+    if kind != alm_rt::rt::ALM_ARG_NONE {
         let esize = match kind {
-            glm_rt::rt::GLM_ARG_BOOL => 1,
-            glm_rt::rt::GLM_ARG_ANY => 16,
+            alm_rt::rt::ALM_ARG_BOOL => 1,
+            alm_rt::rt::ALM_ARG_ANY => 16,
             _ => 8,
         };
-        args = unsafe { glm_tbl_new(esize, ((kind as u8) & 0x07) << 1) };
+        args = unsafe { alm_tbl_new(esize, ((kind as u8) & 0x07) << 1) };
         let mut parsed = Vec::with_capacity(words.len());
         for raw in words {
             match parse_word(raw, kind) {
                 Ok(v) => parsed.push(v),
                 Err(()) => {
                     eprintln!(
-                        "glm host error: boundary args must be {}, got '{raw}' — \
+                        "alm host error: boundary args must be {}, got '{raw}' — \
                          the arg table is {}",
                         arg_kind_words(kind),
                         arg_kind_table(kind),
                     );
-                    unsafe { glm_tbl_free(args) };
+                    unsafe { alm_tbl_free(args) };
                     std::process::exit(1);
                 }
             }
@@ -233,48 +233,48 @@ unsafe fn run_boundary(words: &[String], out_path: &str) -> Result<(), String> {
         for (i, v) in parsed.iter().enumerate() {
             match v {
                 HostArg::Int(x) => unsafe {
-                    glm_tbl_set(args, i as i64, (x as *const i64).cast::<u8>())
+                    alm_tbl_set(args, i as i64, (x as *const i64).cast::<u8>())
                 },
                 HostArg::Float(x) => unsafe {
-                    glm_tbl_set(args, i as i64, (x as *const f64).cast::<u8>())
+                    alm_tbl_set(args, i as i64, (x as *const f64).cast::<u8>())
                 },
                 HostArg::Bool(b) => unsafe {
-                    glm_tbl_set(args, i as i64, (&u8::from(*b) as *const u8).cast::<u8>())
+                    alm_tbl_set(args, i as i64, (&u8::from(*b) as *const u8).cast::<u8>())
                 },
                 HostArg::Str(bytes) => unsafe {
-                    let p = glm_str_intern(bytes.as_ptr(), bytes.len());
-                    if kind == glm_rt::rt::GLM_ARG_ANY {
-                        let cell = glm_rt::glm_any_pack(glm_rt::rt::GLM_ARG_STRING, p as u64);
-                        glm_tbl_set_any(args, i as i64, cell);
+                    let p = alm_str_intern(bytes.as_ptr(), bytes.len());
+                    if kind == alm_rt::rt::ALM_ARG_ANY {
+                        let cell = alm_rt::alm_any_pack(alm_rt::rt::ALM_ARG_STRING, p as u64);
+                        alm_tbl_set_any(args, i as i64, cell);
                     } else {
-                        glm_tbl_set(args, i as i64, (&p as *const *const u8).cast::<u8>());
+                        alm_tbl_set(args, i as i64, (&p as *const *const u8).cast::<u8>());
                     }
                 },
-                HostArg::Any(v) => unsafe { glm_tbl_set_any(args, i as i64, *v) },
+                HostArg::Any(v) => unsafe { alm_tbl_set_any(args, i as i64, *v) },
             }
         }
     }
 
-    let result = unsafe { glm_exec(args) };
+    let result = unsafe { alm_exec(args) };
 
     if result.is_null() {
-        eprintln!("[glm host] boundary: glm_exec returned null");
+        eprintln!("[alm host] boundary: alm_exec returned null");
     } else {
-        let report = unsafe { render_boundary(result, 0, glm_tbl_get) };
-        eprintln!("[glm host] boundary: glm_exec returned {report}");
+        let report = unsafe { render_boundary(result, 0, alm_tbl_get) };
+        eprintln!("[alm host] boundary: alm_exec returned {report}");
     }
 
     unsafe {
         if result != args {
-            glm_tbl_free(args);
+            alm_tbl_free(args);
         }
-        glm_tbl_free(result);
+        alm_tbl_free(result);
     }
     Ok(())
 }
 
-unsafe fn render_boundary(t: *mut GlmTable, depth: u32, glm_tbl_get: GlmTblGet) -> String {
-    let body = unsafe { render_cells(t, depth, glm_tbl_get) };
+unsafe fn render_boundary(t: *mut AlmTable, depth: u32, alm_tbl_get: AlmTblGet) -> String {
+    let body = unsafe { render_cells(t, depth, alm_tbl_get) };
     if depth == 0 {
         format!("a table {body}")
     } else {
@@ -282,22 +282,22 @@ unsafe fn render_boundary(t: *mut GlmTable, depth: u32, glm_tbl_get: GlmTblGet) 
     }
 }
 
-unsafe fn render_cells(t: *mut GlmTable, depth: u32, glm_tbl_get: GlmTblGet) -> String {
+unsafe fn render_cells(t: *mut AlmTable, depth: u32, alm_tbl_get: AlmTblGet) -> String {
     let (len, esize, contains_tables) = unsafe { ((*t).len, (*t).esize, (*t).contains_tables) };
     let rows = contains_tables != 0 && esize == 8;
     let shown = len.clamp(0, if depth == 0 { 8 } else { 4 }) as usize;
     let mut cells = Vec::with_capacity(shown);
     for i in 0..shown as i64 {
         let mut buf = [0u8; 16];
-        unsafe { glm_tbl_get(t, i, buf.as_mut_ptr(), esize) };
+        unsafe { alm_tbl_get(t, i, buf.as_mut_ptr(), esize) };
         if rows {
-            let row = usize::from_ne_bytes(buf[..8].try_into().unwrap()) as *mut GlmTable;
+            let row = usize::from_ne_bytes(buf[..8].try_into().unwrap()) as *mut AlmTable;
             cells.push(if row.is_null() {
                 "null".to_string()
             } else if !is_plausible_row(row as usize) {
                 format!("row@{:#x}?", row as usize)
             } else if depth < 2 {
-                unsafe { render_boundary(row, depth + 1, glm_tbl_get) }
+                unsafe { render_boundary(row, depth + 1, alm_tbl_get) }
             } else {
                 "row…".to_string()
             });
@@ -305,12 +305,12 @@ unsafe fn render_cells(t: *mut GlmTable, depth: u32, glm_tbl_get: GlmTblGet) -> 
             let payload = u64::from_ne_bytes(buf[..8].try_into().unwrap());
             let tag = i32::from_ne_bytes(buf[8..12].try_into().unwrap());
             cells.push(match tag {
-                k if k == glm_rt::rt::GLM_ARG_INT => format!("{}:int", payload as i64),
-                k if k == glm_rt::rt::GLM_ARG_FLOAT => {
+                k if k == alm_rt::rt::ALM_ARG_INT => format!("{}:int", payload as i64),
+                k if k == alm_rt::rt::ALM_ARG_FLOAT => {
                     format!("{}:float", f64::from_bits(payload))
                 }
-                k if k == glm_rt::rt::GLM_ARG_BOOL => format!("{}:bool", payload != 0),
-                k if k == glm_rt::rt::GLM_ARG_STRING => format!("{payload:#x}:string"),
+                k if k == alm_rt::rt::ALM_ARG_BOOL => format!("{}:bool", payload != 0),
+                k if k == alm_rt::rt::ALM_ARG_STRING => format!("{payload:#x}:string"),
                 _ => format!("{payload}:int"),
             });
         } else if esize == 8 {
@@ -332,7 +332,7 @@ fn is_plausible_row(addr: usize) -> bool {
 }
 
 fn main() {
-    glm_rt::trace::compiler_trace_init();
+    alm_rt::trace::compiler_trace_init();
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -342,7 +342,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     const HELP: &str = "\
-Usage: glm [FLAGS] [--output <path>] <file.lua> [args...]
+Usage: alm [FLAGS] [--output <path>] <file.lua> [args...]
 
 FLAGS:
     --help        Print this help message and exit.
@@ -352,7 +352,7 @@ FLAGS:
     --debug       -O0, frame pointers, no inlining — dev loop tracing.
 
 The compiler performs a pure transform to native code. If --output is omitted,
-it defaults to libglm_out.so (or glm_out for --exe).";
+it defaults to libalm_out.so (or alm_out for --exe).";
 
     let mut standalone = false;
     let mut debug = false;
@@ -386,13 +386,13 @@ it defaults to libglm_out.so (or glm_out for --exe).";
                 if let Some(p) = args.get(idx) {
                     if std::path::Path::new(p.as_str()).is_dir() {
                         eprintln!(
-                            "glm compiler error: --output must be a file path, not a directory: {p}"
+                            "alm compiler error: --output must be a file path, not a directory: {p}"
                         );
                         std::process::exit(1);
                     }
                     output_file = Some(p.clone());
                 } else {
-                    eprintln!("glm compiler error: --output requires a file path argument");
+                    eprintln!("alm compiler error: --output requires a file path argument");
                     std::process::exit(1);
                 }
                 idx += 1;
@@ -403,7 +403,7 @@ it defaults to libglm_out.so (or glm_out for --exe).";
             }
             _ if flag.starts_with('-') => {
                 eprintln!(
-                    "glm compiler error: Unknown flag '{flag}'. Flags must come before the source file."
+                    "alm compiler error: Unknown flag '{flag}'. Flags must come before the source file."
                 );
                 std::process::exit(1);
             }
@@ -413,9 +413,9 @@ it defaults to libglm_out.so (or glm_out for --exe).";
 
     let output_file = output_file.unwrap_or_else(|| {
         if standalone {
-            "glm_out".to_string()
+            "alm_out".to_string()
         } else {
-            "libglm_out.so".to_string()
+            "libalm_out.so".to_string()
         }
     });
 
@@ -428,7 +428,7 @@ it defaults to libglm_out.so (or glm_out for --exe).";
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
-        eprintln!("glm compiler error: Failed to read source file '{source_path}'");
+        eprintln!("alm compiler error: Failed to read source file '{source_path}'");
         eprintln!("  Current directory: {cwd}");
         eprintln!("  System error: {e}");
         std::process::exit(1);
@@ -466,7 +466,7 @@ it defaults to libglm_out.so (or glm_out for --exe).";
 
     if uses_ffi(&ast) && !standalone {
         eprintln!(
-            "glm compiler error: the ffi surface (require(\"ffi\") / ffi.load / lib.sym) is \
+            "alm compiler error: the ffi surface (require(\"ffi\") / ffi.load / lib.sym) is \
              --exe-only — rebuild with --exe; a shared object loading shared objects is not \
              acyclic destiny"
         );
@@ -516,7 +516,7 @@ it defaults to libglm_out.so (or glm_out for --exe).";
     let stem = std::path::Path::new(&output_file)
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("glm_out");
+        .unwrap_or("alm_out");
     let ll_name = format!("{out_dir}/{stem}.ll");
     let _ = std::fs::remove_file(&ll_name);
     std::fs::remove_file(&output_file).ok();
@@ -528,12 +528,12 @@ it defaults to libglm_out.so (or glm_out for --exe).";
         "release"
     };
     let runtime = format!(
-        "{}/target/{}/libglm_rt.a",
+        "{}/target/{}/libalm_rt.a",
         env!("CARGO_MANIFEST_DIR"),
         profile
     );
     // the C11 async substrate lives next to the runtime archive; every
-    // artifact links it so process-wide glm state (exec registry, trace
+    // artifact links it so process-wide alm state (exec registry, trace
     // plate, exit report) has exactly one home per process
     let async_dir = std::path::Path::new(&runtime)
         .parent()
@@ -563,7 +563,7 @@ it defaults to libglm_out.so (or glm_out for --exe).";
         .arg(&ll_name)
         .arg(&runtime)
         .arg(format!("-L{async_dir}"))
-        .arg("-lglm_async")
+        .arg("-lalm_async")
         .arg(format!("-Wl,-rpath,{async_dir}"))
         .arg("-Wl,-rpath,$ORIGIN")
         .arg("-lpthread")
@@ -578,8 +578,8 @@ it defaults to libglm_out.so (or glm_out for --exe).";
         panic!("Clang failed to assemble and link the {link_kind}.");
     }
     println!("Success! {link_kind} written to {output_file}");
-    glm_rt::trace::compiler_trace_signal(glm_rt::trace::TRACE_COMPILED);
-    eprintln!("GLM_TRACE: slot 0 — compiled ok");
+    alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_COMPILED);
+    eprintln!("ALM_TRACE: slot 0 — compiled ok");
 
     if standalone {
         return;
@@ -587,27 +587,27 @@ it defaults to libglm_out.so (or glm_out for --exe).";
 
     let words: Vec<String> = args[idx + 1..].to_vec();
     if let Err(e) = unsafe { run_boundary(&words, &output_file) } {
-        eprintln!("glm host error: {e}");
+        eprintln!("alm host error: {e}");
         std::process::exit(1);
     }
 }
 
 fn arg_kind_words(kind: i32) -> &'static str {
     match kind {
-        glm_rt::rt::GLM_ARG_FLOAT => "numbers (64-bit floats)",
-        glm_rt::rt::GLM_ARG_BOOL => "booleans ('true'/'false')",
-        glm_rt::rt::GLM_ARG_STRING => "strings (any word)",
-        glm_rt::rt::GLM_ARG_ANY => "int, float, bool, or string words",
+        alm_rt::rt::ALM_ARG_FLOAT => "numbers (64-bit floats)",
+        alm_rt::rt::ALM_ARG_BOOL => "booleans ('true'/'false')",
+        alm_rt::rt::ALM_ARG_STRING => "strings (any word)",
+        alm_rt::rt::ALM_ARG_ANY => "int, float, bool, or string words",
         _ => "integers (64-bit)",
     }
 }
 
 fn arg_kind_table(kind: i32) -> &'static str {
     match kind {
-        glm_rt::rt::GLM_ARG_FLOAT => "Table<Float>",
-        glm_rt::rt::GLM_ARG_BOOL => "Table<Boolean>",
-        glm_rt::rt::GLM_ARG_STRING => "Table<String>",
-        glm_rt::rt::GLM_ARG_ANY => "Table<Any>",
+        alm_rt::rt::ALM_ARG_FLOAT => "Table<Float>",
+        alm_rt::rt::ALM_ARG_BOOL => "Table<Boolean>",
+        alm_rt::rt::ALM_ARG_STRING => "Table<String>",
+        alm_rt::rt::ALM_ARG_ANY => "Table<Any>",
         _ => "Table<Integer>",
     }
 }

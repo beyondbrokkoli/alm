@@ -1,5 +1,5 @@
 [package]
-name = "glm"
+name = "alm"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,16 +7,16 @@ edition = "2024"
 logos = "0.16.1"
 
 # One crate, two targets:
-#   bin  glm     — the compiler (src/main.rs and its modules)
-#   lib  glm_rt  — the C-ABI runtime, built as a staticlib that clang links
+#   bin  alm     — the compiler (src/main.rs and its modules)
+#   lib  alm_rt  — the C-ABI runtime, built as a staticlib that clang links
 #                  against the generated .ll (src/lib.rs -> src/rt.rs)
 [lib]
-name = "glm_rt"
+name = "alm_rt"
 path = "src/lib.rs"
 crate-type = ["staticlib", "rlib"]
 
 [[bin]]
-name = "glm"
+name = "alm"
 path = "src/main.rs"
 
 [profile.release]

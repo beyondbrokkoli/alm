@@ -1,7 +1,7 @@
 use super::core::LayoutVerdict;
 use crate::ast::{Expr, Stmt};
 use crate::shape::Ty;
-use glm_rt::{signal, trace};
+use alm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, PartialEq, Debug)]

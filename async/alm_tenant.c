@@ -1,17 +1,17 @@
-/* async/glm_tenant.c (glm-owned, not engine-vendored): the
+/* async/alm_tenant.c (alm-owned, not engine-vendored): the
    multi-exec tenant registry + the sole-owner trace plate.
 
    Because this file lives in the ONE shared object the dynamic loader
    guarantees per process, it can make single-writer promises no
-   per-artifact glm_rt copy ever could:
-     - .glm_rt_trace.bin is opened/mapped exactly once per process (CAS
-       once-guard); every poke from every glm artifact and foreign C
+   per-artifact alm_rt copy ever could:
+     - .alm_rt_trace.bin is opened/mapped exactly once per process (CAS
+       once-guard); every poke from every alm artifact and foreign C
        companion lands on the same MAP_SHARED inode — nobody else
        creates the file, so nobody needs to detect an existing mapping.
      - the exit-time leak report is installed once (atexit) and walks
        every registered exec's census mirror, so a leak names the module
        that leaked instead of whichever runtime copy happened to notice.
-   glm_rt copies keep no process-wide trace/leak state of their own —
+   alm_rt copies keep no process-wide trace/leak state of their own —
    just the exec_id handle vx_exec_register handed them. */
 
 #include <fcntl.h>
@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #include "sys_sync.h"
-#include "glm_async.h"
+#include "alm_async.h"
 #include "state_types.c"
 
 /* once-guard for the whole substrate: 0 = uninitialized, 1 = init in
@@ -66,14 +66,14 @@ static void ensure_init(void) {
     }
 }
 
-/* the substrate's init point for sibling translation units (glm_coro.c):
+/* the substrate's init point for sibling translation units (alm_coro.c):
  * public, idempotent, cheap after the first call */
 EXPORT void vx_async_ready(void) {
     ensure_init();
 }
 
 __attribute__((constructor))
-static void glm_async_ctor(void) {
+static void alm_async_ctor(void) {
     ensure_init();
 }
 
@@ -84,7 +84,7 @@ static void exit_report(void) {
      * full ring abandons its yield once shutdown is set, so the census
      * walk below reads final, race-free numbers */
     vx_coro_quiesce();
-    if (getenv("GLM_RT_DUMP")) {
+    if (getenv("ALM_RT_DUMP")) {
         vx_exec_dump();
     }
     int leaked_any = 0;
@@ -95,7 +95,7 @@ static void exit_report(void) {
         if (live > 0) {
             leaked_any = 1;
             fprintf(stderr,
-                    "GLM_TRACE: slot 90 — leak at exit (module %s, "
+                    "ALM_TRACE: slot 90 — leak at exit (module %s, "
                     "sys_alloc_count() == %lld)\n",
                     s->name, (long long)live);
         }
@@ -182,7 +182,7 @@ EXPORT void vx_exec_dump(void) {
     static const char* words[] = {
         "EMPTY", "BOOTING", "RUNNING", "FINISHED", "FAILED",
     };
-    fprintf(stderr, "--- GLM EXEC REGISTRY (%d registered) ---\n",
+    fprintf(stderr, "--- ALM EXEC REGISTRY (%d registered) ---\n",
             (int)vx_exec_count());
     for (int i = 0; i < VX_EXEC_MAX; i++) {
         uint32_t st = L(g_execs.slots[i].state);
@@ -196,14 +196,14 @@ EXPORT void vx_exec_dump(void) {
     }
 }
 
-/* ---- the trace plate: sole owner of .glm_rt_trace.bin ------------------ */
+/* ---- the trace plate: sole owner of .alm_rt_trace.bin ------------------ */
 
 static uint8_t* plate_map_acquire(void) {
     if (L(g_trace.plate_init) == 2) return g_trace.plate_map;
     int expected = 0;
     if (CXS(g_trace.plate_init, expected, 1)) {
         uint8_t* map = NULL;
-        const char* file = ".glm_rt_trace.bin";
+        const char* file = ".alm_rt_trace.bin";
         /* anti-stale: this .so is one per process, so a first-init here
          * means a fresh process — remove any leftover plate, then create.
          * The file stays linked so plate.py can read it after exit. */

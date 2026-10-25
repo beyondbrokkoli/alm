@@ -1,5 +1,5 @@
 use crate::shape::Ty;
-use glm_rt::GlmElem;
+use alm_rt::AlmElem;
 use std::marker::PhantomData;
 
 pub type BlockId = usize;
@@ -27,7 +27,7 @@ pub struct Any;
 /// produce one — a user integer, however produced at runtime, can never
 /// address a record cell because it never shares a register class with
 /// `Reg<StrKey>` and the backend routes the two to distinct runtime
-/// entry points (`glm_tbl_set_skey` vs `glm_tbl_set`).
+/// entry points (`alm_tbl_set_skey` vs `alm_tbl_set`).
 #[derive(Debug, Clone, Copy)]
 pub struct StrKey;
 
@@ -1036,7 +1036,7 @@ pub enum Instruction {
         target: Reg<Int>,
         val: i64,
     },
-    /// glm_str_key: the negative table key of a pooled string — one
+    /// alm_str_key: the negative table key of a pooled string — one
     /// unaligned load of the 8-byte prefix off the canonical handle
     /// (async/str_pool.c). The ONLY runtime derivation of a StrKey
     /// register; the constant-fold twin is StrKeyConst.
@@ -1228,7 +1228,7 @@ impl BasicBlock {
 #[derive(Debug, Clone)]
 pub struct IrProgram {
     pub blocks: Vec<BasicBlock>,
-    pub boundary_elem: Option<GlmElem>,
+    pub boundary_elem: Option<AlmElem>,
     pub entry: EntryKind,
     pub source_file: std::path::PathBuf,
 }

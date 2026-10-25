@@ -19,7 +19,7 @@ EXPORT void vx_spin_wait(int* spin_count) {
 }
 
 /* vendored verbatim from demo_engine/host/threading/thread_pool.c (the
-   whole 11-line file): thread lifecycle is the embedder's job — glm_coro.c
+   whole 11-line file): thread lifecycle is the embedder's job — alm_coro.c
    is the embedder now. Un-static'd + EXPORT for cross-DSO callers. */
 
 EXPORT vmath_thread_t vx_thread_start(void* (*func)(void*), void* arg) {

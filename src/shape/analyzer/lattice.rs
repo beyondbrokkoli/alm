@@ -186,7 +186,7 @@ impl Analyzer {
 
         let joined = join_ty(&self.lattice.site_elem[site], vt);
         if matches!(joined, Conflict) && self.lattice.site_elem[site] != joined {
-            crate::glm_dbgln!(
+            crate::alm_dbgln!(
                 "[decide] site {site}: {:?} -> Conflict (vt={:?})",
                 self.lattice.site_elem[site],
                 vt
@@ -222,7 +222,7 @@ impl Analyzer {
                     && (ts.ty == Pending || matches!(ts.ty, Tbl(_)))
                     && ts.ty != expected_var_ty
                 {
-                    crate::glm_dbgln!(
+                    crate::alm_dbgln!(
                         "[decide-rewrite] site {site}: '{nm}' {:?} -> {:?} (vt={:?})",
                         ts.ty,
                         expected_var_ty,

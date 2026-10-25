@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
 [USAGE & CLI]
-  python3 plate.py                      Decode default (./.glm_trace.bin)
+  python3 plate.py                      Decode default (./.alm_trace.bin)
   python3 plate.py <plate.bin>          Decode explicit plate
   python3 plate.py <good.bin> <bad.bin> Event-sequence diff (baseline, suspect)
   python3 plate.py -s <signals.txt> ... Override SSOT registry path
 
 [DEFAULTS]
-  Plate     : ./.glm_trace.bin
+  Plate     : ./.alm_trace.bin
   Registry  : ./trace_signals.txt (resolved relative to script directory)
 
 [DECODER FORMAT DISPATCH]
-  1. Compiler Chronology Plate (`.glm_trace.bin`)
+  1. Compiler Chronology Plate (`.alm_trace.bin`)
      Offset 0..4   : fired (u32 LE)    — total events emitted (writer sequence)
      Offset 4..8   : capacity (u32 LE) — ring buffer size (C)
      Offset 8..8+C : ring (u8[C])      — slot bytes in fire order (wraps at C)
 
-  2. Runtime Sidecar Plate (`.glm_rt_trace.bin`)
+  2. Runtime Sidecar Plate (`.alm_rt_trace.bin`)
      Detection     : Input size == 256 bytes
      Semantics     : Sticky boolean array (u8[256]) from target process.
      Output        : List of slots that fired at least once.
@@ -30,10 +30,10 @@ import argparse
 import sys
 from pathlib import Path
 
-SIDECAR_LEN = 256  # .glm_rt_trace.bin: one sticky byte per slot
+SIDECAR_LEN = 256  # .alm_rt_trace.bin: one sticky byte per slot
 HDR_LEN = 8
 
-DEFAULT_PLATE = ".glm_trace.bin"
+DEFAULT_PLATE = ".alm_trace.bin"
 
 
 def load_signals(path: Path):
@@ -189,7 +189,7 @@ def main():
 
     ap = argparse.ArgumentParser(
         prog="plate.py",
-        description="Decode the .glm_trace.bin event chronology, or diff two "
+        description="Decode the .alm_trace.bin event chronology, or diff two "
                     "plates (good.bin bad.bin — baseline first, suspect second).")
     ap.add_argument("plates", nargs="*", metavar="PLATE",
                     help="one plate -> chronology; two plates -> diff")

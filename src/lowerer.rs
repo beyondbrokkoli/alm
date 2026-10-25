@@ -10,11 +10,11 @@ use crate::ir::{
 use crate::shape::{
     ArmFreeEntry, DoExitFree, FfiVerb, Keep, KeyLane, LayoutVerdict, ShapeFacts, TagSrc, Ty,
 };
+use alm_rt::{signal, trace};
 use bridges::{
     NumPair, NumSingle, OrdPair, any_of, bool_of, int_of, num_pair, num_single, ord_pair, phi_of,
     phi_push, pooled_ptr_of, ptr_of, str_lane, string_repr,
 };
-use glm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct LowerError(pub String);
@@ -25,14 +25,14 @@ impl LowerError {
     }
 }
 
-pub fn boundary_elem_of(elem: Ty) -> glm_rt::GlmElem {
+pub fn boundary_elem_of(elem: Ty) -> alm_rt::AlmElem {
     match elem {
-        Ty::Flt => glm_rt::GlmElem::Float,
-        Ty::Bool => glm_rt::GlmElem::Boolean,
-        Ty::Str => glm_rt::GlmElem::String,
-        Ty::Any => glm_rt::GlmElem::Any,
-        Ty::Int | Ty::Tbl(_) | Ty::Unknown(_) => glm_rt::GlmElem::Integer,
-        Ty::Ffi | Ty::FfiLib | Ty::Coro => glm_rt::GlmElem::Integer,
+        Ty::Flt => alm_rt::AlmElem::Float,
+        Ty::Bool => alm_rt::AlmElem::Boolean,
+        Ty::Str => alm_rt::AlmElem::String,
+        Ty::Any => alm_rt::AlmElem::Any,
+        Ty::Int | Ty::Tbl(_) | Ty::Unknown(_) => alm_rt::AlmElem::Integer,
+        Ty::Ffi | Ty::FfiLib | Ty::Coro => alm_rt::AlmElem::Integer,
         // the boundary elem fact is a resolved checker value — flow
         // state never rides the artifact path
         Ty::Pending | Ty::Conflict => unreachable!("flow state never rides the artifact path"),
@@ -620,7 +620,7 @@ impl<'a> IrLowerer<'a> {
     /// identity at COMPILE time (StrKeyConst — the whole point of
     /// hash-derived keys: zero runtime work for `t.x` / `t["x"]` /
     /// record fields); a String-typed dynamic key (`t[s]`) lowers to
-    /// glm_str_key (StrKey — one prefix load off the pooled handle);
+    /// alm_str_key (StrKey — one prefix load off the pooled handle);
     /// anything else is the existing Integer lane. The returned
     /// TableKey keeps the two lanes apart at the type level: only the
     /// two derivations can construct the Str lane, so no user integer
@@ -632,7 +632,7 @@ impl<'a> IrLowerer<'a> {
             let r = self.next_reg();
             self.emit(Instruction::StrKeyConst {
                 target: Reg::new(r),
-                val: glm_rt::rt::str_key_of_bytes(s.as_bytes()),
+                val: alm_rt::rt::str_key_of_bytes(s.as_bytes()),
             });
             return Ok(TableKey::Str(Reg::new(r)));
         }
@@ -1894,7 +1894,7 @@ impl<'a> IrLowerer<'a> {
                             let k = self.next_reg();
                             self.emit(Instruction::StrKeyConst {
                                 target: Reg::new(k),
-                                val: glm_rt::rt::str_key_of_bytes(name.as_bytes()),
+                                val: alm_rt::rt::str_key_of_bytes(name.as_bytes()),
                             });
                             self.table_set(tbl, TableKey::Str(Reg::new(k)), v_reg, &elem)?;
                         }
@@ -1938,7 +1938,7 @@ impl<'a> IrLowerer<'a> {
                 let k = self.next_reg();
                 self.emit(Instruction::StrKeyConst {
                     target: Reg::new(k),
-                    val: glm_rt::rt::str_key_of_bytes(name.as_bytes()),
+                    val: alm_rt::rt::str_key_of_bytes(name.as_bytes()),
                 });
                 let target_ty = self.elem_face_of(obj)?;
                 let t_reg = ptr_of(t_any)?;

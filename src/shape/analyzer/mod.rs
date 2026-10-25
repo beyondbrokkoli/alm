@@ -1,6 +1,6 @@
 use crate::analysis::AnalysisContext;
 use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
-use glm_rt::{signal, trace};
+use alm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::core::{
@@ -454,7 +454,7 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
     let mut dbg_pass: u32 = 0;
     loop {
         dbg_pass += 1;
-        crate::glm_dbgln!("[fixpoint] pass {dbg_pass}");
+        crate::alm_dbgln!("[fixpoint] pass {dbg_pass}");
         a.walk.changed = false;
         a.walk.scopes = vec![boundary_root_scope()];
         a.walk.fn_scopes = vec![BTreeMap::new()];
@@ -673,7 +673,7 @@ impl Analyzer {
             signal!(trace::TRACE_FAIL_CYCLIC_STORE);
             self.ledger.diagnostics.push(format!(
                 "line {line}: Type Error: cyclic table store — '{value}' stored into '{base}' \
-                 would create a table cycle (glm's element types are finite)"
+                 would create a table cycle (alm's element types are finite)"
             ));
         }
 

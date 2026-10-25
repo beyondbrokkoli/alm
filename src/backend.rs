@@ -6,7 +6,7 @@ use crate::ir::{
     SourceLoc, TableKey, Terminator, UnaryNum,
 };
 use crate::shape::LayoutVerdict;
-use glm_rt::trace;
+use alm_rt::trace;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -21,13 +21,13 @@ fn elem_size(ty: &Ty) -> u32 {
 
 fn elem_kind_code(ty: &Ty) -> u8 {
     match ty {
-        Ty::Int => glm_rt::rt::GLM_ARG_INT as u8,
-        Ty::Flt => glm_rt::rt::GLM_ARG_FLOAT as u8,
-        Ty::Bool => glm_rt::rt::GLM_ARG_BOOL as u8,
-        Ty::Str => glm_rt::rt::GLM_ARG_STRING as u8,
-        Ty::Any => glm_rt::rt::GLM_ARG_ANY as u8,
-        Ty::Tbl(_) => glm_rt::rt::GLM_ELEM_TABLE,
-        _ => glm_rt::rt::GLM_ELEM_UNDECIDED,
+        Ty::Int => alm_rt::rt::ALM_ARG_INT as u8,
+        Ty::Flt => alm_rt::rt::ALM_ARG_FLOAT as u8,
+        Ty::Bool => alm_rt::rt::ALM_ARG_BOOL as u8,
+        Ty::Str => alm_rt::rt::ALM_ARG_STRING as u8,
+        Ty::Any => alm_rt::rt::ALM_ARG_ANY as u8,
+        Ty::Tbl(_) => alm_rt::rt::ALM_ELEM_TABLE,
+        _ => alm_rt::rt::ALM_ELEM_UNDECIDED,
     }
 }
 
@@ -80,11 +80,11 @@ impl DebugMeta {
         ));
         defs.push_str(&format!(
             "!{DI_CU} = distinct !DICompileUnit(language: DW_LANG_C99, file: !{DI_FILE}, \
-             producer: \"glm\", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug, \
+             producer: \"alm\", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug, \
              enums: !{{}})\n"
         ));
         defs.push_str(&format!(
-            "!{DI_SP} = distinct !DISubprogram(name: \"glm_exec\", linkageName: \"glm_exec\", \
+            "!{DI_SP} = distinct !DISubprogram(name: \"alm_exec\", linkageName: \"alm_exec\", \
              scope: !{DI_FILE}, file: !{DI_FILE}, line: 1, type: !{DI_FN_TY}, scopeLine: 1, \
              spFlags: DISPFlagDefinition, unit: !{DI_CU})\n"
         ));
@@ -447,7 +447,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                     let f = ks;
                     ks += 1;
                     code.push_str(&format!(
-                        "  %ts{f}.slot = getelementptr inbounds [{n} x ptr], ptr @.glm_strtab, i64 0, i64 {slot}\n\
+                        "  %ts{f}.slot = getelementptr inbounds [{n} x ptr], ptr @.alm_strtab, i64 0, i64 {slot}\n\
                          %v{t} = load ptr, ptr %ts{f}.slot\n",
                         f = f,
                         n = str_order.len(),
@@ -458,28 +458,28 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                 Instruction::StrLen { target, s } => {
                     needs_str_len_decl = true;
                     code.push_str(&format!(
-                        "  %v{} = call i64 @glm_str_len(ptr %v{})\n",
+                        "  %v{} = call i64 @alm_str_len(ptr %v{})\n",
                         target.id, s.id
                     ));
                 }
                 Instruction::StrKey { target, s } => {
                     needs_str_key_decl = true;
                     code.push_str(&format!(
-                        "  %v{} = call i64 @glm_str_key(ptr %v{})\n",
+                        "  %v{} = call i64 @alm_str_key(ptr %v{})\n",
                         target.id, s.id
                     ));
                 }
                 Instruction::AnyLen { target, source } => {
                     needs_any_len_decl = true;
                     code.push_str(&format!(
-                        "  %v{} = call i64 @glm_any_len(i128 %v{})\n",
+                        "  %v{} = call i64 @alm_any_len(i128 %v{})\n",
                         target.id, source.id
                     ));
                 }
                 Instruction::TableLen { target, table } => {
                     needs_tbl_len_decl = true;
                     code.push_str(&format!(
-                        "  %v{} = call i64 @glm_tbl_len(ptr %v{})\n",
+                        "  %v{} = call i64 @alm_tbl_len(ptr %v{})\n",
                         target.id, table.id
                     ));
                 }
@@ -487,14 +487,14 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                     PackRegs::Int(s) => {
                         needs_any_from |= 1;
                         code.push_str(&format!(
-                            "  %v{} = call i128 @glm_any_from_int(i64 %v{})\n",
+                            "  %v{} = call i128 @alm_any_from_int(i64 %v{})\n",
                             target.id, s.id
                         ));
                     }
                     PackRegs::Float(s) => {
                         needs_any_from |= 2;
                         code.push_str(&format!(
-                            "  %v{} = call i128 @glm_any_from_float(double %v{})\n",
+                            "  %v{} = call i128 @alm_any_from_float(double %v{})\n",
                             target.id, s.id
                         ));
                     }
@@ -502,7 +502,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                         needs_any_from |= 4;
                         code.push_str(&format!(
                             "  %v{t}.bz = zext i1 %v{src} to i8\n  %v{t} = call i128 \
-                             @glm_any_from_bool(i8 %v{t}.bz)\n",
+                             @alm_any_from_bool(i8 %v{t}.bz)\n",
                             t = target.id,
                             src = s.id
                         ));
@@ -510,7 +510,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                     PackRegs::Str(s) => {
                         needs_any_from |= 8;
                         code.push_str(&format!(
-                            "  %v{} = call i128 @glm_any_from_str(ptr %v{})\n",
+                            "  %v{} = call i128 @alm_any_from_str(ptr %v{})\n",
                             target.id, s.id
                         ));
                     }
@@ -537,7 +537,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                     needs_hdr_md = true;
 
                     code.push_str(&format!(
-                        "  %v{} = call ptr @glm_tbl_new(i64 {}, i8 {})\n",
+                        "  %v{} = call ptr @alm_tbl_new(i64 {}, i8 {})\n",
                         target.id,
                         elem_size(elem),
                         flags | (elem_kind_code(elem) << 1)
@@ -555,7 +555,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                 Instruction::TableReserve { table, bound } => {
                     needs_tbl_reserve_decl = true;
                     code.push_str(&format!(
-                        "  call void @glm_tbl_reserve(ptr %v{}, i64 %v{})\n",
+                        "  call void @alm_tbl_reserve(ptr %v{}, i64 %v{})\n",
                         table.id, bound.id
                     ));
                 }
@@ -583,7 +583,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                     trace::compiler_trace_signal(trace::TRACE_OFFLOAD_EMIT);
 
                     needs_tbl_free_decl = true;
-                    code.push_str(&format!("  call void @glm_tbl_free(ptr %v{})\n", table.id));
+                    code.push_str(&format!("  call void @alm_tbl_free(ptr %v{})\n", table.id));
                 }
                 Instruction::TableFreeExcept { table, keeps } => {
                     trace::compiler_trace_signal(trace::TRACE_OFFLOAD_EMIT);
@@ -591,7 +591,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                     if keeps.len() == 1 {
                         needs_tbl_free_except_decl = true;
                         code.push_str(&format!(
-                            "  call void @glm_tbl_free_except(ptr %v{}, ptr %v{})\n",
+                            "  call void @alm_tbl_free_except(ptr %v{}, ptr %v{})\n",
                             table.id, keeps[0].id
                         ));
                     } else {
@@ -612,7 +612,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                             ));
                         }
                         code.push_str(&format!(
-                            "  call void @glm_tbl_free_except_n(ptr %v{t}, ptr %kf{f}, i64 {n})\n",
+                            "  call void @alm_tbl_free_except_n(ptr %v{t}, ptr %kf{f}, i64 {n})\n",
                             t = table.id,
                             f = f,
                             n = keeps.len()
@@ -633,7 +633,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                 Instruction::CoroCreate { target, lib } => {
                     needs_coro_decls = true;
                     code.push_str(&format!(
-                        "  %v{} = call i64 @glm_coro_create(ptr %v{})\n",
+                        "  %v{} = call i64 @alm_coro_create(ptr %v{})\n",
                         target.id, lib.id
                     ));
                 }
@@ -644,42 +644,42 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                 } => {
                     needs_coro_decls = true;
                     code.push_str(&format!(
-                        "  %v{} = call i64 @glm_coro_resume(i64 %v{}, ptr %v{})\n",
+                        "  %v{} = call i64 @alm_coro_resume(i64 %v{}, ptr %v{})\n",
                         target.id, handle.id, args.id
                     ));
                 }
                 Instruction::CoroYield { target, value } => {
                     needs_coro_decls = true;
                     code.push_str(&format!(
-                        "  %v{} = call i64 @glm_coro_yield(i64 %v{})\n",
+                        "  %v{} = call i64 @alm_coro_yield(i64 %v{})\n",
                         target.id, value.id
                     ));
                 }
                 Instruction::CoroStatus { target, handle } => {
                     needs_coro_decls = true;
                     code.push_str(&format!(
-                        "  %v{} = call ptr @glm_coro_status(i64 %v{})\n",
+                        "  %v{} = call ptr @alm_coro_status(i64 %v{})\n",
                         target.id, handle.id
                     ));
                 }
                 Instruction::CoroClose { target, handle } => {
                     needs_coro_decls = true;
                     code.push_str(&format!(
-                        "  %v{} = call i64 @glm_coro_close(i64 %v{})\n",
+                        "  %v{} = call i64 @alm_coro_close(i64 %v{})\n",
                         target.id, handle.id
                     ));
                 }
                 Instruction::FfiLoad { target, path } => {
                     needs_ffi_load_decl = true;
                     code.push_str(&format!(
-                        "  %v{} = call ptr @glm_ffi_load(ptr %v{})\n",
+                        "  %v{} = call ptr @alm_ffi_load(ptr %v{})\n",
                         target.id, path.id
                     ));
                 }
                 Instruction::FfiArgKind { target, lib } => {
                     needs_ffi_arg_kind_decl = true;
                     code.push_str(&format!(
-                        "  %v{} = call i64 @glm_ffi_arg_kind(ptr %v{})\n",
+                        "  %v{} = call i64 @alm_ffi_arg_kind(ptr %v{})\n",
                         target.id, lib.id
                     ));
                 }
@@ -692,7 +692,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                         None => unreachable!("ffi symbol missed by the strtab pre-pass"),
                     };
                     code.push_str(&format!(
-                        "  call void @glm_ffi_call(ptr %v{}, ptr {}, ptr %v{})\n",
+                        "  call void @alm_ffi_call(ptr %v{}, ptr {}, ptr %v{})\n",
                         lib.id, g, arg.id
                     ));
                 }
@@ -747,26 +747,26 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                 Instruction::Print { operands } => {
                     for (i, (r, ty)) in operands.iter().enumerate() {
                         if i > 0 {
-                            code.push_str("  call void @glm_print_sep()\n");
+                            code.push_str("  call void @alm_print_sep()\n");
                         }
                         let (r, ty) = (*r, ty);
                         match ty {
                             Ty::Int => {
-                                code.push_str(&format!("  call void @glm_print_int(i64 %v{})\n", r))
+                                code.push_str(&format!("  call void @alm_print_int(i64 %v{})\n", r))
                             }
                             Ty::Flt => code.push_str(&format!(
-                                "  call void @glm_print_float(double %v{})\n",
+                                "  call void @alm_print_float(double %v{})\n",
                                 r
                             )),
                             Ty::Bool => {
-                                code.push_str(&format!("  call void @glm_print_bool(i1 %v{})\n", r))
+                                code.push_str(&format!("  call void @alm_print_bool(i1 %v{})\n", r))
                             }
                             Ty::Str => code
-                                .push_str(&format!("  call void @glm_print_string(ptr %v{})\n", r)),
+                                .push_str(&format!("  call void @alm_print_string(ptr %v{})\n", r)),
                             Ty::Any => {
                                 needs_any_print_decl = true;
                                 code.push_str(&format!(
-                                    "  call void @glm_any_print(i128 %v{})\n",
+                                    "  call void @alm_any_print(i128 %v{})\n",
                                     r
                                 ));
                             }
@@ -780,7 +780,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                                     "Type Error: the module surfaces cannot be printed".to_string(),
                                 ]);
                             }
-                            Ty::Unknown(_) => code.push_str("  call void @glm_print_int(i64 0)\n"),
+                            Ty::Unknown(_) => code.push_str("  call void @alm_print_int(i64 0)\n"),
                             // print operands carry resolved lowerer types —
                             // flow state never rides the artifact path
                             Ty::Pending | Ty::Conflict => {
@@ -788,7 +788,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                             }
                         }
                     }
-                    code.push_str("  call void @glm_print_nl()\n");
+                    code.push_str("  call void @alm_print_nl()\n");
                 }
             }
             if let Some(loc) = block.locs.get(ii).copied().flatten()
@@ -848,18 +848,18 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
     }
 
     let mut out = String::from(
-        "declare void @glm_print_int(i64)\n\
-         declare void @glm_print_float(double)\n\
-         declare void @glm_print_bool(i1)\n\
-         declare void @glm_print_string(ptr)\n\
-         declare void @glm_print_sep()\n\
-         declare void @glm_print_nl()\n\n\
+        "declare void @alm_print_int(i64)\n\
+         declare void @alm_print_float(double)\n\
+         declare void @alm_print_bool(i1)\n\
+         declare void @alm_print_string(ptr)\n\
+         declare void @alm_print_sep()\n\
+         declare void @alm_print_nl()\n\n\
          ",
     );
     out.push_str(if dbg.is_some() {
-        "define ptr @glm_exec(ptr %args) !dbg !5 {\nentry:\n"
+        "define ptr @alm_exec(ptr %args) !dbg !5 {\nentry:\n"
     } else {
-        "define ptr @glm_exec(ptr %args) {\nentry:\n"
+        "define ptr @alm_exec(ptr %args) {\nentry:\n"
     });
     out.push_str(&allocas);
     out.push_str("  br label %b0\n");
@@ -867,11 +867,11 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
     out.push_str("}\n");
 
     let arg_kind = match program.boundary_elem {
-        Some(elem) => glm_rt::rt::arg_kind_of(&elem),
-        None => glm_rt::rt::GLM_ARG_NONE,
+        Some(elem) => alm_rt::rt::arg_kind_of(&elem),
+        None => alm_rt::rt::ALM_ARG_NONE,
     };
     out.push_str(&format!(
-        "\ndefine i32 @glm_arg_kind() {{\n\
+        "\ndefine i32 @alm_arg_kind() {{\n\
          entry:\n\
            ret i32 {arg_kind}\n\
          }}\n"
@@ -883,7 +883,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
             out.push_str(&format!(
                 "\ndefine i32 @main(i32 %argc, ptr %argv) {{\n\
                  entry:\n\
-                   %rc = call i32 @glm_exec_main(i32 %argc, ptr %argv, i32 {arg_kind}, ptr @glm_exec)\n\
+                   %rc = call i32 @alm_exec_main(i32 %argc, ptr %argv, i32 {arg_kind}, ptr @alm_exec)\n\
                    ret i32 %rc\n\
                  }}\n"
             ));
@@ -892,8 +892,8 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
             out.push_str(
                 "\ndefine i32 @main() {\n\
                  entry:\n\
-                   %r = call ptr @glm_exec(ptr null)\n\
-                   call void @glm_tbl_free(ptr %r)\n\
+                   %r = call ptr @alm_exec(ptr null)\n\
+                   call void @alm_tbl_free(ptr %r)\n\
                    ret i32 0\n\
                  }\n",
             );
@@ -906,19 +906,19 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
         trace::compiler_trace_signal(trace::TRACE_STRTAB_EMIT);
         let ptrs: Vec<String> = str_order.iter().map(|g| format!("ptr {g}")).collect();
         registry.push_str(&format!(
-            "@.glm_strtab = global [{} x ptr] [{}]\n",
+            "@.alm_strtab = global [{} x ptr] [{}]\n",
             ptrs.len(),
             ptrs.join(", ")
         ));
         registry.push_str(&format!(
-            "\ndefine internal void @.glm_strreg() {{\n\
+            "\ndefine internal void @.alm_strreg() {{\n\
              entry:\n\
-               call void @glm_str_register(ptr @.glm_strtab, i64 {})\n\
+               call void @alm_str_register(ptr @.alm_strtab, i64 {})\n\
                ret void\n\
              }}\n\
              @llvm.global_ctors = appending global \
              [1 x {{ i32, ptr, ptr }}] \
-             [{{ i32, ptr, ptr }} {{ i32 65535, ptr @.glm_strreg, ptr null }}]\n",
+             [{{ i32, ptr, ptr }} {{ i32 65535, ptr @.alm_strreg, ptr null }}]\n",
             ptrs.len()
         ));
     }
@@ -928,46 +928,46 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
         head.push_str("declare double @llvm.floor.f64(double)\n");
     }
     if needs_tbl_new_decl {
-        head.push_str("declare ptr @glm_tbl_new(i64, i8)\n");
+        head.push_str("declare ptr @alm_tbl_new(i64, i8)\n");
     }
     if needs_tbl_reserve_decl {
-        head.push_str("declare void @glm_tbl_reserve(ptr, i64)\n");
+        head.push_str("declare void @alm_tbl_reserve(ptr, i64)\n");
     }
     if needs_tbl_free_decl {
-        head.push_str("declare void @glm_tbl_free(ptr)\n");
+        head.push_str("declare void @alm_tbl_free(ptr)\n");
     }
     if needs_tbl_free_except_decl {
-        head.push_str("declare void @glm_tbl_free_except(ptr, ptr)\n");
+        head.push_str("declare void @alm_tbl_free_except(ptr, ptr)\n");
     }
     if needs_tbl_free_except_n_decl {
-        head.push_str("declare void @glm_tbl_free_except_n(ptr, ptr, i64)\n");
+        head.push_str("declare void @alm_tbl_free_except_n(ptr, ptr, i64)\n");
     }
     if tbl_decls.get {
-        head.push_str("declare void @glm_tbl_get(ptr, i64, ptr, i64)\n");
+        head.push_str("declare void @alm_tbl_get(ptr, i64, ptr, i64)\n");
     }
     if tbl_decls.set {
-        head.push_str("declare void @glm_tbl_set(ptr, i64, ptr)\n");
+        head.push_str("declare void @alm_tbl_set(ptr, i64, ptr)\n");
     }
     if tbl_decls.get_any {
-        head.push_str("declare i128 @glm_tbl_get_any(ptr, i64)\n");
+        head.push_str("declare i128 @alm_tbl_get_any(ptr, i64)\n");
     }
     if tbl_decls.set_any {
-        head.push_str("declare void @glm_tbl_set_any(ptr, i64, i128)\n");
+        head.push_str("declare void @alm_tbl_set_any(ptr, i64, i128)\n");
     }
     if tbl_decls.get_skey {
-        head.push_str("declare void @glm_tbl_get_skey(ptr, i64, ptr, i64)\n");
+        head.push_str("declare void @alm_tbl_get_skey(ptr, i64, ptr, i64)\n");
     }
     if tbl_decls.set_skey {
-        head.push_str("declare void @glm_tbl_set_skey(ptr, i64, ptr)\n");
+        head.push_str("declare void @alm_tbl_set_skey(ptr, i64, ptr)\n");
     }
     if tbl_decls.get_any_skey {
-        head.push_str("declare i128 @glm_tbl_get_any_skey(ptr, i64)\n");
+        head.push_str("declare i128 @alm_tbl_get_any_skey(ptr, i64)\n");
     }
     if tbl_decls.set_any_skey {
-        head.push_str("declare void @glm_tbl_set_any_skey(ptr, i64, i128)\n");
+        head.push_str("declare void @alm_tbl_set_any_skey(ptr, i64, i128)\n");
     }
     if needs_str_len_decl {
-        head.push_str("declare i64 @glm_str_len(ptr)\n");
+        head.push_str("declare i64 @alm_str_len(ptr)\n");
     }
     if needs_sys_alloc_count_decl {
         head.push_str("declare i64 @sys_alloc_count()\n");
@@ -976,101 +976,101 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
         head.push_str("declare i64 @sys_exec_count()\n");
     }
     if needs_coro_decls {
-        head.push_str("declare i64 @glm_coro_create(ptr)\n");
-        head.push_str("declare i64 @glm_coro_resume(i64, ptr)\n");
-        head.push_str("declare i64 @glm_coro_yield(i64)\n");
-        head.push_str("declare ptr @glm_coro_status(i64)\n");
-        head.push_str("declare i64 @glm_coro_close(i64)\n");
+        head.push_str("declare i64 @alm_coro_create(ptr)\n");
+        head.push_str("declare i64 @alm_coro_resume(i64, ptr)\n");
+        head.push_str("declare i64 @alm_coro_yield(i64)\n");
+        head.push_str("declare ptr @alm_coro_status(i64)\n");
+        head.push_str("declare i64 @alm_coro_close(i64)\n");
     }
     if needs_ffi_load_decl {
-        head.push_str("declare ptr @glm_ffi_load(ptr)\n");
+        head.push_str("declare ptr @alm_ffi_load(ptr)\n");
     }
     if needs_ffi_arg_kind_decl {
-        head.push_str("declare i64 @glm_ffi_arg_kind(ptr)\n");
+        head.push_str("declare i64 @alm_ffi_arg_kind(ptr)\n");
     }
     if needs_ffi_call_decl {
-        head.push_str("declare void @glm_ffi_call(ptr, ptr, ptr)\n");
+        head.push_str("declare void @alm_ffi_call(ptr, ptr, ptr)\n");
     }
     if needs_any_print_decl {
-        head.push_str("declare void @glm_any_print(i128)\n");
+        head.push_str("declare void @alm_any_print(i128)\n");
     }
     if needs_any_eq_decl {
-        head.push_str("declare i32 @glm_any_eq(i128, i128)\n");
+        head.push_str("declare i32 @alm_any_eq(i128, i128)\n");
     }
     if needs_any_len_decl {
-        head.push_str("declare i64 @glm_any_len(i128)\n");
+        head.push_str("declare i64 @alm_any_len(i128)\n");
     }
     if needs_tbl_len_decl {
-        head.push_str("declare i64 @glm_tbl_len(ptr)\n");
+        head.push_str("declare i64 @alm_tbl_len(ptr)\n");
     }
     if needs_any_from & 1 != 0 {
-        head.push_str("declare i128 @glm_any_from_int(i64)\n");
+        head.push_str("declare i128 @alm_any_from_int(i64)\n");
     }
     if needs_any_from & 2 != 0 {
-        head.push_str("declare i128 @glm_any_from_float(double)\n");
+        head.push_str("declare i128 @alm_any_from_float(double)\n");
     }
     if needs_any_from & 4 != 0 {
-        head.push_str("declare i128 @glm_any_from_bool(i8)\n");
+        head.push_str("declare i128 @alm_any_from_bool(i8)\n");
     }
     if needs_any_from & 8 != 0 {
-        head.push_str("declare i128 @glm_any_from_str(ptr)\n");
+        head.push_str("declare i128 @alm_any_from_str(ptr)\n");
     }
     if needs_dbg_value_decl {
         head.push_str("declare void @llvm.dbg.value(metadata, metadata, metadata)\n");
     }
     if needs_div_guard {
-        head.push_str("declare void @glm_div_zero_guard(i64)\n");
+        head.push_str("declare void @alm_div_zero_guard(i64)\n");
     }
     if !registry.is_empty() {
-        head.push_str("declare void @glm_str_register(ptr, i64)\n");
+        head.push_str("declare void @alm_str_register(ptr, i64)\n");
     }
     if needs_str_key_decl {
-        head.push_str("declare i64 @glm_str_key(ptr)\n");
+        head.push_str("declare i64 @alm_str_key(ptr)\n");
     }
     if needs_exec_main_decl {
-        head.push_str("declare i32 @glm_exec_main(i32, ptr, i32, ptr)\n");
+        head.push_str("declare i32 @alm_exec_main(i32, ptr, i32, ptr)\n");
     }
 
     let mut anchor = String::new();
     /* unconditional for every .so: ANY module can be spawned as a
-     * coroutine, and the coro thread wrapper dlsym's glm_tbl_new/set/free
+     * coroutine, and the coro thread wrapper dlsym's alm_tbl_new/set/free
      * to build the boundary table on the worker thread — the anchor keeps
      * the full runtime surface exported even when the module's own IR
      * never references it (the linker would drop the unreferenced archive
      * members otherwise). Each declare is emitted only when the module's
      * own needs_* flag hasn't already declared it (LLVM refuses
-     * redeclaration); glm_str_intern has no needs flag — only the anchor
+     * redeclaration); alm_str_intern has no needs flag — only the anchor
      * and the .init_array registry ever reference it. */
     if matches!(program.entry, EntryKind::Lib) {
         if !needs_tbl_new_decl {
-            anchor.push_str("declare ptr @glm_tbl_new(i64, i8)\n");
+            anchor.push_str("declare ptr @alm_tbl_new(i64, i8)\n");
         }
         if !tbl_decls.set {
-            anchor.push_str("declare void @glm_tbl_set(ptr, i64, ptr)\n");
+            anchor.push_str("declare void @alm_tbl_set(ptr, i64, ptr)\n");
         }
         if !tbl_decls.get {
-            anchor.push_str("declare void @glm_tbl_get(ptr, i64, ptr, i64)\n");
+            anchor.push_str("declare void @alm_tbl_get(ptr, i64, ptr, i64)\n");
         }
         if !needs_tbl_free_decl {
-            anchor.push_str("declare void @glm_tbl_free(ptr)\n");
+            anchor.push_str("declare void @alm_tbl_free(ptr)\n");
         }
         anchor.push_str(concat!(
-            "declare ptr @glm_str_intern(ptr, i64)\n",
-            "@.glm_rt_anchor = internal constant [5 x i64] [\n",
-            "  i64 ptrtoint (ptr @glm_tbl_new to i64),\n",
-            "  i64 ptrtoint (ptr @glm_tbl_set to i64),\n",
-            "  i64 ptrtoint (ptr @glm_tbl_get to i64),\n",
-            "  i64 ptrtoint (ptr @glm_tbl_free to i64),\n",
-            "  i64 ptrtoint (ptr @glm_str_intern to i64)\n",
+            "declare ptr @alm_str_intern(ptr, i64)\n",
+            "@.alm_rt_anchor = internal constant [5 x i64] [\n",
+            "  i64 ptrtoint (ptr @alm_tbl_new to i64),\n",
+            "  i64 ptrtoint (ptr @alm_tbl_set to i64),\n",
+            "  i64 ptrtoint (ptr @alm_tbl_get to i64),\n",
+            "  i64 ptrtoint (ptr @alm_tbl_free to i64),\n",
+            "  i64 ptrtoint (ptr @alm_str_intern to i64)\n",
             "]\n",
-            "@llvm.compiler.used = appending global [1 x ptr] [ptr @.glm_rt_anchor], section \"llvm.metadata\"\n",
+            "@llvm.compiler.used = appending global [1 x ptr] [ptr @.alm_rt_anchor], section \"llvm.metadata\"\n",
         ));
     }
 
     let md = if needs_hdr_md {
         "\n!0 = !{!1}\n\
-         !1 = distinct !{!\"glm_table_header\", !2}\n\
-         !2 = distinct !{!\"glm_table\"}\n"
+         !1 = distinct !{!\"alm_table_header\", !2}\n\
+         !2 = distinct !{!\"alm_table\"}\n"
             .to_string()
     } else {
         String::new()
@@ -1418,7 +1418,7 @@ fn cmp_regs(
         } => {
             *needs_any_eq_decl = true;
             code.push_str(&format!(
-                "  %a{}.eq = call i32 @glm_any_eq(i128 %v{}, i128 %v{})\n\
+                "  %a{}.eq = call i32 @alm_any_eq(i128 %v{}, i128 %v{})\n\
                    %v{} = icmp ne i32 %a{}.eq, 0\n",
                 target.id, left.id, right.id, target.id, target.id
             ));
@@ -1466,14 +1466,14 @@ fn emit_table_get<E: Repr>(
     seam: usize,
     tbl_decls: &mut TableDecls,
 ) {
-    // the key lane picks the entry point: integers name glm_tbl_get[_any],
+    // the key lane picks the entry point: integers name alm_tbl_get[_any],
     // string keys name the _skey faces — the split that keeps a runtime
     // integer (however produced) from ever addressing a record cell
     let (sym, flag) = match (E::REG_FACE, index) {
-        (true, TableKey::Int(_)) => ("glm_tbl_get_any", &mut tbl_decls.get_any),
-        (true, TableKey::Str(_)) => ("glm_tbl_get_any_skey", &mut tbl_decls.get_any_skey),
-        (false, TableKey::Int(_)) => ("glm_tbl_get", &mut tbl_decls.get),
-        (false, TableKey::Str(_)) => ("glm_tbl_get_skey", &mut tbl_decls.get_skey),
+        (true, TableKey::Int(_)) => ("alm_tbl_get_any", &mut tbl_decls.get_any),
+        (true, TableKey::Str(_)) => ("alm_tbl_get_any_skey", &mut tbl_decls.get_any_skey),
+        (false, TableKey::Int(_)) => ("alm_tbl_get", &mut tbl_decls.get),
+        (false, TableKey::Str(_)) => ("alm_tbl_get_skey", &mut tbl_decls.get_skey),
     };
     *flag = true;
     if E::REG_FACE {
@@ -1622,7 +1622,7 @@ fn checked_store<E: Repr>(
     if E::REG_FACE {
         tbl_decls.set_any = true;
         format!(
-            "  call void @glm_tbl_set_any(ptr %v{table}, i64 %v{index}, i128 {v})\n",
+            "  call void @alm_tbl_set_any(ptr %v{table}, i64 %v{index}, i128 {v})\n",
             table = table.id,
             index = index.id,
             v = val_use
@@ -1631,7 +1631,7 @@ fn checked_store<E: Repr>(
         tbl_decls.set = true;
         format!(
             "  store {ety} {v}, ptr %ts{f}.valp\n\
-               call void @glm_tbl_set(ptr %v{table}, i64 %v{index}, ptr %ts{f}.valp)\n",
+               call void @alm_tbl_set(ptr %v{table}, i64 %v{index}, ptr %ts{f}.valp)\n",
             ety = ety,
             v = val_use,
             f = f,
@@ -1654,10 +1654,10 @@ fn emit_table_set<E: Repr>(
     // same lane split as emit_table_get: the key kind names the entry
     // point, so integer traffic and record traffic cannot cross
     let (sym, flag) = match (E::REG_FACE, index) {
-        (true, TableKey::Int(_)) => ("glm_tbl_set_any", &mut tbl_decls.set_any),
-        (true, TableKey::Str(_)) => ("glm_tbl_set_any_skey", &mut tbl_decls.set_any_skey),
-        (false, TableKey::Int(_)) => ("glm_tbl_set", &mut tbl_decls.set),
-        (false, TableKey::Str(_)) => ("glm_tbl_set_skey", &mut tbl_decls.set_skey),
+        (true, TableKey::Int(_)) => ("alm_tbl_set_any", &mut tbl_decls.set_any),
+        (true, TableKey::Str(_)) => ("alm_tbl_set_any_skey", &mut tbl_decls.set_any_skey),
+        (false, TableKey::Int(_)) => ("alm_tbl_set", &mut tbl_decls.set),
+        (false, TableKey::Str(_)) => ("alm_tbl_set_skey", &mut tbl_decls.set_skey),
     };
     *flag = true;
     if E::REG_FACE {
@@ -1757,7 +1757,7 @@ fn floor_div_op<N: Repr>(
             _ => {
                 *needs_div_guard = true;
                 code.push_str(&format!(
-                    "  call void @glm_div_zero_guard(i64 %v{})\n",
+                    "  call void @alm_div_zero_guard(i64 %v{})\n",
                     right.id
                 ));
                 code.push_str(&format!(
@@ -1861,7 +1861,7 @@ fn mod_op<N: Repr>(
             _ => {
                 *needs_div_guard = true;
                 code.push_str(&format!(
-                    "  call void @glm_div_zero_guard(i64 %v{})\n",
+                    "  call void @alm_div_zero_guard(i64 %v{})\n",
                     right.id
                 ));
                 code.push_str(&format!(
@@ -1948,7 +1948,7 @@ mod label_closure_tests {
              \x20 store i64 1, ptr %p\n\
              \x20 br label %b3\n\
              \nbts0sparse:\n\
-             \x20 call void @glm_tbl_set(ptr %t, i64 1, ptr %v)\n\
+             \x20 call void @alm_tbl_set(ptr %t, i64 1, ptr %v)\n\
              \x20 br label %b3\n\
              \nb3:\n\
              \x20 br label %b0\n\

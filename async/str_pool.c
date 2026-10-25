@@ -1,4 +1,4 @@
-/* async/str_pool.c (glm-owned): the process-canonical string pool,
+/* async/str_pool.c (alm-owned): the process-canonical string pool,
    the third stateful layer the substrate owns (trace plate, exec registry,
    strings).
 
@@ -11,7 +11,7 @@
 
    The key is a pure function of the bytes, so the compiler can bake the
    same constant into IR for literal keys; the 8-byte prefix caches it so
-   dynamic t[s] key extraction is one load (glm_str_key). The key derive
+   dynamic t[s] key extraction is one load (alm_str_key). The key derive
    here and in src/rt.rs (and the future backend constant folder) MUST stay
    byte-identical — it is a cross-module ABI contract, not an
    implementation detail.
@@ -19,7 +19,7 @@
    Allocator rule: THIS substrate is the sole allocator of interned
    strings, and interned strings are immortal (never freed). One
    allocator, zero frees — module boundaries cannot split an allocation.
-   glm_str_register interns COPIES of .rodata literals and overwrites the
+   alm_str_register interns COPIES of .rodata literals and overwrites the
    caller's strtab slots with the canonical (prefixed) pointers, so no
    unprefixed static string ever masquerades as a pool handle.
 
@@ -34,7 +34,7 @@
 
 #include "sys_sync.h"
 
-/* glm_async.h declares the full contract; the unity build's include order
+/* alm_async.h declares the full contract; the unity build's include order
    owns vmath_thread_t, so this translation unit self-declares what it
    uses (the declarations must stay identical). */
 void vx_trace_poke(uint8_t slot);

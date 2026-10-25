@@ -1,7 +1,7 @@
-// async/probe/probe_tenant.rs — exercises the glm tenant & trace layer of
-// libglm_async.so: deterministic exec registration (lowest free slot), the
+// async/probe/probe_tenant.rs — exercises the alm tenant & trace layer of
+// libalm_async.so: deterministic exec registration (lowest free slot), the
 // census mirror, the sole-owner sticky plate, and the chronology ring.
-// Runs from any CWD; creates .glm_rt_trace.bin next to the CWD (dev scratch).
+// Runs from any CWD; creates .alm_rt_trace.bin next to the CWD (dev scratch).
 
 use std::ffi::{c_char, CStr};
 

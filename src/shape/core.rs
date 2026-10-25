@@ -1,7 +1,7 @@
 use super::ty::{Ty, join_ty};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SPARSE_THRESHOLD: i64 = glm_rt::rt::SPARSE_THRESHOLD;
+pub const SPARSE_THRESHOLD: i64 = alm_rt::rt::SPARSE_THRESHOLD;
 pub const BOUNDS_FAIL_THRESHOLD: i64 = i64::MAX / 8;
 pub const NULL_ROOT: usize = usize::MAX;
 pub const MOVED_ROOT: usize = usize::MAX - 1;
@@ -54,7 +54,7 @@ impl TableShape {
 
         let new_ty = join_ty(&self.ty, &other.ty);
         if matches!(new_ty, Ty::Conflict) && !matches!(self.ty, Ty::Conflict) {
-            crate::glm_dbgln!("[shape-join] {:?} join {:?} = Conflict", self.ty, other.ty);
+            crate::alm_dbgln!("[shape-join] {:?} join {:?} = Conflict", self.ty, other.ty);
         }
         if self.ty != new_ty {
             self.ty = new_ty;

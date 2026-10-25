@@ -1,27 +1,27 @@
-/* async/glm_coro.c — NEW (glm-owned, not engine-vendored): the
+/* async/alm_coro.c — NEW (alm-owned, not engine-vendored): the
    coroutine.* parody's substrate side.
 
-   A glm "coroutine" is a compiled .so module whose glm_exec runs
+   A alm "coroutine" is a compiled .so module whose alm_exec runs
    preemptively on its own OS pthread (vmath_thread_start, vendored from
    the engine's thread_pool.c). The thread wrapper is the embedder the
    engine never had here: it dlsym's the module's own runtime surface,
    builds the args table ON THE WORKER THREAD through the module's own
-   glm_tbl_new from the LWW in_* cells (marshaled by the host's first
-   coroutine.resume), runs glm_exec, settles ownership exactly like
-   glm_exec_main (result != args frees the new table; args always freed
-   once, through the module's own glm_tbl_free), and flips the module's
+   alm_tbl_new from the LWW in_* cells (marshaled by the host's first
+   coroutine.resume), runs alm_exec, settles ownership exactly like
+   alm_exec_main (result != args frees the new table; args always freed
+   once, through the module's own alm_tbl_free), and flips the module's
    ExecSlot to FINISHED before exiting.
 
    Data crosses threads ONLY as flat values:
      host -> worker : the three LWW in_* cells (written before start)
      worker -> host : RingPackets on ring lane == slot index
                      (yield = acquire/spin/commit; resume = next/release)
-   No GlmTable pointer is ever shared across threads or heaps.
+   No AlmTable pointer is ever shared across threads or heaps.
 
    Lifecycle vs the exit report: vx_coro_quiesce() runs FIRST inside the
    substrate's atexit report — it sets the shutdown flag (a worker
    spinning on a full ring abandons the yield) and joins every live
-   thread, so the census walk and GLM_RT_DUMP below it stay deterministic.
+   thread, so the census walk and ALM_RT_DUMP below it stay deterministic.
    A coroutine that computes forever holds the exit open — same contract
    as any unjoined thread. */
 
@@ -29,11 +29,11 @@
 #include <stdio.h>
 
 #include "sys_sync.h"
-#include "glm_async.h"
+#include "alm_async.h"
 #include "state_types.c"
 
 /* the lane binding of the thread calling vx_coro_yield: set by the
- * wrapper before glm_exec runs; -1 on the host thread (yield drops) */
+ * wrapper before alm_exec runs; -1 on the host thread (yield drops) */
 static _Thread_local int32_t t_coro_lane = -1;
 
 static void* coro_thread_fn(void* argp) {
@@ -41,19 +41,19 @@ static void* coro_thread_fn(void* argp) {
     int32_t lane = (int32_t)(co - g_coros.slots);
     t_coro_lane = lane;
 
-    void* (*x_exec)(void*) = (void* (*)(void*))dlsym(co->lib, "glm_exec");
-    void (*x_free)(void*) = (void (*)(void*))dlsym(co->lib, "glm_tbl_free");
+    void* (*x_exec)(void*) = (void* (*)(void*))dlsym(co->lib, "alm_exec");
+    void (*x_free)(void*) = (void (*)(void*))dlsym(co->lib, "alm_tbl_free");
     int32_t (*x_exec_id)(void) =
-        (int32_t (*)(void))dlsym(co->lib, "glm_rt_exec_id");
-    int32_t (*x_kind)(void) = (int32_t (*)(void))dlsym(co->lib, "glm_arg_kind");
+        (int32_t (*)(void))dlsym(co->lib, "alm_rt_exec_id");
+    int32_t (*x_kind)(void) = (int32_t (*)(void))dlsym(co->lib, "alm_arg_kind");
     void* (*x_new)(uint64_t, uint8_t) =
-        (void* (*)(uint64_t, uint8_t))dlsym(co->lib, "glm_tbl_new");
+        (void* (*)(uint64_t, uint8_t))dlsym(co->lib, "alm_tbl_new");
     void (*x_set)(void*, int64_t, const void*) =
-        (void (*)(void*, int64_t, const void*))dlsym(co->lib, "glm_tbl_set");
+        (void (*)(void*, int64_t, const void*))dlsym(co->lib, "alm_tbl_set");
 
     if (x_exec == NULL || x_free == NULL) {
         fprintf(stderr,
-                "glm coro: module lacks glm_exec/glm_tbl_free — idle exit\n");
+                "alm coro: module lacks alm_exec/alm_tbl_free — idle exit\n");
     } else {
         /* build the boundary table on THIS thread through the module's own
          * allocator; cells carry the marshaled in_* values per the kind */
@@ -77,7 +77,7 @@ static void* coro_thread_fn(void* argp) {
                     }
                 } else if (kind == 4) {
                     for (int i = 0; i < 3; i++) {
-                        /* Any cell: tag GLM_ARG_INT (0) high, payload low */
+                        /* Any cell: tag ALM_ARG_INT (0) high, payload low */
                         unsigned __int128 cell = (unsigned __int128)ins[i];
                         x_set(args, i, &cell);
                     }

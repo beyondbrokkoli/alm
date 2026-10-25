@@ -7,7 +7,7 @@
 #include <stdalign.h>
 #include <stddef.h>
 #include "sys_sync.h"
-#include "glm_async.h"
+#include "alm_async.h"
 
 #define OS_CMD_IDLE          0
 #define OS_CMD_BOOT_WINDOW   1
@@ -70,7 +70,7 @@ typedef struct {
 extern EngineState g_engine;
 extern RenderRing  g_ring;
 
-/* glm tenant & trace layer (NEW, glm-owned — not engine-vendored):
+/* alm tenant & trace layer (NEW, alm-owned — not engine-vendored):
    ExecSlot is the per-artifact identity + census mirror; TraceState is
    the sole-owner plate mapping plus the in-memory chronology ring. The
    registry is flat fixed-size state — no heap, no strings beyond the
@@ -79,7 +79,7 @@ extern RenderRing  g_ring;
 typedef struct {
     alignas(64) _Atomic uint32_t state;    /* VX_EXEC_EMPTY..FAILED */
     _Atomic uint32_t flags;                /* VX_EXEC_F_EXE / VX_EXEC_F_SO */
-    _Atomic int64_t  census_live;          /* mirrored live GlmTable count */
+    _Atomic int64_t  census_live;          /* mirrored live AlmTable count */
     _Atomic int64_t  census_total;         /* mirrored total allocations */
     char             name[VX_EXEC_NAME_MAX]; /* written under BOOTING only */
 } ExecSlot;
@@ -96,8 +96,8 @@ typedef struct {
     uint32_t         event_ring[VX_TRACE_RING_CAP];     /* (exec<<8)|slot, wraps */
 } TraceState;
 
-/* glm coroutine layer (NEW, glm-owned): a "coroutine" is a compiled .so
-   module running its glm_exec on a dedicated OS pthread, streaming
+/* alm coroutine layer (NEW, alm-owned): a "coroutine" is a compiled .so
+   module running its alm_exec on a dedicated OS pthread, streaming
    RingPackets to the spawning host thread over the ring LANE OF THE SAME
    INDEX (slot i owns g_ring tenant i — VX_CORO_MAX == VX_MAX_WINDOWS).
    The slot is flat fixed-size state: the dlopen handle, LWW input cells

@@ -260,7 +260,7 @@ impl Analyzer {
                                         return Err(ShapeError(
                                             "Lifetime Error: cyclic row store — the row \
                                              read would be stored into a table that \
-                                             already contains it (glm's element types \
+                                             already contains it (alm's element types \
                                              are finite)"
                                                 .to_string(),
                                         ));
@@ -334,7 +334,7 @@ impl Analyzer {
                         }
                     }
                     if matches!(t, Conflict) {
-                        crate::glm_dbgln!(
+                        crate::alm_dbgln!(
                             "[ctor] site {id} line {:?}: cell value is Conflict",
                             self.ctor_lines[id]
                         );
@@ -371,7 +371,7 @@ impl Analyzer {
             Expr::Index { obj, key } => {
                 let (kt, _, _) = self.infer_expr(rec, key)?;
                 if matches!(kt, Flt | Bool) {
-                    crate::glm_dbgln!("[idx] bad key ty={:?}", kt);
+                    crate::alm_dbgln!("[idx] bad key ty={:?}", kt);
                     signal!(rec.on(), trace::TRACE_INFER_IDX_BAD_KEY);
                     self.infer_expr(rec, obj)?;
                     return Ok((Conflict, BTreeSet::new(), BTreeMap::new()));
@@ -535,7 +535,7 @@ impl Analyzer {
                 let (depth, bind) = self.resolve(rec, name)?;
                 let _ = depth;
                 if matches!(bind.ty, Conflict) {
-                    crate::glm_dbgln!(
+                    crate::alm_dbgln!(
                         "[ident] '{name}' resolves to Conflict aliases={:?}",
                         bind.aliases
                     );
@@ -598,7 +598,7 @@ impl Analyzer {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::IntDiv | BinOp::Mod => {
                         signal!(rec.on(), trace::TRACE_INFER_BINOP_ARITH);
                         if matches!(arith_ty(lt.clone(), rt.clone()), Conflict) {
-                            crate::glm_dbgln!("[arith] {:?} {op:?} {:?} = Conflict", lt, rt);
+                            crate::alm_dbgln!("[arith] {:?} {op:?} {:?} = Conflict", lt, rt);
                         }
                         Ok((arith_ty(lt, rt), BTreeSet::new(), BTreeMap::new()))
                     }
@@ -653,12 +653,12 @@ impl Analyzer {
                 let (ty, sites, lineage) = self.infer_expr(rec, obj)?;
                 match ty {
                     Tbl(inner) if matches!(*inner, Conflict) => {
-                        crate::glm_dbgln!("[field] dot read on Tbl(Conflict) sites={:?}", sites);
+                        crate::alm_dbgln!("[field] dot read on Tbl(Conflict) sites={:?}", sites);
                         Ok((*inner, sites, lineage))
                     }
                     Tbl(inner) => Ok((*inner, sites, lineage)),
                     _ => {
-                        crate::glm_dbgln!(
+                        crate::alm_dbgln!(
                             "[field] dot access on non-table ty={:?} sites={:?}",
                             ty,
                             sites

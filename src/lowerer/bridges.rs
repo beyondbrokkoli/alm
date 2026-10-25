@@ -31,7 +31,7 @@ pub(super) fn ptr_of(r: AnyReg) -> Result<Reg<Ptr>, LowerError> {
     match r {
         AnyReg::Ptr(x) => Ok(x),
         _ => {
-            crate::glm_dbgln!("[lower] ptr_of got {r:?}");
+            crate::alm_dbgln!("[lower] ptr_of got {r:?}");
             Err(repr_mismatch("a table-header operand position"))
         }
     }

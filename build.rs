@@ -20,10 +20,10 @@ fn take_field(line: &str) -> (&str, &str) {
 }
 
 /// Compile the C11 async substrate (async) into ONE shared object under
-/// target/<profile>/ — the process-global glm state must live in a .so so
-/// the loader guarantees a single copy per process no matter how many glm
+/// target/<profile>/ — the process-global alm state must live in a .so so
+/// the loader guarantees a single copy per process no matter how many alm
 /// artifacts link it. Every artifact the compiler emits gains
-/// DT_NEEDED libglm_async.so (see main.rs's clang link line).
+/// DT_NEEDED libalm_async.so (see main.rs's clang link line).
 fn build_async_core() {
     const SOURCES: [&str; 8] = [
         "sys_sync.c",
@@ -31,8 +31,8 @@ fn build_async_core() {
         "mailbox.c",
         "ring_stream.c",
         "mailbox_accessors.c",
-        "glm_tenant.c",
-        "glm_coro.c",
+        "alm_tenant.c",
+        "alm_coro.c",
         "str_pool.c",
     ];
 
@@ -53,7 +53,7 @@ fn build_async_core() {
     };
 
     let cc = env::var("CC").unwrap_or_else(|_| "clang".into());
-    let so = target_profile.join("libglm_async.so");
+    let so = target_profile.join("libalm_async.so");
     let mut cmd = std::process::Command::new(&cc);
     cmd.arg("-shared")
         .arg("-fPIC")
@@ -70,19 +70,19 @@ fn build_async_core() {
     cmd.arg("-lpthread").arg("-o").arg(&so);
     let status = cmd
         .status()
-        .unwrap_or_else(|e| panic!("failed to spawn {cc} for libglm_async.so: {e}"));
+        .unwrap_or_else(|e| panic!("failed to spawn {cc} for libalm_async.so: {e}"));
     if !status.success() {
-        panic!("building libglm_async.so failed");
+        panic!("building libalm_async.so failed");
     }
 
-    // the glm bin (and its rlib link) resolves the vx_* surface from here;
+    // the alm bin (and its rlib link) resolves the vx_* surface from here;
     // the rpath keeps the compiler's own dev-loop host able to dlopen the
     // artifacts it just built, which DT_NEEDED this .so
     println!(
         "cargo:rustc-link-search=native={}",
         target_profile.display()
     );
-    println!("cargo:rustc-link-lib=dylib=glm_async");
+    println!("cargo:rustc-link-lib=dylib=alm_async");
     println!(
         "cargo:rustc-link-arg=-Wl,-rpath,{}",
         target_profile.display()

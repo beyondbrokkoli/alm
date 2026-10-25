@@ -24,7 +24,7 @@
 use super::checker::type_name;
 use crate::ast::{Expr, Stmt};
 use crate::shape::Ty;
-use glm_rt::{signal, trace};
+use alm_rt::{signal, trace};
 use std::collections::BTreeMap;
 
 pub(super) struct UnknownStore {
@@ -164,7 +164,7 @@ impl UnknownStore {
         if self.occurs(id, &ty) {
             signal!(trace::TRACE_FAIL_OCCURS_CHECK);
             return Err("Type Error: cyclic table type — a table's element type \
-                 may not contain the table itself (glm's element types are finite)"
+                 may not contain the table itself (alm's element types are finite)"
                 .to_string());
         }
         signal!(trace::TRACE_CHK_UNIFY);

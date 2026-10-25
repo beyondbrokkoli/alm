@@ -22,7 +22,7 @@ pub enum TableMode {
 
 /// #[repr(C)] header. Field layout (offset: type), ABI-pinned by the
 #[repr(C)]
-pub struct GlmTable {
+pub struct AlmTable {
     pub data: *mut u8,
     pub len: i64,
     pub reserve: usize,
@@ -37,18 +37,18 @@ pub struct GlmTable {
 const _: () = {
     use std::mem::{offset_of, size_of};
     assert!(
-        size_of::<GlmTable>() == 56,
-        "GlmTable must stay the 56-byte ABI"
+        size_of::<AlmTable>() == 56,
+        "AlmTable must stay the 56-byte ABI"
     );
-    assert!(offset_of!(GlmTable, data) == 0);
-    assert!(offset_of!(GlmTable, len) == 8);
-    assert!(offset_of!(GlmTable, reserve) == 16);
-    assert!(offset_of!(GlmTable, esize) == 24);
-    assert!(offset_of!(GlmTable, mode) == 32);
-    assert!(offset_of!(GlmTable, contains_tables) == 33);
-    assert!(offset_of!(GlmTable, elem_kind) == 34);
-    assert!(offset_of!(GlmTable, sparse_map) == 40);
-    assert!(offset_of!(GlmTable, border) == 48);
+    assert!(offset_of!(AlmTable, data) == 0);
+    assert!(offset_of!(AlmTable, len) == 8);
+    assert!(offset_of!(AlmTable, reserve) == 16);
+    assert!(offset_of!(AlmTable, esize) == 24);
+    assert!(offset_of!(AlmTable, mode) == 32);
+    assert!(offset_of!(AlmTable, contains_tables) == 33);
+    assert!(offset_of!(AlmTable, elem_kind) == 34);
+    assert!(offset_of!(AlmTable, sparse_map) == 40);
+    assert!(offset_of!(AlmTable, border) == 48);
 };
 
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -56,9 +56,9 @@ static TOTAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // --- exec tenancy: this copy's handle into the shared C11 substrate -----
 //
-// Every process-wide glm concern (the trace plate file, the exit-time leak
-// report, cross-instance visibility) lives in libglm_async.so — one copy
-// per process, loader-guaranteed. glm_rt keeps only its exec_id handle and
+// Every process-wide alm concern (the trace plate file, the exit-time leak
+// report, cross-instance visibility) lives in libalm_async.so — one copy
+// per process, loader-guaranteed. alm_rt keeps only its exec_id handle and
 // the fast local counters it mirrors into its ExecSlot.
 
 const EXEC_UNREGISTERED: i32 = -2;
@@ -96,7 +96,7 @@ struct DlInfo {
 }
 
 // lives in this copy's .data: dladdr on its address names the artifact
-// (exe or .so) this glm_rt copy was linked into
+// (exe or .so) this alm_rt copy was linked into
 static MODULE_MARK: u8 = 0;
 
 /// The exec_id this copy registered under (single-flight; -1 if the
@@ -139,11 +139,11 @@ unsafe fn register_now() -> i32 {
             None => full.to_vec(),
         }
     } else {
-        b"glm".to_vec()
+        b"alm".to_vec()
     };
     let mut nul = name;
     nul.push(0);
-    // VX_EXEC_F_EXE (0x1) when glm_exec_main ran first, else VX_EXEC_F_SO (0x2)
+    // VX_EXEC_F_EXE (0x1) when alm_exec_main ran first, else VX_EXEC_F_SO (0x2)
     let flags: u32 = if IS_EXE.load(Ordering::Relaxed) {
         0x1
     } else {
@@ -153,10 +153,10 @@ unsafe fn register_now() -> i32 {
 }
 
 /// Sticky trace byte on the process-wide plate — the single C11 shared
-/// object owns the file; pokes from every glm_rt copy and foreign C
+/// object owns the file; pokes from every alm_rt copy and foreign C
 /// companions land on the same MAP_SHARED inode.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_trace_set(slot: u8) {
+pub unsafe extern "C" fn alm_trace_set(slot: u8) {
     // a raw load, not exec_id(): a poke never forces registration (out-of-
     // range ids ride the anonymous 0xFF event tag in the substrate)
     unsafe { vx_trace_poke_exec(EXEC_ID.load(Ordering::Relaxed), slot) };
@@ -174,10 +174,10 @@ unsafe fn mirror_census(id: i32) {
     }
 }
 
-unsafe extern "C" fn glm_trace_leak_check() {
+unsafe extern "C" fn alm_trace_leak_check() {
     if ALLOC_COUNT.load(Ordering::Relaxed) > 0 {
-        unsafe { glm_trace_set(TRACE_FAIL_LEAK_DETECTED) };
-        eprintln!("GLM_TRACE: slot 90 — leak at exit (sys_alloc_count() > 0)");
+        unsafe { alm_trace_set(TRACE_FAIL_LEAK_DETECTED) };
+        eprintln!("ALM_TRACE: slot 90 — leak at exit (sys_alloc_count() > 0)");
     }
 }
 
@@ -198,17 +198,17 @@ const fn span_align(esize: usize) -> usize {
 }
 
 fn abort_alloc(bytes: usize) -> ! {
-    eprintln!("glm: table allocation of {bytes} bytes failed");
+    eprintln!("alm: table allocation of {bytes} bytes failed");
     std::process::abort();
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_new(esize: usize, flags: u8) -> *mut GlmTable {
+pub unsafe extern "C" fn alm_tbl_new(esize: usize, flags: u8) -> *mut AlmTable {
     let contains_tables = (flags & 0x80) >> 7;
     let elem_kind = (flags >> 1) & 0x07;
     let is_sparse = (flags & 0x01) != 0;
 
-    let hdr = Box::into_raw(Box::new(GlmTable {
+    let hdr = Box::into_raw(Box::new(AlmTable {
         data: std::ptr::null_mut(),
         len: 0,
         reserve: 0,
@@ -231,22 +231,22 @@ pub unsafe extern "C" fn glm_tbl_new(esize: usize, flags: u8) -> *mut GlmTable {
     TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
     let id = exec_id();
     unsafe { mirror_census(id) };
-    unsafe { glm_trace_set(TRACE_RT_ALLOC) };
+    unsafe { alm_trace_set(TRACE_RT_ALLOC) };
     if id == -1
         && LOCAL_LEAK_HOOK
             .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
         // registry full: this copy owes its own exit leak check
-        unsafe { atexit(glm_trace_leak_check) };
+        unsafe { atexit(alm_trace_leak_check) };
     }
     hdr
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_grow(t: *mut GlmTable, idx: i64) {
+pub unsafe extern "C" fn alm_tbl_grow(t: *mut AlmTable, idx: i64) {
     if t.is_null() {
-        unsafe { glm_trace_set(TRACE_RT_GROW_NULL) };
+        unsafe { alm_trace_set(TRACE_RT_GROW_NULL) };
         return;
     }
     let tbl = unsafe { &mut *t };
@@ -254,16 +254,16 @@ pub unsafe extern "C" fn glm_tbl_grow(t: *mut GlmTable, idx: i64) {
         return;
     }
     if idx >= 0 && idx == i64::MAX {
-        eprintln!("glm fatal: table index overflow (idx={idx})");
+        eprintln!("alm fatal: table index overflow (idx={idx})");
         std::process::abort();
     }
     unsafe { span_grow(tbl, idx.wrapping_add(1)) };
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_reserve(t: *mut GlmTable, n: i64) {
+pub unsafe extern "C" fn alm_tbl_reserve(t: *mut AlmTable, n: i64) {
     if t.is_null() {
-        unsafe { glm_trace_set(TRACE_RT_RESERVE_NULL) };
+        unsafe { alm_trace_set(TRACE_RT_RESERVE_NULL) };
         return;
     }
     let raw_esize = unsafe { ptr::addr_of!((*t).esize).read() };
@@ -275,7 +275,7 @@ pub unsafe extern "C" fn glm_tbl_reserve(t: *mut GlmTable, n: i64) {
         || raw_mode > 1
     {
         eprintln!(
-            "glm fatal: glm_tbl_reserve called on freed or corrupted GlmTable {:p} (len={}, esize=0x{:x}, mode={})",
+            "alm fatal: alm_tbl_reserve called on freed or corrupted AlmTable {:p} (len={}, esize=0x{:x}, mode={})",
             t, raw_len, raw_esize, raw_mode
         );
         std::process::abort();
@@ -293,7 +293,7 @@ pub unsafe extern "C" fn glm_tbl_reserve(t: *mut GlmTable, n: i64) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_len(t: *const GlmTable) -> i64 {
+pub unsafe extern "C" fn alm_tbl_len(t: *const AlmTable) -> i64 {
     if t.is_null() {
         return 0;
     }
@@ -303,7 +303,7 @@ pub unsafe extern "C" fn glm_tbl_len(t: *const GlmTable) -> i64 {
 pub const SPARSE_THRESHOLD: i64 = 100_000;
 
 #[inline(never)]
-unsafe fn overflow_map(tbl: &mut GlmTable) -> &mut HashMap<i64, u128> {
+unsafe fn overflow_map(tbl: &mut AlmTable) -> &mut HashMap<i64, u128> {
     if tbl.sparse_map.is_null() {
         tbl.sparse_map = Box::into_raw(Box::new(HashMap::with_capacity(1)));
     }
@@ -449,24 +449,24 @@ impl CellRepr for KeyedCell {
 }
 
 #[allow(dead_code)]
-unsafe fn keyed_set(t: *mut GlmTable, index: i64, cell: KeyedCell) {
+unsafe fn keyed_set(t: *mut AlmTable, index: i64, cell: KeyedCell) {
     unsafe { set_core::<KeyedCell>(t, index, cell) };
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_div_zero_guard(rhs: i64) {
+pub unsafe extern "C" fn alm_div_zero_guard(rhs: i64) {
     if rhs == 0 {
-        unsafe { glm_trace_set(TRACE_FAIL_DIV_ZERO) };
-        eprintln!("glm runtime error: attempt to perform 'n/0' (integer division by zero)");
+        unsafe { alm_trace_set(TRACE_FAIL_DIV_ZERO) };
+        eprintln!("alm runtime error: attempt to perform 'n/0' (integer division by zero)");
         std::process::abort();
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_set(t: *mut GlmTable, index: i64, val: *const u8) {
+pub unsafe extern "C" fn alm_tbl_set(t: *mut AlmTable, index: i64, val: *const u8) {
     if t.is_null() {
-        unsafe { glm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
-        eprintln!("glm runtime error: attempt to index a nil value (null table row)");
+        unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
+        eprintln!("alm runtime error: attempt to index a nil value (null table row)");
         std::process::abort();
     }
     match unsafe { (&*t).esize } {
@@ -474,13 +474,13 @@ pub unsafe extern "C" fn glm_tbl_set(t: *mut GlmTable, index: i64, val: *const u
         8 => unsafe { set_core::<u64>(t, index, u64::load_slot(val)) },
         16 => unsafe { set_core::<u128>(t, index, u128::load_slot(val)) },
         other => {
-            eprintln!("glm runtime error: GlmTable esize {other} has no cell repr");
+            eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
             std::process::abort();
         }
     }
 }
 
-unsafe fn set_core<C: CellRepr>(t: *mut GlmTable, index: i64, cell: C) {
+unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C) {
     let tbl = unsafe { &mut *t };
 
     // Integer keys are the non-negative span of the i64 lane: negative
@@ -521,14 +521,14 @@ unsafe fn set_core<C: CellRepr>(t: *mut GlmTable, index: i64, cell: C) {
 /// overflow insert). The caller is a `*_skey` entry point; the compiler
 /// guarantees the key is a negative interned identity, which the
 /// debug_assert double-checks.
-unsafe fn set_skey_core<C: CellRepr>(t: *mut GlmTable, key: i64, cell: C) {
+unsafe fn set_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64, cell: C) {
     debug_assert!(is_str_key(key), "skey store outside the reserved range");
     let tbl = unsafe { &mut *t };
     unsafe { overflow_map(tbl).insert(key, cell.to_lane()) };
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_get(t: *mut GlmTable, index: i64, dst: *mut u8, esize: usize) {
+pub unsafe extern "C" fn alm_tbl_get(t: *mut AlmTable, index: i64, dst: *mut u8, esize: usize) {
     if dst.is_null() {
         return;
     }
@@ -541,13 +541,13 @@ pub unsafe extern "C" fn glm_tbl_get(t: *mut GlmTable, index: i64, dst: *mut u8,
         8 => unsafe { u64::store_dst(get_core::<u64>(t, index), dst) },
         16 => unsafe { u128::store_dst(get_core::<u128>(t, index), dst) },
         other => {
-            eprintln!("glm runtime error: GlmTable esize {other} has no cell repr");
+            eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
             std::process::abort();
         }
     }
 }
 
-unsafe fn get_core<C: CellRepr>(t: *mut GlmTable, index: i64) -> C {
+unsafe fn get_core<C: CellRepr>(t: *mut AlmTable, index: i64) -> C {
     let tbl = unsafe { &mut *t };
 
     // negative integers (the string-key range included) read the zero
@@ -578,7 +578,7 @@ unsafe fn get_core<C: CellRepr>(t: *mut GlmTable, index: i64) -> C {
 
 /// String-key read: the overflow map only; a missing field reads the
 /// zero lane — the same "unset cell" semantics as out-of-range arrays.
-unsafe fn get_skey_core<C: CellRepr>(t: *mut GlmTable, key: i64) -> C {
+unsafe fn get_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64) -> C {
     debug_assert!(is_str_key(key), "skey read outside the reserved range");
     let tbl = unsafe { &mut *t };
     if !tbl.sparse_map.is_null()
@@ -590,30 +590,30 @@ unsafe fn get_skey_core<C: CellRepr>(t: *mut GlmTable, key: i64) -> C {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_set_any(t: *mut GlmTable, index: i64, val: i128) {
+pub unsafe extern "C" fn alm_tbl_set_any(t: *mut AlmTable, index: i64, val: i128) {
     if t.is_null() {
-        unsafe { glm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
-        eprintln!("glm runtime error: attempt to index a nil value (null table row)");
+        unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
+        eprintln!("alm runtime error: attempt to index a nil value (null table row)");
         std::process::abort();
     }
     match unsafe { (&*t).esize } {
         16 => unsafe { set_core::<u128>(t, index, val as u128) },
         other => {
-            eprintln!("glm runtime error: GlmTable esize {other} has no register cell face");
+            eprintln!("alm runtime error: AlmTable esize {other} has no register cell face");
             std::process::abort();
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_get_any(t: *mut GlmTable, index: i64) -> i128 {
+pub unsafe extern "C" fn alm_tbl_get_any(t: *mut AlmTable, index: i64) -> i128 {
     if t.is_null() {
         return 0;
     }
     match unsafe { (&*t).esize } {
         16 => unsafe { get_core::<u128>(t, index) as i128 },
         other => {
-            eprintln!("glm runtime error: GlmTable esize {other} has no register cell face");
+            eprintln!("alm runtime error: AlmTable esize {other} has no register cell face");
             std::process::abort();
         }
     }
@@ -626,10 +626,10 @@ pub unsafe extern "C" fn glm_tbl_get_any(t: *mut GlmTable, index: i64) -> i128 {
 // above (whose cores drop every negative index).
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_set_skey(t: *mut GlmTable, key: i64, val: *const u8) {
+pub unsafe extern "C" fn alm_tbl_set_skey(t: *mut AlmTable, key: i64, val: *const u8) {
     if t.is_null() {
-        unsafe { glm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
-        eprintln!("glm runtime error: attempt to index a nil value (null table row)");
+        unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
+        eprintln!("alm runtime error: attempt to index a nil value (null table row)");
         std::process::abort();
     }
     match unsafe { (&*t).esize } {
@@ -637,14 +637,14 @@ pub unsafe extern "C" fn glm_tbl_set_skey(t: *mut GlmTable, key: i64, val: *cons
         8 => unsafe { set_skey_core::<u64>(t, key, u64::load_slot(val)) },
         16 => unsafe { set_skey_core::<u128>(t, key, u128::load_slot(val)) },
         other => {
-            eprintln!("glm runtime error: GlmTable esize {other} has no cell repr");
+            eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
             std::process::abort();
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_get_skey(t: *mut GlmTable, key: i64, dst: *mut u8, esize: usize) {
+pub unsafe extern "C" fn alm_tbl_get_skey(t: *mut AlmTable, key: i64, dst: *mut u8, esize: usize) {
     if dst.is_null() {
         return;
     }
@@ -657,43 +657,43 @@ pub unsafe extern "C" fn glm_tbl_get_skey(t: *mut GlmTable, key: i64, dst: *mut 
         8 => unsafe { u64::store_dst(get_skey_core::<u64>(t, key), dst) },
         16 => unsafe { u128::store_dst(get_skey_core::<u128>(t, key), dst) },
         other => {
-            eprintln!("glm runtime error: GlmTable esize {other} has no cell repr");
+            eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
             std::process::abort();
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_set_any_skey(t: *mut GlmTable, key: i64, val: i128) {
+pub unsafe extern "C" fn alm_tbl_set_any_skey(t: *mut AlmTable, key: i64, val: i128) {
     if t.is_null() {
-        unsafe { glm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
-        eprintln!("glm runtime error: attempt to index a nil value (null table row)");
+        unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
+        eprintln!("alm runtime error: attempt to index a nil value (null table row)");
         std::process::abort();
     }
     match unsafe { (&*t).esize } {
         16 => unsafe { set_skey_core::<u128>(t, key, val as u128) },
         other => {
-            eprintln!("glm runtime error: GlmTable esize {other} has no register cell face");
+            eprintln!("alm runtime error: AlmTable esize {other} has no register cell face");
             std::process::abort();
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_get_any_skey(t: *mut GlmTable, key: i64) -> i128 {
+pub unsafe extern "C" fn alm_tbl_get_any_skey(t: *mut AlmTable, key: i64) -> i128 {
     if t.is_null() {
         return 0;
     }
     match unsafe { (&*t).esize } {
         16 => unsafe { get_skey_core::<u128>(t, key) as i128 },
         other => {
-            eprintln!("glm runtime error: GlmTable esize {other} has no register cell face");
+            eprintln!("alm runtime error: AlmTable esize {other} has no register cell face");
             std::process::abort();
         }
     }
 }
 
-unsafe fn span_grow(tbl: &mut GlmTable, want: i64) {
+unsafe fn span_grow(tbl: &mut AlmTable, want: i64) {
     if want < 0 {
         return;
     }
@@ -780,14 +780,14 @@ fn vm_enabled() -> bool {
         1 => true,
         2 => false,
         _ => {
-            let off = std::env::var_os("GLM_VM").is_some_and(|v| v == "off" || v == "0");
+            let off = std::env::var_os("ALM_VM").is_some_and(|v| v == "off" || v == "0");
             STATE.store(if off { 2 } else { 1 }, Ordering::Relaxed);
             !off
         }
     }
 }
 
-unsafe fn graduate(tbl: &mut GlmTable, new_bytes: usize) {
+unsafe fn graduate(tbl: &mut AlmTable, new_bytes: usize) {
     let reserve = reserve_for(new_bytes);
     let vm = unsafe {
         mmap(
@@ -821,7 +821,7 @@ unsafe fn graduate(tbl: &mut GlmTable, new_bytes: usize) {
     tbl.reserve = reserve;
 }
 
-unsafe fn grow_vm(tbl: &mut GlmTable, new_bytes: usize) {
+unsafe fn grow_vm(tbl: &mut AlmTable, new_bytes: usize) {
     if new_bytes > tbl.reserve {
         let new_reserve = reserve_for(new_bytes);
         let moved = unsafe { mremap(tbl.data.cast(), tbl.reserve, new_reserve, MREMAP_MAYMOVE) };
@@ -838,19 +838,19 @@ unsafe fn grow_vm(tbl: &mut GlmTable, new_bytes: usize) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_free(t: *mut GlmTable) {
+pub unsafe extern "C" fn alm_tbl_free(t: *mut AlmTable) {
     unsafe { free_tbl(t, &[]) };
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_free_except(t: *mut GlmTable, keep: *mut GlmTable) {
+pub unsafe extern "C" fn alm_tbl_free_except(t: *mut AlmTable, keep: *mut AlmTable) {
     unsafe { free_tbl(t, &[keep]) };
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_tbl_free_except_n(
-    t: *mut GlmTable,
-    keeps: *const *mut GlmTable,
+pub unsafe extern "C" fn alm_tbl_free_except_n(
+    t: *mut AlmTable,
+    keeps: *const *mut AlmTable,
     n: usize,
 ) {
     if keeps.is_null() {
@@ -863,7 +863,7 @@ pub unsafe extern "C" fn glm_tbl_free_except_n(
 
 const FREE_POISON_ESIZE: usize = 0xDEAD_F8EE_DEAD_F8EE;
 
-unsafe fn validate_header_before_free(t: *mut GlmTable, prev_allocs: usize) {
+unsafe fn validate_header_before_free(t: *mut AlmTable, prev_allocs: usize) {
     let raw_data = unsafe { ptr::addr_of!((*t).data).read() };
     let raw_len = unsafe { ptr::addr_of!((*t).len).read() };
     let raw_reserve = unsafe { ptr::addr_of!((*t).reserve).read() };
@@ -876,7 +876,7 @@ unsafe fn validate_header_before_free(t: *mut GlmTable, prev_allocs: usize) {
 
     if raw_esize == FREE_POISON_ESIZE {
         eprintln!(
-            "glm fatal: DOUBLE FREE of GlmTable header {:p} \
+            "alm fatal: DOUBLE FREE of AlmTable header {:p} \
              (tcache next/data={:p}, tcache_key/len=0x{:016x} [{}], prev_alloc_count={})",
             t, raw_data, raw_len as u64, raw_len, prev_allocs
         );
@@ -885,7 +885,7 @@ unsafe fn validate_header_before_free(t: *mut GlmTable, prev_allocs: usize) {
 
     let valid_esize = matches!(raw_esize, 1 | 8 | 16);
     let valid_mode = matches!(raw_mode, 0 | 1);
-    let valid_elem_kind = raw_elem_kind <= GLM_ELEM_UNDECIDED;
+    let valid_elem_kind = raw_elem_kind <= ALM_ELEM_UNDECIDED;
     let valid_len = raw_len >= 0
         && usize::try_from(raw_len)
             .ok()
@@ -903,7 +903,7 @@ unsafe fn validate_header_before_free(t: *mut GlmTable, prev_allocs: usize) {
         || !valid_span
     {
         eprintln!(
-            "glm fatal: corrupted or already-freed GlmTable header at {:p} during free_tbl:\n  \
+            "alm fatal: corrupted or already-freed AlmTable header at {:p} during free_tbl:\n  \
              prev_alloc_count = {}\n  \
              @0  data            = {:p}\n  \
              @8  len             = {} (0x{:016x})\n  \
@@ -933,11 +933,11 @@ unsafe fn validate_header_before_free(t: *mut GlmTable, prev_allocs: usize) {
     }
 }
 
-unsafe fn free_tbl(t: *mut GlmTable, keeps: &[*mut GlmTable]) {
+unsafe fn free_tbl(t: *mut AlmTable, keeps: &[*mut AlmTable]) {
     if t.is_null() || keeps.contains(&t) {
         return;
     }
-    unsafe { glm_trace_set(TRACE_RT_FREE) };
+    unsafe { alm_trace_set(TRACE_RT_FREE) };
     let prev_allocs = ALLOC_COUNT.fetch_sub(1, Ordering::Relaxed);
     unsafe { mirror_census(EXEC_ID.load(Ordering::Relaxed)) };
     unsafe { validate_header_before_free(t, prev_allocs) };
@@ -958,10 +958,10 @@ unsafe fn free_tbl(t: *mut GlmTable, keeps: &[*mut GlmTable]) {
 
         if tbl.mode == TableMode::Dense && !tbl.data.is_null() {
             let ptrs =
-                std::slice::from_raw_parts(tbl.data.cast::<*mut GlmTable>(), tbl.len as usize);
+                std::slice::from_raw_parts(tbl.data.cast::<*mut AlmTable>(), tbl.len as usize);
             for &child in ptrs {
                 if is_valid_ptr(child as usize) {
-                    unsafe { glm_trace_set(TRACE_RT_FREE_CHILD) };
+                    unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
                     unsafe { free_tbl(child, keeps) };
                 }
             }
@@ -970,8 +970,8 @@ unsafe fn free_tbl(t: *mut GlmTable, keeps: &[*mut GlmTable]) {
             let map = unsafe { &*tbl.sparse_map };
             for &child_addr in map.values() {
                 if is_valid_ptr(child_addr as usize) {
-                    unsafe { glm_trace_set(TRACE_RT_FREE_CHILD) };
-                    unsafe { free_tbl(child_addr as *mut GlmTable, keeps) };
+                    unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
+                    unsafe { free_tbl(child_addr as *mut AlmTable, keeps) };
                 }
             }
         }
@@ -1000,22 +1000,22 @@ unsafe fn free_tbl(t: *mut GlmTable, keeps: &[*mut GlmTable]) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_print_int(val: i64) {
+pub extern "C" fn alm_print_int(val: i64) {
     print!("{val}");
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_print_float(val: f64) {
+pub extern "C" fn alm_print_float(val: f64) {
     print!("{val}");
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_print_bool(val: bool) {
+pub extern "C" fn alm_print_bool(val: bool) {
     print!("{val}");
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_print_string(val: *const u8) {
+pub unsafe extern "C" fn alm_print_string(val: *const u8) {
     if val.is_null() {
         return;
     }
@@ -1030,7 +1030,7 @@ pub unsafe extern "C" fn glm_print_string(val: *const u8) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_str_len(val: *const u8) -> i64 {
+pub unsafe extern "C" fn alm_str_len(val: *const u8) -> i64 {
     if val.is_null() {
         return 0;
     }
@@ -1045,18 +1045,18 @@ pub unsafe extern "C" fn glm_str_len(val: *const u8) -> i64 {
 
 /* The string pool lives in the substrate (async/str_pool.c) — the third
 stateful layer inverted (trace plate, exec registry, strings). One pool
-per process: pointer equality is sound across glm copies, and every
+per process: pointer equality is sound across alm copies, and every
 pooled string carries its negative table key in an 8-byte prefix.
 RT_STR_INTERN / RT_STR_POOL_HIT (slots 8/9) are poked by the substrate
 now, anonymously — the pool cannot know the calling copy's exec id. */
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_str_register(ptrs: *const *const u8, n: usize) {
+pub unsafe extern "C" fn alm_str_register(ptrs: *const *const u8, n: usize) {
     unsafe { vx_str_register(ptrs as *mut *const u8, n) };
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_str_intern(s: *const u8, len: usize) -> *const u8 {
+pub unsafe extern "C" fn alm_str_intern(s: *const u8, len: usize) -> *const u8 {
     unsafe { vx_str_intern(s, len) }
 }
 
@@ -1066,14 +1066,14 @@ pub unsafe extern "C" fn glm_str_intern(s: *const u8, len: usize) -> *const u8 {
 /// handles through strtab slots for exactly this reason).
 ///
 /// A null handle (an unset String cell reads 0 — total-read philosophy,
-/// the same null `glm_str_len` guards) answers -1: negative but NOT a
+/// the same null `alm_str_len` guards) answers -1: negative but NOT a
 /// str key (top two bits 11, not 10), so set_core no-ops it like any
 /// other negative index and get_core reads a zero lane — the store is
 /// dropped, the read is 0, and neither the array slot 0 nor the overflow
 /// map is polluted. (Answering 0 would alias array slot 0; answering
 /// STR_KEY_TAG would alias every null string onto one overflow cell.)
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_str_key(s: *const u8) -> i64 {
+pub unsafe extern "C" fn alm_str_key(s: *const u8) -> i64 {
     if s.is_null() {
         return -1;
     }
@@ -1116,12 +1116,12 @@ fn any_payload(v: i128) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_any_print(v: i128) {
+pub extern "C" fn alm_any_print(v: i128) {
     match any_tag(v) {
-        GLM_ARG_INT => print!("{}", any_payload(v) as i64),
-        GLM_ARG_FLOAT => print!("{}", f64::from_bits(any_payload(v))),
-        GLM_ARG_BOOL => print!("{}", any_payload(v) != 0),
-        GLM_ARG_STRING => {
+        ALM_ARG_INT => print!("{}", any_payload(v) as i64),
+        ALM_ARG_FLOAT => print!("{}", f64::from_bits(any_payload(v))),
+        ALM_ARG_BOOL => print!("{}", any_payload(v) != 0),
+        ALM_ARG_STRING => {
             let p = any_payload(v) as *const u8;
             if !p.is_null() {
                 let bytes = unsafe { cstr_bytes(p) };
@@ -1133,31 +1133,31 @@ pub extern "C" fn glm_any_print(v: i128) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_any_eq(l: i128, r: i128) -> i32 {
+pub extern "C" fn alm_any_eq(l: i128, r: i128) -> i32 {
     i32::from(l == r)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_any_len(v: i128) -> i64 {
+pub extern "C" fn alm_any_len(v: i128) -> i64 {
     let kind_word = |k: i32| match k {
-        GLM_ARG_INT => "int",
-        GLM_ARG_FLOAT => "float",
-        GLM_ARG_BOOL => "bool",
-        GLM_ARG_STRING => "string",
+        ALM_ARG_INT => "int",
+        ALM_ARG_FLOAT => "float",
+        ALM_ARG_BOOL => "bool",
+        ALM_ARG_STRING => "string",
         _ => "unknown",
     };
     match any_tag(v) {
-        GLM_ARG_STRING => {
+        ALM_ARG_STRING => {
             let p = any_payload(v) as *const u8;
             if p.is_null() {
                 return 0;
             }
-            unsafe { glm_str_len(p) }
+            unsafe { alm_str_len(p) }
         }
         k => {
-            unsafe { glm_trace_set(TRACE_FAIL_ANY_LEN) };
+            unsafe { alm_trace_set(TRACE_FAIL_ANY_LEN) };
             eprintln!(
-                "glm runtime error: glm_any_len: '#' demands a string cell, got kind {} ({})",
+                "alm runtime error: alm_any_len: '#' demands a string cell, got kind {} ({})",
                 k,
                 kind_word(k)
             );
@@ -1167,23 +1167,23 @@ pub extern "C" fn glm_any_len(v: i128) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_any_from_int(v: i64) -> i128 {
-    any_pack(GLM_ARG_INT, v as u64)
+pub extern "C" fn alm_any_from_int(v: i64) -> i128 {
+    any_pack(ALM_ARG_INT, v as u64)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_any_from_float(v: f64) -> i128 {
-    any_pack(GLM_ARG_FLOAT, v.to_bits())
+pub extern "C" fn alm_any_from_float(v: f64) -> i128 {
+    any_pack(ALM_ARG_FLOAT, v.to_bits())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_any_from_bool(v: bool) -> i128 {
-    any_pack(GLM_ARG_BOOL, u64::from(v))
+pub extern "C" fn alm_any_from_bool(v: bool) -> i128 {
+    any_pack(ALM_ARG_BOOL, u64::from(v))
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_any_from_str(p: *const u8) -> i128 {
-    any_pack(GLM_ARG_STRING, p as u64)
+pub unsafe extern "C" fn alm_any_from_str(p: *const u8) -> i128 {
+    any_pack(ALM_ARG_STRING, p as u64)
 }
 
 pub enum AnyWord {
@@ -1211,18 +1211,18 @@ pub fn classify_word(w: &[u8]) -> AnyWord {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_any_pack(tag: i32, payload: u64) -> i128 {
+pub extern "C" fn alm_any_pack(tag: i32, payload: u64) -> i128 {
     any_pack(tag, payload)
 }
 
 unsafe fn any_of_word(w: &[u8]) -> i128 {
     match classify_word(w) {
-        AnyWord::Int(v) => any_pack(GLM_ARG_INT, v as u64),
-        AnyWord::Float(v) => any_pack(GLM_ARG_FLOAT, v.to_bits()),
-        AnyWord::Bool(v) => any_pack(GLM_ARG_BOOL, u64::from(v)),
+        AnyWord::Int(v) => any_pack(ALM_ARG_INT, v as u64),
+        AnyWord::Float(v) => any_pack(ALM_ARG_FLOAT, v.to_bits()),
+        AnyWord::Bool(v) => any_pack(ALM_ARG_BOOL, u64::from(v)),
         AnyWord::Str => {
-            let p = unsafe { glm_str_intern(w.as_ptr(), w.len()) };
-            any_pack(GLM_ARG_STRING, p as u64)
+            let p = unsafe { alm_str_intern(w.as_ptr(), w.len()) };
+            any_pack(ALM_ARG_STRING, p as u64)
         }
     }
 }
@@ -1237,82 +1237,82 @@ unsafe fn cstr_bytes(p: *const u8) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(p, len) }
 }
 
-pub const GLM_ARG_NONE: i32 = -1;
-pub const GLM_ARG_INT: i32 = 0;
-pub const GLM_ARG_FLOAT: i32 = 1;
-pub const GLM_ARG_BOOL: i32 = 2;
-pub const GLM_ARG_STRING: i32 = 3;
-pub const GLM_ARG_ANY: i32 = 4;
+pub const ALM_ARG_NONE: i32 = -1;
+pub const ALM_ARG_INT: i32 = 0;
+pub const ALM_ARG_FLOAT: i32 = 1;
+pub const ALM_ARG_BOOL: i32 = 2;
+pub const ALM_ARG_STRING: i32 = 3;
+pub const ALM_ARG_ANY: i32 = 4;
 
-pub const GLM_ELEM_TABLE: u8 = 5;
-pub const GLM_ELEM_UNDECIDED: u8 = 6;
+pub const ALM_ELEM_TABLE: u8 = 5;
+pub const ALM_ELEM_UNDECIDED: u8 = 6;
 
-pub fn arg_kind_of(elem: &crate::GlmElem) -> i32 {
+pub fn arg_kind_of(elem: &crate::AlmElem) -> i32 {
     match elem {
-        crate::GlmElem::Float => GLM_ARG_FLOAT,
-        crate::GlmElem::Boolean => GLM_ARG_BOOL,
-        crate::GlmElem::String => GLM_ARG_STRING,
-        crate::GlmElem::Any => GLM_ARG_ANY,
-        crate::GlmElem::Integer => GLM_ARG_INT,
+        crate::AlmElem::Float => ALM_ARG_FLOAT,
+        crate::AlmElem::Boolean => ALM_ARG_BOOL,
+        crate::AlmElem::String => ALM_ARG_STRING,
+        crate::AlmElem::Any => ALM_ARG_ANY,
+        crate::AlmElem::Integer => ALM_ARG_INT,
     }
 }
 
-pub fn elem_of_kind(kind: i32) -> Option<crate::GlmElem> {
+pub fn elem_of_kind(kind: i32) -> Option<crate::AlmElem> {
     match kind {
-        GLM_ARG_INT => Some(crate::GlmElem::Integer),
-        GLM_ARG_FLOAT => Some(crate::GlmElem::Float),
-        GLM_ARG_BOOL => Some(crate::GlmElem::Boolean),
-        GLM_ARG_STRING => Some(crate::GlmElem::String),
-        GLM_ARG_ANY => Some(crate::GlmElem::Any),
+        ALM_ARG_INT => Some(crate::AlmElem::Integer),
+        ALM_ARG_FLOAT => Some(crate::AlmElem::Float),
+        ALM_ARG_BOOL => Some(crate::AlmElem::Boolean),
+        ALM_ARG_STRING => Some(crate::AlmElem::String),
+        ALM_ARG_ANY => Some(crate::AlmElem::Any),
         _ => None,
     }
 }
 
 fn arg_kind_words(kind: i32) -> &'static str {
     match kind {
-        GLM_ARG_FLOAT => "numbers (64-bit floats)",
-        GLM_ARG_BOOL => "booleans ('true'/'false')",
-        GLM_ARG_STRING => "strings (any word)",
-        GLM_ARG_ANY => "int, float, bool, or string words",
+        ALM_ARG_FLOAT => "numbers (64-bit floats)",
+        ALM_ARG_BOOL => "booleans ('true'/'false')",
+        ALM_ARG_STRING => "strings (any word)",
+        ALM_ARG_ANY => "int, float, bool, or string words",
         _ => "integers (64-bit)",
     }
 }
 
 fn arg_kind_table(kind: i32) -> &'static str {
     match kind {
-        GLM_ARG_FLOAT => "Table<Float>",
-        GLM_ARG_BOOL => "Table<Boolean>",
-        GLM_ARG_STRING => "Table<String>",
-        GLM_ARG_ANY => "Table<Any>",
+        ALM_ARG_FLOAT => "Table<Float>",
+        ALM_ARG_BOOL => "Table<Boolean>",
+        ALM_ARG_STRING => "Table<String>",
+        ALM_ARG_ANY => "Table<Any>",
         _ => "Table<Integer>",
     }
 }
 
-unsafe fn set_word(t: *mut GlmTable, i: i64, w: &[u8], kind: i32) -> Result<(), ()> {
+unsafe fn set_word(t: *mut AlmTable, i: i64, w: &[u8], kind: i32) -> Result<(), ()> {
     match kind {
-        GLM_ARG_INT => {
+        ALM_ARG_INT => {
             let v: i64 = String::from_utf8_lossy(w).parse().map_err(|_| ())?;
-            unsafe { glm_tbl_set(t, i, (&v as *const i64).cast()) };
+            unsafe { alm_tbl_set(t, i, (&v as *const i64).cast()) };
         }
-        GLM_ARG_FLOAT => {
+        ALM_ARG_FLOAT => {
             let v: f64 = String::from_utf8_lossy(w).parse().map_err(|_| ())?;
-            unsafe { glm_tbl_set(t, i, (&v as *const f64).cast()) };
+            unsafe { alm_tbl_set(t, i, (&v as *const f64).cast()) };
         }
-        GLM_ARG_BOOL => {
+        ALM_ARG_BOOL => {
             let v = match w {
                 b"true" => 1u8,
                 b"false" => 0u8,
                 _ => return Err(()),
             };
-            unsafe { glm_tbl_set(t, i, (&v as *const u8).cast()) };
+            unsafe { alm_tbl_set(t, i, (&v as *const u8).cast()) };
         }
-        GLM_ARG_STRING => {
-            let p = unsafe { glm_str_intern(w.as_ptr(), w.len()) };
-            unsafe { glm_tbl_set(t, i, (&p as *const *const u8).cast()) };
+        ALM_ARG_STRING => {
+            let p = unsafe { alm_str_intern(w.as_ptr(), w.len()) };
+            unsafe { alm_tbl_set(t, i, (&p as *const *const u8).cast()) };
         }
-        GLM_ARG_ANY => {
+        ALM_ARG_ANY => {
             let v = unsafe { any_of_word(w) };
-            unsafe { glm_tbl_set_any(t, i, v) };
+            unsafe { alm_tbl_set_any(t, i, v) };
         }
         _ => return Err(()),
     }
@@ -1320,11 +1320,11 @@ unsafe fn set_word(t: *mut GlmTable, i: i64, w: &[u8], kind: i32) -> Result<(), 
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_exec_main(
+pub unsafe extern "C" fn alm_exec_main(
     argc: i32,
     argv: *const *const u8,
     kind: i32,
-    exec: unsafe extern "C" fn(*mut GlmTable) -> *mut GlmTable,
+    exec: unsafe extern "C" fn(*mut AlmTable) -> *mut AlmTable,
 ) -> i32 {
     // the exe registers before any code runs (its constructors precede
     // every dlopen), so the main binary deterministically takes slot 0
@@ -1341,11 +1341,11 @@ unsafe fn exec_main_inner(
     argc: i32,
     argv: *const *const u8,
     kind: i32,
-    exec: unsafe extern "C" fn(*mut GlmTable) -> *mut GlmTable,
+    exec: unsafe extern "C" fn(*mut AlmTable) -> *mut AlmTable,
 ) -> i32 {
-    if kind == GLM_ARG_NONE {
+    if kind == ALM_ARG_NONE {
         let result = exec(std::ptr::null_mut());
-        unsafe { glm_tbl_free(result) };
+        unsafe { alm_tbl_free(result) };
         return 0;
     }
     let mut words: Vec<&[u8]> = Vec::new();
@@ -1358,29 +1358,29 @@ unsafe fn exec_main_inner(
         }
     }
     let esize = match kind {
-        GLM_ARG_BOOL => 1,
-        GLM_ARG_ANY => 16,
+        ALM_ARG_BOOL => 1,
+        ALM_ARG_ANY => 16,
         _ => 8,
     };
-    let args = unsafe { glm_tbl_new(esize, ((kind as u8) & 0x07) << 1) };
+    let args = unsafe { alm_tbl_new(esize, ((kind as u8) & 0x07) << 1) };
     for (i, w) in words.iter().enumerate() {
         if unsafe { set_word(args, i as i64, w, kind) }.is_err() {
             eprintln!(
-                "glm error: boundary args must be {}, got '{}' — the arg table is {}",
+                "alm error: boundary args must be {}, got '{}' — the arg table is {}",
                 arg_kind_words(kind),
                 String::from_utf8_lossy(w),
                 arg_kind_table(kind),
             );
-            unsafe { glm_tbl_free(args) };
+            unsafe { alm_tbl_free(args) };
             return 1;
         }
     }
     let result = exec(args);
     unsafe {
         if result != args {
-            glm_tbl_free(args);
+            alm_tbl_free(args);
         }
-        glm_tbl_free(result);
+        alm_tbl_free(result);
     }
     0
 }
@@ -1410,22 +1410,22 @@ unsafe fn ffi_open_path(path: *const u8) -> Vec<u8> {
 unsafe fn ffi_dlsym_or_die(lib: *mut c_void, name: *const u8) -> *mut c_void {
     let sym = unsafe { dlsym(lib, name.cast()) };
     if sym.is_null() {
-        unsafe { glm_trace_set(TRACE_FAIL_FFI_SYM) };
+        unsafe { alm_trace_set(TRACE_FAIL_FFI_SYM) };
         let shown = if name.is_null() {
             "(null)".to_string()
         } else {
             String::from_utf8_lossy(unsafe { cstr_bytes(name) }).into_owned()
         };
-        eprintln!("glm fatal: ffi could not find symbol '{shown}' in the loaded module");
+        eprintln!("alm fatal: ffi could not find symbol '{shown}' in the loaded module");
         std::process::abort();
     }
     sym
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_ffi_load(path: *const u8) -> *mut c_void {
+pub unsafe extern "C" fn alm_ffi_load(path: *const u8) -> *mut c_void {
     if path.is_null() {
-        eprintln!("glm fatal: ffi.load called with a null path");
+        eprintln!("alm fatal: ffi.load called with a null path");
         std::process::abort();
     }
     let prefixed = unsafe { ffi_open_path(path) };
@@ -1441,7 +1441,7 @@ pub unsafe extern "C" fn glm_ffi_load(path: *const u8) -> *mut c_void {
         )
     };
     if handle.is_null() {
-        unsafe { glm_trace_set(TRACE_FAIL_FFI_LOAD) };
+        unsafe { alm_trace_set(TRACE_FAIL_FFI_LOAD) };
         let err = unsafe {
             let e = dlerror();
             if e.is_null() {
@@ -1451,34 +1451,34 @@ pub unsafe extern "C" fn glm_ffi_load(path: *const u8) -> *mut c_void {
             }
         };
         eprintln!(
-            "glm fatal: ffi.load could not open '{}' ({err})",
+            "alm fatal: ffi.load could not open '{}' ({err})",
             String::from_utf8_lossy(unsafe { cstr_bytes(path) }),
         );
         std::process::abort();
     }
-    unsafe { glm_trace_set(TRACE_RT_FFI_LOAD) };
+    unsafe { alm_trace_set(TRACE_RT_FFI_LOAD) };
     handle
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_ffi_arg_kind(lib: *mut c_void) -> i64 {
+pub unsafe extern "C" fn alm_ffi_arg_kind(lib: *mut c_void) -> i64 {
     if lib.is_null() {
-        eprintln!("glm fatal: ffi use of a null library handle");
+        eprintln!("alm fatal: ffi use of a null library handle");
         std::process::abort();
     }
-    let sym = unsafe { ffi_dlsym_or_die(lib, c"glm_arg_kind".as_ptr() as *const u8) };
+    let sym = unsafe { ffi_dlsym_or_die(lib, c"alm_arg_kind".as_ptr() as *const u8) };
     let f = unsafe { std::mem::transmute_copy::<*mut c_void, unsafe extern "C" fn() -> i32>(&sym) };
     unsafe { f() as i64 }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_ffi_call(lib: *mut c_void, sym: *const u8, arg: *mut GlmTable) {
+pub unsafe extern "C" fn alm_ffi_call(lib: *mut c_void, sym: *const u8, arg: *mut AlmTable) {
     if lib.is_null() {
-        eprintln!("glm fatal: ffi call on a null library handle");
+        eprintln!("alm fatal: ffi call on a null library handle");
         std::process::abort();
     }
     let exec = unsafe {
-        std::mem::transmute_copy::<*mut c_void, unsafe extern "C" fn(*mut GlmTable) -> *mut GlmTable>(
+        std::mem::transmute_copy::<*mut c_void, unsafe extern "C" fn(*mut AlmTable) -> *mut AlmTable>(
             &ffi_dlsym_or_die(lib, sym),
         )
     };
@@ -1487,20 +1487,20 @@ pub unsafe extern "C" fn glm_ffi_call(lib: *mut c_void, sym: *const u8, arg: *mu
         return;
     }
     let free_fn = unsafe {
-        std::mem::transmute_copy::<*mut c_void, unsafe extern "C" fn(*mut GlmTable)>(
-            &ffi_dlsym_or_die(lib, c"glm_tbl_free".as_ptr() as *const u8),
+        std::mem::transmute_copy::<*mut c_void, unsafe extern "C" fn(*mut AlmTable)>(
+            &ffi_dlsym_or_die(lib, c"alm_tbl_free".as_ptr() as *const u8),
         )
     };
     unsafe { free_fn(result) };
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_print_sep() {
+pub extern "C" fn alm_print_sep() {
     print!("\t");
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_print_nl() {
+pub extern "C" fn alm_print_nl() {
     println!();
 }
 
@@ -1509,9 +1509,9 @@ pub extern "C" fn sys_alloc_count() -> i64 {
     ALLOC_COUNT.load(Ordering::Relaxed) as i64
 }
 
-/// The dialect's window into the shared C11 session: how many glm
+/// The dialect's window into the shared C11 session: how many alm
 /// runtimes (this exe + every loaded .so module) have registered in the
-/// process — reads the exec registry owned by libglm_async.so, not this
+/// process — reads the exec registry owned by libalm_async.so, not this
 /// copy's state.
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_exec_count() -> i64 {
@@ -1519,10 +1519,10 @@ pub extern "C" fn sys_exec_count() -> i64 {
 }
 
 /// The coroutine thread wrapper's FINISHED hook: this copy's exec handle
-/// in the shared registry (the substrate calls it after glm_exec returns
+/// in the shared registry (the substrate calls it after alm_exec returns
 /// on the worker thread).
 #[unsafe(no_mangle)]
-pub extern "C" fn glm_rt_exec_id() -> i32 {
+pub extern "C" fn alm_rt_exec_id() -> i32 {
     EXEC_ID.load(Ordering::Relaxed)
 }
 
@@ -1530,19 +1530,19 @@ pub extern "C" fn glm_rt_exec_id() -> i32 {
 //
 // The substrate owns threads, lanes, and packets; these wrappers marshal
 // table cells on the CALLER's thread/heap (read-only borrows — no
-// GlmTable pointer ever crosses a thread) and intern the status words.
+// AlmTable pointer ever crosses a thread) and intern the status words.
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_coro_create(lib: *mut c_void) -> i64 {
+pub unsafe extern "C" fn alm_coro_create(lib: *mut c_void) -> i64 {
     let id = unsafe { vx_coro_create(lib) };
     if id < 0 {
-        unsafe { glm_trace_set(TRACE_FAIL_CORO_CREATE) };
+        unsafe { alm_trace_set(TRACE_FAIL_CORO_CREATE) };
     }
     id as i64
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_coro_resume(co: i64, t: *mut GlmTable) -> i64 {
+pub unsafe extern "C" fn alm_coro_resume(co: i64, t: *mut AlmTable) -> i64 {
     let id = co as i32;
     if id >= 0 && unsafe { vx_coro_status(id) } == 1 && !t.is_null() {
         // VX_CORO_CREATED: marshal t[0..2] as the spawn inputs (reads on
@@ -1550,20 +1550,20 @@ pub unsafe extern "C" fn glm_coro_resume(co: i64, t: *mut GlmTable) -> i64 {
         let mut lanes = [0u64; 3];
         for (i, lane) in lanes.iter_mut().enumerate() {
             let mut buf = [0u8; 16];
-            unsafe { glm_tbl_get(t, i as i64, buf.as_mut_ptr(), 16) };
+            unsafe { alm_tbl_get(t, i as i64, buf.as_mut_ptr(), 16) };
             *lane = u64::from_ne_bytes(buf[..8].try_into().unwrap());
         }
         unsafe { vx_coro_send(id, lanes[0], lanes[1], lanes[2]) };
     }
     let r = if id >= 0 {
         unsafe { vx_coro_start(id) };
-        unsafe { glm_trace_set(TRACE_CORO_SPAWN) };
+        unsafe { alm_trace_set(TRACE_CORO_SPAWN) };
         unsafe { vx_coro_pull(id) }
     } else {
         -1
     };
     unsafe {
-        glm_trace_set(if r < 0 {
+        alm_trace_set(if r < 0 {
             TRACE_CORO_DEAD
         } else {
             TRACE_CORO_RESUME
@@ -1573,10 +1573,10 @@ pub unsafe extern "C" fn glm_coro_resume(co: i64, t: *mut GlmTable) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_coro_yield(value: i64) -> i64 {
+pub unsafe extern "C" fn alm_coro_yield(value: i64) -> i64 {
     let r = unsafe { vx_coro_yield(value as u64) };
     unsafe {
-        glm_trace_set(if r < 0 {
+        alm_trace_set(if r < 0 {
             TRACE_CORO_YIELD_DROPPED
         } else {
             TRACE_CORO_YIELD
@@ -1586,7 +1586,7 @@ pub unsafe extern "C" fn glm_coro_yield(value: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_coro_status(co: i64) -> *const u8 {
+pub unsafe extern "C" fn alm_coro_status(co: i64) -> *const u8 {
     // the parody's punchline, straight-faced: "running" because it IS —
     // on its own pthread (CREATED answers Lua's "suspended")
     let word: &[u8] = match unsafe { vx_coro_status(co as i32) } {
@@ -1594,12 +1594,12 @@ pub unsafe extern "C" fn glm_coro_status(co: i64) -> *const u8 {
         2 => b"running",
         _ => b"dead",
     };
-    unsafe { glm_str_intern(word.as_ptr(), word.len()) }
+    unsafe { alm_str_intern(word.as_ptr(), word.len()) }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn glm_coro_close(co: i64) -> i64 {
-    unsafe { glm_trace_set(TRACE_CORO_CLOSE) };
+pub unsafe extern "C" fn alm_coro_close(co: i64) -> i64 {
+    unsafe { alm_trace_set(TRACE_CORO_CLOSE) };
     unsafe { vx_coro_join(co as i32) };
     0
 }
@@ -1617,31 +1617,31 @@ mod strkey_tests {
     fn negative_keys_never_pollute_border() {
         for flags in [0u8, 1u8] {
             // 0 = Dense, 1 = Sparse — record writes behave identically
-            let t = unsafe { glm_tbl_new(std::mem::size_of::<i128>(), flags) };
+            let t = unsafe { alm_tbl_new(std::mem::size_of::<i128>(), flags) };
             let key = str_key_of_bytes(b"health");
 
-            unsafe { glm_tbl_set_any(t, 0, 41) }; // array cell (int face)
-            unsafe { glm_tbl_set_any(t, 1, 7) };
-            unsafe { glm_tbl_set_any_skey(t, key, glm_any_pack(3, 0x1234)) }; // record cell
+            unsafe { alm_tbl_set_any(t, 0, 41) }; // array cell (int face)
+            unsafe { alm_tbl_set_any(t, 1, 7) };
+            unsafe { alm_tbl_set_any_skey(t, key, alm_any_pack(3, 0x1234)) }; // record cell
 
             assert_eq!(
-                unsafe { glm_tbl_len(t) },
+                unsafe { alm_tbl_len(t) },
                 2,
                 "record write must not touch #t"
             );
             assert_eq!(
-                unsafe { glm_tbl_get_any_skey(t, key) },
-                glm_any_pack(3, 0x1234)
+                unsafe { alm_tbl_get_any_skey(t, key) },
+                alm_any_pack(3, 0x1234)
             );
-            assert_eq!(unsafe { glm_tbl_get_any(t, 0) }, 41);
-            assert_eq!(unsafe { glm_tbl_get_any(t, 1) }, 7);
+            assert_eq!(unsafe { alm_tbl_get_any(t, 0) }, 41);
+            assert_eq!(unsafe { alm_tbl_get_any(t, 1) }, 7);
             assert_eq!(
-                unsafe { glm_tbl_get_any_skey(t, str_key_of_bytes(b"missing")) },
+                unsafe { alm_tbl_get_any_skey(t, str_key_of_bytes(b"missing")) },
                 0
             );
             // free per iteration: unit tests must not feed the exit-time
             // leak tripwire — sys_alloc_count() is a CI signal, not noise
-            unsafe { glm_tbl_free(t) };
+            unsafe { alm_tbl_free(t) };
         }
     }
 
@@ -1652,41 +1652,41 @@ mod strkey_tests {
     /// cell, no matter how a running program computed it.
     #[test]
     fn str_range_integers_drop_through_the_int_faces() {
-        let t = unsafe { glm_tbl_new(std::mem::size_of::<i128>(), 0) };
+        let t = unsafe { alm_tbl_new(std::mem::size_of::<i128>(), 0) };
         let forged = str_key_of_bytes(b"health");
         assert!(is_str_key(forged));
 
-        unsafe { glm_tbl_set_any(t, forged, glm_any_pack(3, 0x1234)) };
+        unsafe { alm_tbl_set_any(t, forged, alm_any_pack(3, 0x1234)) };
         assert_eq!(
-            unsafe { glm_tbl_len(t) },
+            unsafe { alm_tbl_len(t) },
             0,
             "a forged str-range int must not grow #t"
         );
         assert_eq!(
-            unsafe { glm_tbl_get_any_skey(t, str_key_of_bytes(b"health")) },
+            unsafe { alm_tbl_get_any_skey(t, str_key_of_bytes(b"health")) },
             0,
             "a forged str-range int must not create the record cell"
         );
         assert_eq!(
-            unsafe { glm_tbl_get_any(t, forged) },
+            unsafe { alm_tbl_get_any(t, forged) },
             0,
             "a forged str-range int reads the zero lane, not a cell"
         );
-        unsafe { glm_tbl_free(t) };
+        unsafe { alm_tbl_free(t) };
     }
 
     #[test]
     fn interned_strings_carry_their_key_in_the_prefix() {
-        let a = unsafe { glm_str_intern(b"player".as_ptr(), 6) };
-        let b = unsafe { glm_str_intern(b"player".as_ptr(), 6) };
+        let a = unsafe { alm_str_intern(b"player".as_ptr(), 6) };
+        let b = unsafe { alm_str_intern(b"player".as_ptr(), 6) };
         assert_eq!(a, b, "intern dedup within the process pool");
 
-        let key = unsafe { glm_str_key(a) };
+        let key = unsafe { alm_str_key(a) };
         assert!(is_str_key(key), "pooled strings carry negative str keys");
         assert_eq!(key, str_key_of_bytes(b"player"), "prefix cache == derive");
 
         // the handle stays a valid C-string: prefix is invisible to readers
-        assert_eq!(unsafe { glm_str_len(a) }, 6);
+        assert_eq!(unsafe { alm_str_len(a) }, 6);
         assert_eq!(unsafe { *a }, b'p');
     }
 

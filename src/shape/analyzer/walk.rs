@@ -126,7 +126,7 @@ impl Analyzer {
                         if matches!(expr, Expr::Field { .. } | Expr::Index { .. })
                             && matches!(bind.ty, Conflict)
                         {
-                            crate::glm_dbgln!(
+                            crate::alm_dbgln!(
                                 "[localdecl] '{}' bound to Conflict aliases={:?}",
                                 names[idx],
                                 bind.aliases
@@ -435,7 +435,7 @@ impl Analyzer {
                                     return Err(ShapeError(
                                         "Lifetime Error: cyclic row store — the row read \
                                          would be stored into a table that already contains \
-                                         it (glm's element types are finite)"
+                                         it (alm's element types are finite)"
                                             .to_string(),
                                     ));
                                 }
@@ -652,7 +652,7 @@ impl Analyzer {
                         .collect();
                     let line = self.stmt_lines.get(&(stmt as *const Stmt)).copied();
                     if matches!(expected_ty, Conflict) {
-                        crate::glm_dbgln!(
+                        crate::alm_dbgln!(
                             "[idxassign] line {line:?}: storing Conflict into sites {proj_bases:?} (vt={:?})",
                             vt
                         );

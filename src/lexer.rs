@@ -109,7 +109,7 @@ pub enum Token<'a> {
                 .count();
             panic!(
                 "line {line}: Lexer error: embedded NUL byte in string literal at byte {off} \
-                 — glm strings are NUL-terminated, so the literal would \
+                 — alm strings are NUL-terminated, so the literal would \
                  silently truncate at print time"
             );
         }

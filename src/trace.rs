@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 include!(concat!(env!("OUT_DIR"), "/trace_signals.rs"));
 
-const TRACE_FILE: &str = ".glm_trace.bin";
+const TRACE_FILE: &str = ".alm_trace.bin";
 pub const TRACE_RING_CAPACITY: u32 = 8192;
 const TRACE_FIRED_OFF: usize = 0;
 const TRACE_CAPACITY_OFF: usize = 4;
