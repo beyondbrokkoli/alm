@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use crate::trace::{
     TRACE_CORO_CLOSE, TRACE_CORO_DEAD, TRACE_CORO_RESUME, TRACE_CORO_SPAWN, TRACE_CORO_YIELD,
-    TRACE_CORO_YIELD_DROPPED, TRACE_FAIL_ANY_LEN, TRACE_FAIL_CORO_CREATE, TRACE_FAIL_DIV_ZERO,
-    TRACE_FAIL_FFI_LOAD, TRACE_FAIL_FFI_SYM, TRACE_FAIL_LEAK_DETECTED, TRACE_FAIL_NULL_ROW_STORE,
-    TRACE_RT_ALLOC, TRACE_RT_FFI_LOAD, TRACE_RT_FREE, TRACE_RT_FREE_CHILD, TRACE_RT_GROW_NULL,
-    TRACE_RT_RESERVE_NULL,
+    TRACE_CORO_YIELD_DROPPED, TRACE_FAIL_ANY_LEN, TRACE_FAIL_CORO_CREATE,
+    TRACE_FAIL_CORO_YIELD_RESERVED, TRACE_FAIL_DIV_ZERO, TRACE_FAIL_FFI_LOAD, TRACE_FAIL_FFI_SYM,
+    TRACE_FAIL_LEAK_DETECTED, TRACE_FAIL_NULL_ROW_STORE, TRACE_RT_ALLOC, TRACE_RT_FFI_LOAD,
+    TRACE_RT_FREE, TRACE_RT_FREE_CHILD, TRACE_RT_GROW_NULL, TRACE_RT_RESERVE_NULL,
 };
 
 #[repr(u8)]
@@ -80,7 +80,7 @@ unsafe extern "C" {
     fn vx_coro_create(lib: *mut c_void) -> i32;
     fn vx_coro_send(id: i32, a: u64, b: u64, c: u64);
     fn vx_coro_start(id: i32) -> i32;
-    fn vx_coro_pull(id: i32) -> i64;
+    fn vx_coro_pull(id: i32, done: *mut i32) -> i64;
     fn vx_coro_yield(value: u64) -> i64;
     fn vx_coro_status(id: i32) -> u32;
     fn vx_coro_join(id: i32);
@@ -1568,24 +1568,43 @@ pub unsafe extern "C" fn alm_coro_resume(co: i64, t: *mut AlmTable) -> i64 {
         }
         unsafe { vx_coro_send(id, lanes[0], lanes[1], lanes[2]) };
     }
-    let r = unsafe {
+    let mut done: i32 = 0;
+    let value = unsafe {
         vx_coro_start(id);
         alm_trace_set(TRACE_CORO_SPAWN);
-        vx_coro_pull(id)
+        vx_coro_pull(id, &mut done)
     };
+    // R12 — THE DRAIN-WORD LAW: the (value, done) pair crossed the seam;
+    // drained answers the reserved word i64::MIN, and EVERY other i64 —
+    // including -1, the old masquerader — is unambiguous data. The trace
+    // keys on the done bit, never on the value's sign (negative data is
+    // still a consumed packet).
     unsafe {
-        alm_trace_set(if r < 0 {
+        alm_trace_set(if done != 0 {
             TRACE_CORO_DEAD
         } else {
             TRACE_CORO_RESUME
         })
     };
-    r
+    if done != 0 { i64::MIN } else { value }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_coro_yield(value: i64) -> i64 {
     let r = unsafe { vx_coro_yield(value as u64) };
+    if r == -2 {
+        // R12: the reserved drain word may never enter the stream — a
+        // packet carrying it would masquerade as drain at the consumer.
+        // A loud, distinct death (the R9 discipline), never a silent
+        // swap or a polite drop that loses the worker's value.
+        unsafe { alm_trace_set(TRACE_FAIL_CORO_YIELD_RESERVED) };
+        eprintln!(
+            "alm fatal: coroutine.yield of {value} — the drain word (i64::MIN) is \
+             reserved: a drained lane answers it, and only a drained lane, at \
+             coroutine.resume; stream any other i64"
+        );
+        std::process::abort();
+    }
     unsafe {
         alm_trace_set(if r < 0 {
             TRACE_CORO_YIELD_DROPPED

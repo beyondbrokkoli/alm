@@ -12,11 +12,15 @@
    once, through the module's own alm_tbl_free), and flips the module's
    ExecSlot to FINISHED before exiting.
 
-   Data crosses threads ONLY as flat values:
-     host -> worker : the three LWW in_* cells (written before start)
-     worker -> host : RingPackets on ring lane == slot index
-                     (yield = acquire/spin/commit; resume = next/release)
-   No AlmTable pointer is ever shared across threads or heaps.
+    Data crosses threads ONLY as flat values:
+      host -> worker : the three LWW in_* cells (written before start)
+      worker -> host : RingPackets on ring lane == slot index
+                      (yield = acquire/spin/commit; resume = next/release)
+                      EOF never rides a packet: vx_coro_pull answers a
+                      (value, done) pair and vx_coro_yield refuses the
+                      reserved drain word (R12), so a payload of -1 is
+                      ordinary data at the consumer's face.
+    No AlmTable pointer is ever shared across threads or heaps.
 
    Lifecycle vs the exit report: vx_coro_quiesce() runs FIRST inside the
    substrate's atexit report — it sets the shutdown flag (a worker
@@ -175,9 +179,19 @@ EXPORT int32_t vx_coro_start(int32_t id) {
                : -1;
 }
 
-EXPORT int64_t vx_coro_pull(int32_t id) {
+/* R12 — THE DRAIN-WORD LAW at the substrate seam: the (value, done)
+ * pair. A packet's payload is ANY i64 (-1 included — the old encoding
+ * mistook it for EOF); EOF is the done bit alone. The complementary
+ * half lives in vx_coro_yield: the reserved drain word (i64::MIN,
+ * 0x8000000000000000) is refused before it can ride a packet, so the
+ * consumer-side encoding "resume answers i64::MIN ⟺ drained" is
+ * unforgeable by construction. */
+EXPORT int64_t vx_coro_pull(int32_t id, int32_t* done) {
     CoroSlot* co = coro_slot(id);
-    if (co == NULL) return -1;
+    if (co == NULL) {
+        if (done != NULL) *done = 1;
+        return 0;
+    }
     int spin = 0;
     for (;;) {
         int idx = vx_stream_next(id);
@@ -192,6 +206,7 @@ EXPORT int64_t vx_coro_pull(int32_t id) {
             co->held_idx = idx;
             RingPacket* p = vx_stream_packet(idx);
             int64_t value = (int64_t)p->a;
+            if (done != NULL) *done = 0;
             return value;
         }
         if (L(co->thread_done) == 1) {
@@ -206,14 +221,22 @@ EXPORT int64_t vx_coro_pull(int32_t id) {
                 vx_thread_join(co->thread);
             }
             coro_retire(co, VX_CORO_RUNNING);
-            return -1;
+            if (done != NULL) *done = 1;
+            return 0;
         }
-        if (L_R(g_coros.shutdown)) return -1; /* exit in flight */
+        if (L_R(g_coros.shutdown)) {
+            if (done != NULL) *done = 1; /* exit in flight */
+            return 0;
+        }
         vx_spin_wait(&spin);
     }
 }
 
 EXPORT int64_t vx_coro_yield(uint64_t value) {
+    /* checked before the lane test, so the refusal is observable on any
+     * thread (a dev-loop drive yields with no lane bound — the reserve
+     * is a spelling rule of the verb, not a lane-runtime rule) */
+    if (value == UINT64_C(0x8000000000000000)) return -2; /* the drain word */
     int32_t lane = t_coro_lane;
     if (lane < 0) return -1; /* outside a coroutine: dropped politely */
     CoroSlot* co = &g_coros.slots[lane];

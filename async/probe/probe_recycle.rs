@@ -5,15 +5,20 @@
 // (2) HONEST EXHAUSTION: with every lane genuinely live, one more
 //     create returns a DISTINCT -1 (the caller can test it); a lane
 //     never silently truncates.
+// (3) DRAIN-WORD RESERVE (R12): vx_coro_yield refuses i64::MIN with the
+//     distinct -2 (before the lane test, so the host thread observes
+//     it) — the word may never ride a packet, and drain is the done bit
+//     of vx_coro_pull's (value, done) pair, never the value's bits.
 // The substrate's idle-exit path (a NULL module) retires each thread
-// immediately, so drain == vx_coro_pull's -1.
+// immediately, so drain answers done=1.
 //
 // Build & run: ./build.sh && ./probe_recycle
 
 unsafe extern "C" {
     fn vx_coro_create(lib: *mut core::ffi::c_void) -> i32;
     fn vx_coro_start(id: i32) -> i32;
-    fn vx_coro_pull(id: i32) -> i64;
+    fn vx_coro_pull(id: i32, done: *mut i32) -> i64;
+    fn vx_coro_yield(value: u64) -> i64;
     fn vx_coro_status(id: i32) -> u32;
     fn vx_coro_join(id: i32);
 }
@@ -40,10 +45,12 @@ fn main() {
             failures += 1;
             continue;
         }
-        let drained = unsafe { vx_coro_pull(id) };
-        if drained != -1 {
+        let mut done: i32 = -1;
+        let drained = unsafe { vx_coro_pull(id, &mut done) };
+        if done != 1 || drained != 0 {
             eprintln!(
-                "FAIL cycle {cycle}: expected drained -1 from the idle lane, got {drained}"
+                "FAIL cycle {cycle}: expected drained done=1/value=0 from the idle lane, got \
+                 done={done} value={drained}"
             );
             failures += 1;
         }
@@ -87,8 +94,21 @@ fn main() {
         unsafe { vx_coro_join(id) };
     }
 
+    // (3) the drain word is reserved: the yield door refuses i64::MIN
+    // with the distinct -2 — on this host thread too, because the
+    // reserve is checked before the lane test (no lane is bound here)
+    let refused = unsafe { vx_coro_yield(0x8000_0000_0000_0000) };
+    if refused != -2 {
+        eprintln!(
+            "FAIL: yield of the drain word must answer the distinct -2, got {refused} (R12 \
+             regression — the word could masquerade as drain)"
+        );
+        failures += 1;
+    }
+
     if failures == 0 {
-        println!("probe_recycle: 8/8 lifetimes recycled, exhaustion distinct — GREEN");
+        println!("probe_recycle: 8/8 lifetimes recycled, exhaustion distinct, drain word \
+                  reserved — GREEN");
     } else {
         eprintln!("probe_recycle: {failures} failure(s)");
         std::process::exit(1);

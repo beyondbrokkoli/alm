@@ -107,8 +107,16 @@ void           vx_thread_join(vmath_thread_t thread);
 int32_t  vx_coro_create(void* lib);                       /* -> id or -1 */
 void     vx_coro_send(int32_t id, uint64_t a, uint64_t b, uint64_t c);
 int32_t  vx_coro_start(int32_t id);                       /* idempotent */
-int64_t  vx_coro_pull(int32_t id);                        /* blocking consume */
-int64_t  vx_coro_yield(uint64_t value);                   /* producer publish */
+/* R12 — the (value, done) pair: *done = 0 -> the return IS one streamed
+   packet's payload (any i64, -1 included); *done = 1 -> drained, closed,
+   or exit-in-flight (the value is 0 and meaningless). EOF lives in the
+   done bit at this seam, never in the value's bits. */
+int64_t  vx_coro_pull(int32_t id, int32_t* done);         /* blocking consume */
+/* producer publish: 0 published, -1 dropped (no lane bound on this
+   thread, abort flag, or shutdown), -2 REFUSED — value is the reserved
+   drain word (i64::MIN) and may never ride a RingPacket: only a drained
+   lane answers that encoding, and only at coroutine.resume's face */
+int64_t  vx_coro_yield(uint64_t value);
 uint32_t vx_coro_status(int32_t id);                      /* state word */
 void     vx_coro_join(int32_t id);                        /* wait + join */
 void     vx_coro_quiesce(void);                           /* exit-report pre-pass */
