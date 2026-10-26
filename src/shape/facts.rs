@@ -154,12 +154,12 @@ pub struct ShapeFacts {
     /// 2026-10-26): finish re-resolves every pair-keyed fact through
     /// the FINAL substitution store (`resolve_fn_defs_through_subs`,
     /// `resolve_recorded_facts`), so a fact recorded still-Unknown IS
-    /// rewindable by a later binding — the mechanism is real
-    /// (fn_ret_anchor_rewrite: a valueless definition's ret anchor,
-    /// recorded Unknown at insertion, rewritten Str by a later
-    /// assignment before finish resolves the recorded rets) — but
-    /// every path through the window converges on the ONE final
-    /// truth, so it cannot answer silently wrong. Four probes
+    /// rewindable by a later binding — the mechanism is real (R13's
+    /// probe matrix: a valueless definition's ret anchor, recorded
+    /// Unknown at insertion, rewritten by a later assignment before
+    /// finish resolves the recorded rets) — but every path through
+    /// the window converges on the ONE final truth, so it cannot
+    /// answer silently wrong. Four probes
     /// (2026-10-26) close it: (1) the store is MONOTONE with a
     /// single final truth — `unify` rejects a divergent second
     /// binding (the monomorphic argument/return laws, the elem unify
@@ -175,14 +175,20 @@ pub struct ShapeFacts {
     /// the monomorphic signature at the call, lane facts pin Unknown
     /// keys to Int AT the choke point, and the boundary seed resolves
     /// to the module-global truth uniformly (one face for every
-    /// expansion). (4) The one fact class recorded still-Unknown by
-    /// design — a valueless definition's ret — answers the rewritten
-    /// truth coherently: the inline materializes the bound face's
-    /// typed zero (the null through the Str face, i64 0 through Int),
-    /// never a miscoerced register. The window opens; the truth that
-    /// walks through it is still the one final truth. Resolving at
-    /// insertion would close the mechanism itself, but no divergence
-    /// exists to close — this note is the law, not a debt.
+    /// expansion). (4) The one fact class that WAS recorded
+    /// still-Unknown by design — a valueless definition's ret, R13's
+    /// witness shape — is now gated at the door (R15, owner ruling
+    /// 2026-10-26): consuming the result of an expansion with no
+    /// valued return rejects at the call
+    /// (`fn_valueless_call_rejected`); only the statement-position
+    /// procedure call remains, and nothing consumes its ret. A body
+    /// with ANY valued return still rides the law: its fall-off path
+    /// materializes the bound face's typed zero (the null through the
+    /// Str face, i64 0 through Int), never a miscoerced register. The
+    /// window opens; the truth that walks through it is still the one
+    /// final truth. Resolving at insertion would close the mechanism
+    /// itself, but no divergence exists to close — this note is the
+    /// law, not a debt.
     pub call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
     /// KEYING DISCIPLINE: same `(call expr, expansion site)` pairs as
     /// `call_defs` — the RESOLVED return type of that one expansion.

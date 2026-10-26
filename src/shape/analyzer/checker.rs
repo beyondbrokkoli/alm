@@ -168,6 +168,12 @@ pub(super) struct Checker {
     bare_sites: BTreeMap<(*const Stmt, Option<*const Expr>, String), usize>,
     boundary_elem: Option<Ty>,
     diagnostics: Vec<String>,
+    /// R15 (owner ruling 2026-10-26): true only while checking the
+    /// DIRECT call expression of a `Stmt::Expr` — the procedure form,
+    /// the one position where a valueless expansion may sit. The Call
+    /// arm takes (and clears) it before checking arguments, so nested
+    /// calls stay value positions.
+    stmt_position_call: bool,
 }
 
 impl Checker {
@@ -208,6 +214,7 @@ impl Checker {
             bare_sites: BTreeMap::new(),
             boundary_elem: None,
             diagnostics: Vec::new(),
+            stmt_position_call: false,
         }
     }
 
@@ -873,9 +880,15 @@ impl Checker {
                 }
             }
             Stmt::Expr { expr } => {
+                // R15: the whole-statement call is the procedure form —
+                // the one position a valueless expansion may occupy.
+                if matches!(expr, Expr::Call { .. }) {
+                    self.stmt_position_call = true;
+                }
                 if !self.check_ffi_verb(lat, expr)? {
                     let _ = self.check_expr(lat, expr)?;
                 }
+                self.stmt_position_call = false;
             }
             Stmt::Return { value } => match self.return_ctxs.last().cloned() {
                 Some(ReturnCtx::Boundary) => match value {
@@ -1625,6 +1638,7 @@ impl Checker {
                     ));
                 }
                 let mut arg_tys = Vec::with_capacity(args.len());
+                let stmt_position = std::mem::take(&mut self.stmt_position_call);
                 for a in args {
                     arg_tys.push(self.check_expr(lat, a)?);
                 }
@@ -1651,6 +1665,19 @@ impl Checker {
                 }
 
                 let body = unsafe { def.body() };
+
+                // R15 (owner ruling 2026-10-26): an expansion with NO
+                // valued return produces no value — consuming its result
+                // rejects; the statement position is the procedure form
+                // and stays legal. A body with ANY valued return is not
+                // valueless: its fall-off path answers the R13 typed zero
+                // by the Store Window Law.
+                if !stmt_position && !body_has_valued_return(body) {
+                    return Err(format!(
+                        "Type Error: '{name}' is an expansion with no return — \
+                         it produces no value"
+                    ));
+                }
 
                 // the per-instantiation fact key: the OUTERMOST expansion
                 // this call is checked inside (the call itself at no
@@ -1842,6 +1869,24 @@ fn types_compatible(l: &Ty, r: &Ty) -> bool {
         (Ty::Tbl(e1), Ty::Tbl(e2)) => types_compatible(e1, e2),
         _ => false,
     }
+}
+
+/// R15: does any statement of this body return a value? Statements
+/// only — a nested function literal's returns belong to its own
+/// definition, and expression positions cannot hold statements. The
+/// parser's desugared shapes (for → Do/While/If) are covered by the
+/// recursion, so a `return` inside any loop still counts.
+fn body_has_valued_return(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Return { value: Some(_) } => true,
+        Stmt::Do { body } | Stmt::While { body, .. } => body_has_valued_return(body),
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => body_has_valued_return(then_body) || body_has_valued_return(else_body),
+        _ => false,
+    })
 }
 
 pub(super) fn type_name(ty: &Ty) -> String {
