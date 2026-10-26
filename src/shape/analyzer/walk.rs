@@ -870,7 +870,7 @@ impl Analyzer {
                         .is_some_and(|&loop_entry| loop_entry > fn_entry)
                 {
                     return Err(ShapeError(
-                        "Type Error: 'break' cannot leave a function body — \
+                        "Type Error: 'break' cannot leave an expansion — \
                          write the break inside a loop of the same body"
                             .into(),
                     ));

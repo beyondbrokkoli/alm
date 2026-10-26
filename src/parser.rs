@@ -428,6 +428,25 @@ impl<'a> Parser<'a> {
                     }
                 } else if matches!(lhs, Expr::Call { .. }) {
                     Ok(Stmt::Expr { expr: lhs })
+                } else if let Expr::Identifier(name) = &lhs {
+                    if name == "continue" {
+                        // C3's named rejection: 'continue' parses as a
+                        // bare NAME, so the generic statement error used
+                        // to answer it. The dialect's loop verbs are
+                        // 'break' and the loop condition — name the word
+                        // (the for-step diagnostic's style).
+                        Err(ParseError(
+                            "Syntax Error: continue is not in the dialect — guard the \
+                             rest of the body with 'if' instead"
+                                .into(),
+                        ))
+                    } else {
+                        Err(ParseError(
+                            "Syntax Error: Expected '=' (assignment) or '()' (call) after \
+                             expression statement"
+                                .into(),
+                        ))
+                    }
                 } else {
                     Err(ParseError(
                         "Syntax Error: Expected '=' (assignment) or '()' (call) after \

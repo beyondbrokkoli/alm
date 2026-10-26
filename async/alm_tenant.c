@@ -137,7 +137,9 @@ EXPORT int32_t vx_exec_register(const char* name, uint32_t flags) {
             return (int32_t)i;
         }
     }
-    return -1; /* registry full: caller falls back to copy-local handling */
+    return -1; /* registry full: the caller degrades honestly — rt.rs keeps
+                * exec_id -1, pokes ride the anonymous 0xFF event tag,
+                * census mirrors skip (probe_tenant pins the distinct -1) */
 }
 
 EXPORT const char* vx_exec_name(int32_t id) {

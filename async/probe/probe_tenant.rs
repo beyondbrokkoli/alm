@@ -66,6 +66,66 @@ fn main() {
         "unwritten event must read NONE"
     );
 
+    unsafe extern "C" {
+        fn vx_str_intern(s: *const u8, len: usize) -> *const u8;
+    }
+
+    // R9 neighbor — the 9th exec register: VX_EXEC_MAX (8) is the
+    // ceiling, then a DISTINCT -1. rt.rs degrades honestly on it
+    // (exec_id stays -1, pokes ride the anonymous 0xFF event tag,
+    // census mirrors skip); the old "copy-local fallback" comment was
+    // fiction — this pin is the real contract.
+    while unsafe { vx_exec_register(c"filler.so".as_ptr(), 0x2) } >= 0 {}
+    assert_eq!(unsafe { vx_exec_count() }, 8, "registry ceiling is VX_EXEC_MAX");
+    assert_eq!(
+        unsafe { vx_exec_register(c"ninth.so".as_ptr(), 0x2) },
+        -1,
+        "the 9th register answers the distinct -1, never a silent reuse"
+    );
+    let before = unsafe { vx_trace_event_count() };
+    unsafe { vx_trace_poke_exec(-1, 77) };
+    assert_eq!(unsafe { vx_trace_fired(77) }, 1);
+    assert_eq!(
+        unsafe { vx_trace_event_get(before) },
+        (0xFFu32 << 8) | 77,
+        "an out-of-range exec id rides the anonymous tag"
+    );
+
+    // R9 neighbor — the chronology ring wraps at VX_TRACE_RING_CAP
+    // (8192): event_get(seq) reads ring[seq % CAP], so seq and seq+CAP
+    // alias one cell and the oldest events are overwritten FIFO, never
+    // staged elsewhere.
+    let base = unsafe { vx_trace_event_count() };
+    let cap: u64 = 8192;
+    for _ in 0..(cap + 9) {
+        unsafe { vx_trace_poke(55) };
+    }
+    let n = unsafe { vx_trace_event_count() };
+    assert_eq!(n, base + cap + 9);
+    assert_eq!(unsafe { vx_trace_event_get(n - 1) }, (0xFFu32 << 8) | 55);
+    assert_eq!(
+        unsafe { vx_trace_event_get(base) },
+        unsafe { vx_trace_event_get(base + cap) },
+        "seq and seq+CAP must read the same wrapped cell"
+    );
+
+    // R9 neighbor — str_pool: canonical dedup (one handle per byte
+    // sequence, ever) and the NULL guard. Malloc-failure propagation
+    // is the documented contract — pool_intern answers NULL at both
+    // allocation sites, never a partial or non-canonical pointer;
+    // failure cannot be injected here without a malloc shim, so the
+    // guard half is the pin.
+    let h1 = unsafe { vx_str_intern(b"probe_canonical".as_ptr(), 15) };
+    let h2 = unsafe { vx_str_intern(b"probe_canonical".as_ptr(), 15) };
+    assert!(!h1.is_null());
+    assert_eq!(h1, h2, "intern is canonical: same bytes, same handle");
+    assert!(
+        unsafe { vx_str_intern(std::ptr::null(), 0) }.is_null(),
+        "the NULL guard propagates NULL"
+    );
+
     unsafe { vx_exec_dump() };
     println!("probe_tenant: 3 execs registered, plate + ring verified");
+    println!("probe_tenant: 9th register -1 + anonymous tag, ring wrap at 8192, \
+              str_pool dedup — GREEN");
 }
