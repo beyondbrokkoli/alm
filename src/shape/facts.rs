@@ -88,6 +88,17 @@ pub struct ShapeFacts {
     pub boundary_elem: Option<Ty>,
     #[allow(dead_code)]
     pub layouts: Vec<LayoutVerdict>,
+    /// INVARIANCE ARGUMENT (fold d, B4) — the walk's structure family
+    /// (`free_sites` through `move_poisons` below): every one of these
+    /// maps records WHICH control edges and structural sites exist
+    /// (scope exits, keeps, temp sites, tag edges, poisons) — facts
+    /// about the AST's shape, not about types. They are recorded ONCE
+    /// by the walk at the definition and consumed per expansion by the
+    /// lowerer, which is sound because structure is
+    /// instantiation-INVARIANT: a body inlined at many call sites has
+    /// the same statements, the same scope tree, and the same exit
+    /// edges at every site. Nothing kind-flavored may join this family
+    /// without gaining the `(expr/stmt, expansion site)` key.
     pub free_sites: BTreeSet<*const Stmt>,
     pub free_keeps: BTreeMap<*const Stmt, Vec<Keep>>,
     pub do_exit_frees: BTreeMap<(*const Stmt, u8), Vec<DoExitFree>>,
@@ -112,7 +123,16 @@ pub struct ShapeFacts {
     pub name_dense: BTreeMap<(String, usize), bool>,
     pub stored_ctor_parents: BTreeSet<usize>,
     pub substitutions: BTreeMap<usize, Ty>,
-    pub local_types: BTreeMap<(*const Stmt, String), Ty>,
+    /// KEYING DISCIPLINE (B3, fold d): keyed by the triple
+    /// `(decl stmt, expansion site, name)` — the resolved type of ONE
+    /// expansion's bare declaration (`local x` with no value). The
+    /// site is the OUTERMOST expansion the declaration was checked
+    /// inside (None = the checker's top level, itself a single
+    /// site), derived exactly as the call-key sites are. Two
+    /// expansions of one body may close the same bare local
+    /// differently — each expansion lowers its own IR local, and this
+    /// key keeps each lowering on its own resolved truth.
+    pub local_types: BTreeMap<(*const Stmt, Option<*const Expr>, String), Ty>,
     pub row_reads: BTreeMap<usize, (String, usize)>,
     pub cell_children: BTreeMap<usize, BTreeSet<usize>>,
     pub fn_scope_keys: BTreeMap<*const Expr, (*const Stmt, u8)>,
@@ -129,6 +149,21 @@ pub struct ShapeFacts {
     /// and the lowerer lowers the identical AST in the identical order.
     /// Union consumers (fn_touched scans) must range over all sites of
     /// a call expr, never assume a single entry.
+    ///
+    /// THE RESIDUAL STORE WINDOW (fold d, B4 — stated, not closed):
+    /// finish re-resolves every pair-keyed fact through the FINAL
+    /// substitution store (`resolve_fn_defs_through_subs`,
+    /// `resolve_recorded_facts`). Per-site truth therefore survives
+    /// only when a fact was recorded already-concrete — the common
+    /// case (`call_rets` resolves at insertion; the access/key faces
+    /// clone the resolved elem/lane). The thin window that remains: a
+    /// fact recorded still-Unknown can be rewritten by a LATER
+    /// expansion's binding before finish resolves it. Reaching it
+    /// needs an operand type that is itself still-Unknown at
+    /// insertion (a bare declaration's node riding through an
+    /// argument), so it is not provably empty — a fold that wants it
+    /// CLOSED must resolve at insertion unconditionally, not at
+    /// finish.
     pub call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
     /// KEYING DISCIPLINE: same `(call expr, expansion site)` pairs as
     /// `call_defs` — the RESOLVED return type of that one expansion.
@@ -136,15 +171,33 @@ pub struct ShapeFacts {
     /// monomorphic law is per-definition); the resolved truth a call
     /// site's lowering consumes is per-instantiation, recorded here.
     pub call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
+    /// INVARIANCE ARGUMENT (fold d, B4) — why `ffi_verbs` needs NO
+    /// expansion-site key, unlike its checker-recorded neighbors: a
+    /// verb is (member name, base-type family); the member name is
+    /// fixed text in the AST node itself, and acceptance fixes the
+    /// family per expansion — if two expansions of one body both
+    /// accept the same dotted call, both resolved the SAME base-type
+    /// family, hence the same verb. A base that changed families
+    /// between sites would have been REJECTED in one expansion, and
+    /// acceptance is per-program. One expr, one verb, every site.
     pub ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
-    pub index_key_lanes: BTreeMap<*const Expr, KeyLane>,
-    /// The element face of one table access base, keyed by the base
-    /// expression: the checker's resolved elem, recorded at the access
-    /// choke points (`check_index_base` for bracket reads/writes, the
-    /// Field receiver arm for dot reads) and consumed straight by the
+    /// KEYING DISCIPLINE: same `(expr, expansion site)` pairs as
+    /// `call_defs` — the addressing lane of THIS one expansion's key.
+    /// The key expr may sit inside a body inlined at many call sites;
+    /// each expansion's lane is its own truth (a late-bound callee can
+    /// return an Integer at one site and a String at another).
+    pub index_key_lanes: BTreeMap<(*const Expr, *const Expr), KeyLane>,
+    /// KEYING DISCIPLINE: same `(expr, expansion site)` pairs as
+    /// `call_defs` — the element face of one table access base, per
+    /// expansion: recorded at the access choke points
+    /// (`check_index_base` for bracket reads/writes, the Field
+    /// receiver arm for dot reads) and consumed straight by the
     /// lowerer's Index/IndexAssign/Field faces, so the ctor's
-    /// allocation and every access face come from one decision.
-    pub access_elems: BTreeMap<*const Expr, Ty>,
+    /// allocation and every access face come from one decision. A
+    /// base reached in two expansions of one body may carry two faces
+    /// (a late-bound callee's return elem differs per site); the pair
+    /// key keeps each expansion's lowering on its own face.
+    pub access_elems: BTreeMap<(*const Expr, *const Expr), Ty>,
     pub stmt_lines: BTreeMap<*const Stmt, usize>,
     pub ctor_lines: Vec<usize>,
     #[allow(dead_code)]

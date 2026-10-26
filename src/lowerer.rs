@@ -629,6 +629,14 @@ impl<'a> IrLowerer<'a> {
         }))
     }
 
+    /// The per-instantiation half of the access/key fact keys, derived
+    /// exactly as the checker derives them (`fact_site` there): the
+    /// OUTERMOST expansion the current expression is being lowered
+    /// inside — the expression itself at no expansion.
+    fn fact_site(&self, expr: *const Expr) -> *const Expr {
+        self.expansion_sites.first().copied().unwrap_or(expr)
+    }
+
     /// Table keys: a String literal folds to its negative interned
     /// identity at COMPILE time (StrKeyConst — the whole point of
     /// hash-derived keys: zero runtime work for `t.x` / `t["x"]` /
@@ -652,7 +660,7 @@ impl<'a> IrLowerer<'a> {
         let lane = *self
             .shape
             .index_key_lanes
-            .get(&(key as *const Expr))
+            .get(&(key as *const Expr, self.fact_site(key as *const Expr)))
             .ok_or_else(|| {
                 LowerError(
                     "Lower Error: an index key carries no recorded lane — \
@@ -691,7 +699,7 @@ impl<'a> IrLowerer<'a> {
         let elem = self
             .shape
             .access_elems
-            .get(&(obj as *const Expr))
+            .get(&(obj as *const Expr, self.fact_site(obj as *const Expr)))
             .cloned()
             .ok_or_else(|| {
                 LowerError(
@@ -720,7 +728,11 @@ impl<'a> IrLowerer<'a> {
                     let ty = self
                         .shape
                         .local_types
-                        .get(&(stmt as *const Stmt, name.clone()))
+                        .get(&(
+                            stmt as *const Stmt,
+                            self.expansion_sites.first().copied(),
+                            name.clone(),
+                        ))
                         .cloned()
                         .ok_or_else(|| {
                             LowerError(

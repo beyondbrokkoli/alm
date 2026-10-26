@@ -36,7 +36,11 @@ pub(super) struct UnknownStore {
     /// construction; the checking half's seed reads this same node
     boundary_seed: Option<usize>,
     /// identity nodes for bare declarations (`local x` with no value),
-    /// anchored by the walk's LocalDecl arm
+    /// anchored by the walk's LocalDecl arm — the WALK's definition
+    /// view of one node per declaration. (The checker's truth is
+    /// per-expansion: it mints its own fresh node at each site's
+    /// declare — see `bare_sites` in checker.rs, the B3/fold-d
+    /// ruling. This map now feeds only the walk's own machinery.)
     bare_nodes: BTreeMap<(*const Stmt, String), usize>,
     /// return nodes for function definitions, anchored by `walk_fn_def`
     fn_ret_nodes: BTreeMap<*const Expr, usize>,
@@ -79,9 +83,11 @@ impl UnknownStore {
             .expect("the store construction mints the seed")
     }
 
-    /// The bare-declaration node for `(stmt, name)` — the walk's
-    /// LocalDecl arm anchors it; the checking half reads (or mints,
-    /// defensively) the same node.
+    /// The walk's definition-view node for one bare declaration
+    /// `(stmt, name)` — one per declaration across every pass. The
+    /// checker no longer reads this (per-expansion mints since B3,
+    /// fold d); the walk's LocalDecl arm anchors into it for its own
+    /// scope machinery.
     pub(super) fn ensure_bare_node(&mut self, stmt: &Stmt, name: &str) -> usize {
         let key = (stmt as *const Stmt, name.to_string());
         if let Some(&id) = self.bare_nodes.get(&key) {
@@ -90,10 +96,6 @@ impl UnknownStore {
         let id = self.mint_id();
         self.bare_nodes.insert(key, id);
         id
-    }
-
-    pub(super) fn bare_nodes(&self) -> &BTreeMap<(*const Stmt, String), usize> {
-        &self.bare_nodes
     }
 
     /// The return node for one function definition — anchored by

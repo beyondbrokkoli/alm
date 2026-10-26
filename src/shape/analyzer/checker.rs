@@ -103,13 +103,13 @@ pub(super) struct CheckCtx {
 /// assembly time. The substitutions are NOT here — they live in the
 /// lattice's `UnknownStore` and ride out of it at assembly.
 pub(super) struct CheckFacts {
-    pub local_types: BTreeMap<(*const Stmt, String), Ty>,
+    pub local_types: BTreeMap<(*const Stmt, Option<*const Expr>, String), Ty>,
     pub fn_defs: BTreeMap<*const Expr, FnDef>,
     pub call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
     pub call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
     pub ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
-    pub index_key_lanes: BTreeMap<*const Expr, KeyLane>,
-    pub access_elems: BTreeMap<*const Expr, Ty>,
+    pub index_key_lanes: BTreeMap<(*const Expr, *const Expr), KeyLane>,
+    pub access_elems: BTreeMap<(*const Expr, *const Expr), Ty>,
     pub boundary_elem: Option<Ty>,
     pub diagnostics: Vec<String>,
 }
@@ -154,9 +154,18 @@ pub(super) struct Checker {
     call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
     call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
     ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
-    index_key_lanes: BTreeMap<*const Expr, KeyLane>,
-    access_elems: BTreeMap<*const Expr, Ty>,
-    local_types: BTreeMap<(*const Stmt, String), Ty>,
+    index_key_lanes: BTreeMap<(*const Expr, *const Expr), KeyLane>,
+    access_elems: BTreeMap<(*const Expr, *const Expr), Ty>,
+    local_types: BTreeMap<(*const Stmt, Option<*const Expr>, String), Ty>,
+    /// the bare declarations the CHECKER declared, keyed
+    /// `(stmt, expansion site, name)` — the B3 (fold d) ruling: the
+    /// identity node is PER-EXPANSION (a fresh mint at each site's
+    /// declare; None = the checker's top level, itself a single
+    /// site). The walk's definition-view anchoring in the lattice's
+    /// own `bare_nodes` map is untouched — it feeds the walk's scope
+    /// machinery, not this truth. Finish resolves each node through
+    /// the final store into `local_types` under the same key.
+    bare_sites: BTreeMap<(*const Stmt, Option<*const Expr>, String), usize>,
     boundary_elem: Option<Ty>,
     diagnostics: Vec<String>,
 }
@@ -196,6 +205,7 @@ impl Checker {
             index_key_lanes: BTreeMap::new(),
             access_elems: BTreeMap::new(),
             local_types: BTreeMap::new(),
+            bare_sites: BTreeMap::new(),
             boundary_elem: None,
             diagnostics: Vec::new(),
         }
@@ -472,18 +482,18 @@ impl Checker {
 
     /// The closing resolution pass: the checker holds no scope entries,
     /// so what remains is resolving the recorded facts through
-    /// the final constraints — every bare declaration's local type (the
-    /// identity nodes are the lattice's, anchored by the walk's LocalDecl
-    /// arm) and every access-elem face (constraints bound later — the
+    /// the final constraints — every bare declaration's local type
+    /// (the checker's per-expansion identity nodes, B3's fresh mints)
+    /// and every access-elem face (constraints bound later — the
     /// boundary elem's seed-read pin, inlined-body unifications — must
     /// flow into them; the lowerer consumes the FINAL truth, not the
     /// mid-check snapshot).
     fn resolve_recorded_facts(&mut self, lat: &mut UnknownStore) {
-        for ((stmt, name), id) in lat.bare_nodes() {
-            let resolved = lat.resolve(&Ty::Unknown(*id));
-            self.local_types.insert((*stmt, name.clone()), resolved);
+        for ((stmt, site, name), id) in std::mem::take(&mut self.bare_sites) {
+            let resolved = lat.resolve(&Ty::Unknown(id));
+            self.local_types.insert((stmt, site, name), resolved);
         }
-        let resolved: Vec<(*const Expr, Ty)> = self
+        let resolved: Vec<((*const Expr, *const Expr), Ty)> = self
             .access_elems
             .iter()
             .map(|(&k, v)| (k, lat.resolve(v)))
@@ -697,10 +707,26 @@ impl Checker {
                     self.declare_var(lat, name.clone(), ty)?;
                 }
                 for name in &names[exprs.len()..] {
-                    // the identity node is the lattice's (anchored by the
-                    // walk's LocalDecl arm — one node per declaration,
-                    // minted during the fixpoint, read here)
-                    let id = lat.ensure_bare_node(stmt, name);
+                    // B3 (fold d), the owner ruling 2026-10-26: the bare
+                    // declaration's identity node is PER-EXPANSION — a
+                    // fresh mint at each site's declare (None = the
+                    // checker's top level, itself a single site). Each
+                    // expansion lowers its own IR local, so per-expansion
+                    // is the truth the lowerer already lives; two sites of
+                    // one body may close the same bare local differently
+                    // (fn_bare_local_divergent pins the flip). The walk's
+                    // definition-view anchoring stays in the lattice's own
+                    // map, untouched. Reads through a bare name still
+                    // reject via the nil-poison law per expansion — the
+                    // node only closes via assignment unification.
+                    let site = self.expansion_sites.first().copied();
+                    let node = lat.fresh();
+                    let id = match node {
+                        Ty::Unknown(id) => id,
+                        _ => unreachable!("fresh mints an Unknown node"),
+                    };
+                    self.bare_sites
+                        .insert((stmt as *const Stmt, site, name.clone()), id);
                     self.declare_var(lat, name.clone(), Ty::Unknown(id))?;
                 }
             }
@@ -884,6 +910,16 @@ impl Checker {
         Ok(())
     }
 
+    /// The per-instantiation half of the access/key fact keys: the
+    /// OUTERMOST expansion the current expression is being checked
+    /// inside — the expression itself when it sits at no expansion
+    /// (top level degenerates to `(expr, expr)`, mirroring the
+    /// call-site convention). Derived exactly as the Call arm derives
+    /// its pair keys; the lowerer mirrors this from its own stack.
+    fn fact_site(&self, expr: *const Expr) -> *const Expr {
+        self.expansion_sites.first().copied().unwrap_or(expr)
+    }
+
     fn check_index_base(
         &mut self,
         lat: &mut UnknownStore,
@@ -898,8 +934,9 @@ impl Checker {
                 // type-walk re-derivation was the elem seam (two views of
                 // one cell kind disagreeing on adoption-bridged names)
                 signal!(trace::TRACE_CHK_ELEM_FACE);
+                let site = self.fact_site(obj as *const Expr);
                 self.access_elems
-                    .insert(obj as *const Expr, (*elem).clone());
+                    .insert((obj as *const Expr, site), (*elem).clone());
                 Ok((*elem, desc))
             }
             _ => Err(format!(
@@ -939,14 +976,14 @@ impl Checker {
         // addressing lane from this fact rather than re-deriving it from
         // its own type walk of the key expression
         signal!(trace::TRACE_CHK_KEY_LANE);
-        self.index_key_lanes.insert(
-            key as *const Expr,
-            if key_ty == Ty::Str {
-                KeyLane::Str
-            } else {
-                KeyLane::Int
-            },
-        );
+        let lane = if key_ty == Ty::Str {
+            KeyLane::Str
+        } else {
+            KeyLane::Int
+        };
+        let site = self.fact_site(key as *const Expr);
+        self.index_key_lanes
+            .insert((key as *const Expr, site), lane);
         Ok(key_ty)
     }
 
@@ -1514,8 +1551,9 @@ impl Checker {
                         // a record read answers the table's elem — the
                         // same elem face fact the bracket accesses record
                         signal!(trace::TRACE_CHK_ELEM_FACE);
+                        let site = self.fact_site(obj.as_ref() as *const Expr);
                         self.access_elems
-                            .insert(obj.as_ref() as *const Expr, (*elem).clone());
+                            .insert((obj.as_ref() as *const Expr, site), (*elem).clone());
                         Ok(*elem)
                     }
                     other => Err(format!(
