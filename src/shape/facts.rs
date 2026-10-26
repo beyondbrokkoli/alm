@@ -119,6 +119,11 @@ pub struct ShapeFacts {
     pub arm_rebind_frees: BTreeMap<*const Stmt, Vec<ArmFreeEntry>>,
     pub arm_do_exit_frees: BTreeMap<(*const Stmt, u8), Vec<ArmFreeEntry>>,
     pub arm_root_exit_frees: Vec<ArmFreeEntry>,
+    /// (`move_poisons`: the names a statement moved FROM — the lowerer's
+    /// null_moves_of zeroes each source register AT the keyed statement,
+    /// so a moved binding can never be read or freed twice; the map is
+    /// structure (which names died where), the zeroing is
+    /// per-instantiation codegen at the site.)
     pub move_poisons: BTreeMap<*const Stmt, BTreeSet<String>>,
     pub name_dense: BTreeMap<(String, usize), bool>,
     pub stored_ctor_parents: BTreeSet<usize>,
