@@ -192,15 +192,17 @@ impl<'a> Parser<'a> {
             Some(Token::For) => {
                 // parse_stmt pushed one seq entry for the desugared Stmt::Do.
                 // record_stmt_lines consumes entries in AST pre-order, so the
-                // synthesized LocalDecl, While, and inner-body Do need their
-                // own entries BEFORE the body parses, and the synthetic
-                // i = i + 1 one after — all pointing at the for header,
-                // desugared code reports there.
+                // synthesized LocalDecls (counter, limit latch), While, and
+                // inner-body Do need their own entries BEFORE the body
+                // parses, and the synthetic i = i + 1 one after — all
+                // pointing at the for header, desugared code reports there.
                 let for_line = *self.stmt_line_seq.last().unwrap_or(&1);
                 let for_col = *self.stmt_col_seq.last().unwrap_or(&1);
                 self.stmt_line_seq.push(for_line);
                 self.stmt_line_seq.push(for_line);
                 self.stmt_line_seq.push(for_line);
+                self.stmt_line_seq.push(for_line);
+                self.stmt_col_seq.push(for_col);
                 self.stmt_col_seq.push(for_col);
                 self.stmt_col_seq.push(for_col);
                 self.stmt_col_seq.push(for_col);
@@ -218,6 +220,21 @@ impl<'a> Parser<'a> {
                 let start = self.parse_expr()?;
                 self.expect(Token::Comma)?;
                 let limit = self.parse_expr()?;
+                // Checked at the bound's own token so the reported line is
+                // the header, not the body's `end` (a float that arrives
+                // through a name still meets the checker's mixed-operand
+                // law at the same header line).
+                if matches!(start, Expr::Float(_)) || matches!(limit, Expr::Float(_)) {
+                    return Err(ParseError(
+                        "Syntax Error: for-loop bounds must be integers".into(),
+                    ));
+                }
+                if matches!(self.tokens.peek(), Some(Token::Comma)) {
+                    return Err(ParseError(
+                        "Syntax Error: for-step is not in the dialect — 'for i = a, b do' has start and limit only"
+                            .into(),
+                    ));
+                }
                 self.expect(Token::Do)?;
 
                 let mut body = Vec::new();
@@ -236,14 +253,21 @@ impl<'a> Parser<'a> {
                 }
 
                 // Desugar: for i = a, b do B end is half-open (a ..< b) and
-                // becomes Do[ local i = a, While i < b { Do[ B ]; i = i + 1 } ]
+                // becomes Do[ local i = a, local for$limit = b,
+                //              While i < for$limit { Do[ B ]; i = i + 1 } ]
                 // so the existing while phi/fill machinery handles everything.
-                // The user body rides its own inner scope: a `local i` in B
+                // The limit LATCHES: b evaluates once at entry, before the
+                // first test — a body that rebinds b's source name cannot
+                // move the bound mid-flight (the R7 law). `for$limit` is
+                // unspellable (identifiers are [a-zA-Z_][a-zA-Z0-9_]*), so
+                // user code cannot read, assign, or collide with it. The
+                // user body rides its own inner scope: a `local i` in B
                 // shadows the counter only inside B, so the synthetic
                 // increment after it still reaches the counter (without the
                 // wrap it would increment the shadow — an infinite loop).
                 // Analysis walks the desugared tree, so *const Stmt keys
                 // stay consistent.
+                let limit_slot = "for$limit".to_string();
                 let increment = Stmt::Assignment {
                     name: var.clone(),
                     expr: Expr::BinaryOp {
@@ -258,11 +282,15 @@ impl<'a> Parser<'a> {
                             names: vec![var.clone()],
                             exprs: vec![start],
                         },
+                        Stmt::LocalDecl {
+                            names: vec![limit_slot.clone()],
+                            exprs: vec![limit],
+                        },
                         Stmt::While {
                             condition: Expr::BinaryOp {
                                 op: BinOp::LessThan,
                                 left: Box::new(Expr::Identifier(var)),
-                                right: Box::new(limit),
+                                right: Box::new(Expr::Identifier(limit_slot)),
                             },
                             body: vec![Stmt::Do { body }, increment],
                         },
