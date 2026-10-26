@@ -764,13 +764,15 @@ fn get_base_identifier(expr: &Expr) -> Option<&String> {
     }
 }
 
-/// The ONE "not a function" diagnostic (R5's double-prefix closure):
-/// both halves print this exact text — whichever fires first. Post-F5
-/// sugar the wording carries no "anonymous" (a named `function f()` is
-/// the same binding).
+/// The ONE "not an expansion" diagnostic (R5's double-prefix closure;
+/// the Wordturn reworded it 2026-10-26 — the `function` KEYWORD stays,
+/// Lua source compatibility is the surface, but the machine's own
+/// text names the macro): both halves print this exact text —
+/// whichever fires first. Post-F5 sugar the wording carries no
+/// "anonymous" (a named `function f()` is the same binding).
 pub(super) fn not_a_function_msg(name: &str) -> String {
     format!(
-        "Type Error: '{name}' is not a function — only functions assigned \
+        "Type Error: '{name}' is not an expansion — only macros assigned \
          directly to variables are callable"
     )
 }
@@ -793,7 +795,7 @@ pub(super) fn dotted_callee(callee: &Expr) -> Option<String> {
 /// The ONE non-identifier-callee diagnostic, same discipline as
 /// `not_a_function_msg`.
 pub(super) fn calls_through_fn_var_msg() -> String {
-    "Type Error: calls go through a function variable — only functions \
+    "Type Error: calls go through a macro's name — only macros \
      assigned directly to variables are callable"
         .to_string()
 }

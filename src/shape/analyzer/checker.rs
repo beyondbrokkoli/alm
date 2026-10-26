@@ -1403,7 +1403,7 @@ impl Checker {
                 if self.resolves_to_fn(name) {
                     return Err(format!(
                         "Type Error: '{name}' is an expansion, not a value — \
-                         functions in alm have no runtime representation"
+                         macros in alm have no runtime representation"
                     ));
                 }
                 self.var_type(lat, name)
