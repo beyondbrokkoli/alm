@@ -144,17 +144,16 @@ impl Analyzer {
                 }
                 while sets.len() < names.len() {
                     signal!(rec.on(), trace::TRACE_BIND_SCALAR);
-                    // anchor the bare declaration's identity node in the
-                    // lattice's unknown store — the checking half's
-                    // declare reads (and, defensively, mints) the same
-                    // node, one per declaration across every pass. Bare
-                    // decls do NOT register in scalar_nodes: the
+                    // a bare declaration carries no walk-side identity
+                    // node since B3 (fold d): the checker mints a
+                    // fresh one PER EXPANSION at each site's declare
+                    // (`bare_sites`, checker.rs), and H8 (2026-10-26)
+                    // retired the lattice's definition-view
+                    // `bare_nodes` map — its ids had no readers left.
+                    // Bare decls do NOT register in scalar_nodes: the
                     // nil-poison law rejects every read through a bare
-                    // name before a use-site pin could fire, so the node
-                    // only ever closes via assignment unification.
-                    self.lattice
-                        .unknowns
-                        .ensure_bare_node(stmt, &names[sets.len()]);
+                    // name before a use-site pin could fire, so the
+                    // node only ever closes via assignment unification.
                     sets.push(TableShape {
                         ty: Pending,
                         layout: LayoutVerdict::default(),

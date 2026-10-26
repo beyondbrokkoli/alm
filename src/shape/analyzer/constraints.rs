@@ -1,12 +1,14 @@
 //! The unknown-constraint store — the lattice home of the checker's
 //! substitution algebra. Nominal unknown
-//! nodes — bare-declaration slots, the boundary `arg` seed, function
-//! return nodes, per-call parameter instances — are minted HERE, anchored
+//! nodes — the boundary `arg` seed, function return nodes, per-call
+//! parameter instances — are minted HERE, anchored
 //! by the lattice walk where it can see the structure (the boundary seed
-//! at lattice construction, bare slots in the LocalDecl arm, returns in
-//! `walk_fn_def`); everything the walk cannot anchor (call-site parameter
-//! instances, the dummy a function VALUE binds under) is minted through
-//! the same store by the checking half. Pins and unifications land as
+//! at lattice construction, returns in `walk_fn_def`); everything the
+//! walk cannot anchor (call-site parameter
+//! instances, the dummy a function VALUE binds under, and — since B3,
+//! fold d — every bare declaration's per-expansion identity node) is
+//! minted through the same store by the checking half. Pins and
+//! unifications land as
 //! substitutions in this ONE store — `resolve` is the query, `bind` and
 //! `unify` are the constraint ops, standing beside the elem lattice's
 //! `decide`. The assembled facts derive `substitutions` straight from
@@ -22,7 +24,7 @@
 //! the site and the node disciplines meet in this one store.
 
 use super::checker::type_name;
-use crate::ast::{Expr, Stmt};
+use crate::ast::Expr;
 use crate::shape::Ty;
 use alm_rt::{signal, trace};
 use std::collections::BTreeMap;
@@ -35,13 +37,6 @@ pub(super) struct UnknownStore {
     /// the boundary `arg` table's element node — minted once, at lattice
     /// construction; the checking half's seed reads this same node
     boundary_seed: Option<usize>,
-    /// identity nodes for bare declarations (`local x` with no value),
-    /// anchored by the walk's LocalDecl arm — the WALK's definition
-    /// view of one node per declaration. (The checker's truth is
-    /// per-expansion: it mints its own fresh node at each site's
-    /// declare — see `bare_sites` in checker.rs, the B3/fold-d
-    /// ruling. This map now feeds only the walk's own machinery.)
-    bare_nodes: BTreeMap<(*const Stmt, String), usize>,
     /// return nodes for function definitions, anchored by `walk_fn_def`
     fn_ret_nodes: BTreeMap<*const Expr, usize>,
     /// value nodes for function definitions — the dummy a function VALUE
@@ -59,7 +54,6 @@ impl UnknownStore {
             subs: BTreeMap::new(),
             next_id: usize::MAX,
             boundary_seed: None,
-            bare_nodes: BTreeMap::new(),
             fn_ret_nodes: BTreeMap::new(),
             fn_value_nodes: BTreeMap::new(),
         };
@@ -81,21 +75,6 @@ impl UnknownStore {
     pub(super) fn boundary_seed(&self) -> usize {
         self.boundary_seed
             .expect("the store construction mints the seed")
-    }
-
-    /// The walk's definition-view node for one bare declaration
-    /// `(stmt, name)` — one per declaration across every pass. The
-    /// checker no longer reads this (per-expansion mints since B3,
-    /// fold d); the walk's LocalDecl arm anchors into it for its own
-    /// scope machinery.
-    pub(super) fn ensure_bare_node(&mut self, stmt: &Stmt, name: &str) -> usize {
-        let key = (stmt as *const Stmt, name.to_string());
-        if let Some(&id) = self.bare_nodes.get(&key) {
-            return id;
-        }
-        let id = self.mint_id();
-        self.bare_nodes.insert(key, id);
-        id
     }
 
     /// The return node for one function definition — anchored by

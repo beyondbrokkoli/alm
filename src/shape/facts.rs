@@ -150,20 +150,39 @@ pub struct ShapeFacts {
     /// Union consumers (fn_touched scans) must range over all sites of
     /// a call expr, never assume a single entry.
     ///
-    /// THE RESIDUAL STORE WINDOW (fold d, B4 — stated, not closed):
-    /// finish re-resolves every pair-keyed fact through the FINAL
-    /// substitution store (`resolve_fn_defs_through_subs`,
-    /// `resolve_recorded_facts`). Per-site truth therefore survives
-    /// only when a fact was recorded already-concrete — the common
-    /// case (`call_rets` resolves at insertion; the access/key faces
-    /// clone the resolved elem/lane). The thin window that remains: a
-    /// fact recorded still-Unknown can be rewritten by a LATER
-    /// expansion's binding before finish resolves it. Reaching it
-    /// needs an operand type that is itself still-Unknown at
-    /// insertion (a bare declaration's node riding through an
-    /// argument), so it is not provably empty — a fold that wants it
-    /// CLOSED must resolve at insertion unconditionally, not at
-    /// finish.
+    /// THE STORE WINDOW LAW (fold d stated it; R13 closed it
+    /// 2026-10-26): finish re-resolves every pair-keyed fact through
+    /// the FINAL substitution store (`resolve_fn_defs_through_subs`,
+    /// `resolve_recorded_facts`), so a fact recorded still-Unknown IS
+    /// rewindable by a later binding — the mechanism is real
+    /// (fn_ret_anchor_rewrite: a valueless definition's ret anchor,
+    /// recorded Unknown at insertion, rewritten Str by a later
+    /// assignment before finish resolves the recorded rets) — but
+    /// every path through the window converges on the ONE final
+    /// truth, so it cannot answer silently wrong. Four probes
+    /// (2026-10-26) close it: (1) the store is MONOTONE with a
+    /// single final truth — `unify` rejects a divergent second
+    /// binding (the monomorphic argument/return laws, the elem unify
+    /// at every store), so a later binding can only CLOSE a recorded
+    /// Unknown, never contradict it. (2) Every consumer reads the
+    /// final truth — the finish passes rewrite the recorded faces and
+    /// the ctor's allocation derives from the same final elem, so
+    /// check-time acceptance, access face, and allocation are one
+    /// truth; a pre-binding runtime read answers the final elem's
+    /// zero. (3) A still-Unknown operand cannot ride into a fact: a
+    /// bare declaration's node rejects at the lifetime law before any
+    /// face could record it, a still-Unknown argument unifies against
+    /// the monomorphic signature at the call, lane facts pin Unknown
+    /// keys to Int AT the choke point, and the boundary seed resolves
+    /// to the module-global truth uniformly (one face for every
+    /// expansion). (4) The one fact class recorded still-Unknown by
+    /// design — a valueless definition's ret — answers the rewritten
+    /// truth coherently: the inline materializes the bound face's
+    /// typed zero (the null through the Str face, i64 0 through Int),
+    /// never a miscoerced register. The window opens; the truth that
+    /// walks through it is still the one final truth. Resolving at
+    /// insertion would close the mechanism itself, but no divergence
+    /// exists to close — this note is the law, not a debt.
     pub call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
     /// KEYING DISCIPLINE: same `(call expr, expansion site)` pairs as
     /// `call_defs` — the RESOLVED return type of that one expansion.

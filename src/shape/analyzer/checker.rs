@@ -161,10 +161,10 @@ pub(super) struct Checker {
     /// `(stmt, expansion site, name)` — the B3 (fold d) ruling: the
     /// identity node is PER-EXPANSION (a fresh mint at each site's
     /// declare; None = the checker's top level, itself a single
-    /// site). The walk's definition-view anchoring in the lattice's
-    /// own `bare_nodes` map is untouched — it feeds the walk's scope
-    /// machinery, not this truth. Finish resolves each node through
-    /// the final store into `local_types` under the same key.
+    /// site). The walk anchors no competing node (H8, 2026-10-26:
+    /// the lattice's definition-view `bare_nodes` map is retired —
+    /// its ids had no readers left). Finish resolves each node
+    /// through the final store into `local_types` under the same key.
     bare_sites: BTreeMap<(*const Stmt, Option<*const Expr>, String), usize>,
     boundary_elem: Option<Ty>,
     diagnostics: Vec<String>,
@@ -487,7 +487,11 @@ impl Checker {
     /// and every access-elem face (constraints bound later — the
     /// boundary elem's seed-read pin, inlined-body unifications — must
     /// flow into them; the lowerer consumes the FINAL truth, not the
-    /// mid-check snapshot).
+    /// mid-check snapshot). THE STORE WINDOW LAW (facts.rs, at
+    /// `call_defs`' keying note) is why this rewind is sound: the
+    /// store is monotone and every consumer reads this one final
+    /// truth, so a fact recorded still-Unknown can only be CLOSED by
+    /// a later binding, never contradicted.
     fn resolve_recorded_facts(&mut self, lat: &mut UnknownStore) {
         for ((stmt, site, name), id) in std::mem::take(&mut self.bare_sites) {
             let resolved = lat.resolve(&Ty::Unknown(id));
