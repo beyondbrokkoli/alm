@@ -190,7 +190,8 @@ pub(super) struct Checker {
     /// root exit (the tag-physics of arm frees is walk-planned; envs
     /// are compiler-minted) — creations live in straight-line scope.
     /// The census factories create at the ctor-return; the bound is
-    /// documented in the archived W3a closure record (V1 rows).
+    /// documented in the archived W3a closure record (V1 rows) and
+    /// pinned by escape_cond_mint_rejected.
     cond_depth: usize,
     ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
     index_key_lanes: BTreeMap<(*const Expr, *const Expr), KeyLane>,
@@ -922,7 +923,10 @@ impl Checker {
                     // a captured TABLE binding is the env's own — the
                     // move already happened at the mint; a rebind inside
                     // the body has no affine home (census verdict: mutate
-                    // cells, or rebind in the defining scope)
+                    // cells, or rebind in the defining scope). Pinned by
+                    // escape_captured_table_rebind_rejected (the capture
+                    // must be below top level — top-level names stay
+                    // late reads, P3, and rebind freely).
                     if matches!(expected, Ty::Tbl(_)) {
                         return Err(format!(
                             "Type Error: '{name}' is a captured table — it cannot be \
@@ -1147,6 +1151,8 @@ impl Checker {
     /// (top level degenerates to `(expr, expr)`, mirroring the
     /// call-site convention). Derived exactly as the Call arm derives
     /// its pair keys; the lowerer mirrors this from its own stack.
+    /// Pinned at depth two by fn_nested_site_keys (an expansion inside
+    /// an expansion: key lane, elem face, closure-call env).
     fn fact_site(&self, expr: *const Expr) -> *const Expr {
         self.expansion_sites.first().copied().unwrap_or(expr)
     }
@@ -1624,7 +1630,10 @@ impl Checker {
     /// W3a, R3's record-face read half: does the obj's ctor pin this
     /// field to a closure singleton? V1 bound: the receiver must be a
     /// walk-visible (top-level) name — table identity IS the alias
-    /// sites, and only the walk's binding view carries them.
+    /// sites, and only the walk's binding view carries them. A
+    /// block-local receiver answers no singleton and the dotted call
+    /// falls to the module-surface reject — pinned by
+    /// escape_block_local_dispatch_rejected.
     fn closure_field_fn(&self, obj: &Expr, field: &str) -> Option<*const Expr> {
         let Expr::Identifier(n) = obj else {
             return None;
@@ -1643,7 +1652,12 @@ impl Checker {
 
     /// W3a, W3-R5 (the Data Transfer Contract): does this table-valued
     /// expr carry a closure field? Such a table may not cross a module
-    /// boundary — the env pointer is this module's heap state.
+    /// boundary — the env pointer is this module's heap state. All
+    /// three faces pinned: the return by escape_no_crossing, the drive
+    /// and spawn faces by the property harness
+    /// (w3a_crossing_faces_reject_on_both_drive_and_spawn — they sit
+    /// behind the driver's exe-only gate, out of the .so corpus's
+    /// reach).
     fn carries_closure(&self, expr: &Expr) -> bool {
         if let Expr::Identifier(n) = expr
             && let Some(bind) = self.snap.binds.get(n)
@@ -1757,6 +1771,35 @@ impl Checker {
                                 "Type Error: mixed table constructor elements — {} after {}",
                                 type_name(&ty),
                                 type_name(&elem)
+                            ));
+                        }
+                    }
+                }
+                // W3a, R3's field-kind rule (the pin-owed register, census
+                // §3 cluster B row 18, closed 2026-10-27): a closure
+                // record's cells are 8-byte scalars — when any field pins
+                // a closure singleton, the non-closure elem must be one
+                // 8-byte kind (Int/Flt/Str) or nothing. The elem join
+                // does NOT reject the rest as conflicts by itself: a Bool
+                // or table cell (or an Int/Flt mix joining to Any) beside
+                // a closure field mis-sizes the 8-byte record — the
+                // runtime's "no register cell face" abort and, for table
+                // cells, an untracked second free of the nested header.
+                // Pinned by escape_record_bool_field_rejected and
+                // escape_record_table_field_rejected.
+                let has_closure_field = self
+                    .ctx
+                    .sites
+                    .get(&(expr as *const Expr))
+                    .is_some_and(|s| self.closure_fields.keys().any(|(cs, _)| cs == s));
+                if has_closure_field {
+                    match lat.resolve(&elem) {
+                        Ty::Int | Ty::Flt | Ty::Str | Ty::Unknown(_) | Ty::Pending => {}
+                        other => {
+                            return Err(format!(
+                                "Type Error: a closure record's non-closure fields are 8-byte \
+                                 scalars (Int/Flt/Str) — its element type is {}",
+                                type_name(&other)
                             ));
                         }
                     }

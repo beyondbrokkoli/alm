@@ -31,6 +31,11 @@
 //! pin-free — a body-local pin would leak module-global facts the
 //! checker never made (the seed's `boundary_elem`, row-read sites in
 //! `check_row_reads`).
+//!
+//! The subset discipline is pinned differentially: with the lever off
+//! (`analyze_with(ctx, false)`), the checker's pins alone must
+//! reproduce the byte-identical pipeline output —
+//! `walk_pins_are_a_pure_subset_over_the_corpus`.
 
 use super::*;
 
@@ -190,7 +195,7 @@ impl Analyzer {
     /// elem kind through `boundary_elem`, row-read sites through
     /// `check_row_reads`).
     fn pins_armed(&self, rec: Gate) -> bool {
-        rec.on() && self.fn_walk.is_empty()
+        rec.on() && self.walk_pins && self.fn_walk.is_empty()
     }
 
     // ---- the computed-scalar discipline (recorded pass, top level) ----

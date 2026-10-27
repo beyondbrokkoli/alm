@@ -5,6 +5,8 @@ mod helpers;
 mod ty;
 
 pub use self::analyzer::analyze;
+#[cfg(test)]
+pub use self::analyzer::analyze_with;
 pub use self::core::*;
 pub use self::facts::*;
 #[allow(unused_imports)]

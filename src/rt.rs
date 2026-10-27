@@ -1730,4 +1730,32 @@ mod strkey_tests {
         assert!(is_str_key(k1));
         assert!(!is_str_key(-1) && !is_str_key(-42) && !is_str_key(5));
     }
+
+    /// The null-handle sentinel face (the pin-owed register, census §3
+    /// cluster D row 30): an unset String cell reads 0 (total-read
+    /// philosophy), and `alm_str_key` answers -1 — negative but NOT a
+    /// str key (top two bits 11, not 10) — so a store through it
+    /// no-ops like any other negative index and a read answers the
+    /// zero lane. Answering 0 would alias array slot 0; answering
+    /// STR_KEY_TAG would alias every null string onto one overflow
+    /// cell. (strkey_repr_chokepoints exercises this end-to-end; this
+    /// is the ABI-level pin.)
+    #[test]
+    fn null_handle_answers_minus_one_and_stores_noop() {
+        assert_eq!(unsafe { alm_str_key(std::ptr::null()) }, -1);
+        assert!(!is_str_key(-1));
+        let t = unsafe { alm_tbl_new(std::mem::size_of::<i128>(), 0) };
+        unsafe { alm_tbl_set_any(t, -1, alm_any_pack(3, 0x1234)) };
+        assert_eq!(
+            unsafe { alm_tbl_len(t) },
+            0,
+            "a store through the null-key sentinel must no-op"
+        );
+        assert_eq!(
+            unsafe { alm_tbl_get_any(t, 0) },
+            0,
+            "array slot 0 must stay untouched (answering 0 would alias it)"
+        );
+        unsafe { alm_tbl_free(t) };
+    }
 }

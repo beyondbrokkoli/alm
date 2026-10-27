@@ -116,7 +116,9 @@ pub enum Stmt {
 /// One definition, two gates that must agree: the lowerer's fill
 /// conversion and the analyzer's Dense promotion both refuse loops whose
 /// own body carries a break — a fill loop's body must run to the guard's
-/// completion, so a break out of it invalidates the reserve.
+/// completion, so a break out of it invalidates the reserve. Pinned by
+/// fill_break_two_gates (one loop per path in one lock: the converted
+/// twin carries the reserve, the break twin the checked stores).
 pub fn has_break(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
         Stmt::Break => true,

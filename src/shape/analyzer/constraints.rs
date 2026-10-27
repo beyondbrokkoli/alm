@@ -112,6 +112,13 @@ impl UnknownStore {
         self.fn_value_nodes.get(&fn_ptr).copied()
     }
 
+    /// Read-only view of the minter's head (the id-space census in
+    /// `analyze_with` checks the down-counting families' headroom
+    /// against the row ghosts growing up).
+    pub(super) fn next_id(&self) -> usize {
+        self.next_id
+    }
+
     pub(super) fn take_subs(&mut self) -> BTreeMap<usize, Ty> {
         std::mem::take(&mut self.subs)
     }

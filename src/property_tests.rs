@@ -107,7 +107,15 @@ impl Stage {
 /// inside a phase are caught and reported as their own stage — the
 /// compiler must diagnose, never crash.
 fn compile(source: &str) -> Result<String, (Stage, Vec<String>)> {
-    match std::panic::catch_unwind(AssertUnwindSafe(|| compile_inner(source))) {
+    compile_with(source, true)
+}
+
+/// The differential leg's entry (the pin-owed register, census §3
+/// cluster A): `walk_pins = false` routes the analyzer through
+/// `analyze_with(ctx, false)`, disarming the walk's use-site pins so
+/// only the checker's own land — the subset discipline's A/B leg.
+fn compile_with(source: &str, walk_pins: bool) -> Result<String, (Stage, Vec<String>)> {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| compile_inner_with(source, walk_pins))) {
         Ok(r) => r,
         Err(payload) => {
             let msg = payload
@@ -121,6 +129,10 @@ fn compile(source: &str) -> Result<String, (Stage, Vec<String>)> {
 }
 
 fn compile_inner(source: &str) -> Result<String, (Stage, Vec<String>)> {
+    compile_inner_with(source, true)
+}
+
+fn compile_inner_with(source: &str, walk_pins: bool) -> Result<String, (Stage, Vec<String>)> {
     let mut tokens = Vec::new();
     let mut offsets = Vec::new();
     let mut lexer = lexer::Token::lexer(source);
@@ -143,7 +155,7 @@ fn compile_inner(source: &str) -> Result<String, (Stage, Vec<String>)> {
             None => break,
         }
     }
-    compile_tokenized(source, tokens.into_iter().zip(offsets).collect())
+    compile_tokenized_with(source, tokens.into_iter().zip(offsets).collect(), walk_pins)
 }
 
 /// The pipeline from a pre-lexed token stream — the token-soup fuzz leg
@@ -152,6 +164,17 @@ fn compile_inner(source: &str) -> Result<String, (Stage, Vec<String>)> {
 fn compile_tokenized(
     source: &str,
     tokens: Vec<(lexer::Token<'_>, usize)>,
+) -> Result<String, (Stage, Vec<String>)> {
+    compile_tokenized_with(source, tokens, true)
+}
+
+/// The pipeline from a pre-lexed token stream — the token-soup fuzz leg
+/// feeds mutated token vectors in here directly (offsets stay valid
+/// byte indices of the same source, so diagnostics remain sound).
+fn compile_tokenized_with(
+    source: &str,
+    tokens: Vec<(lexer::Token<'_>, usize)>,
+    walk_pins: bool,
 ) -> Result<String, (Stage, Vec<String>)> {
     let wrap = |r: Result<String, (Stage, Vec<String>)>| r;
     match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -171,7 +194,7 @@ fn compile_tokenized(
 
         // one walk: the analyzer's recorded pass IS the checker — its
         // diagnostics cover both halves
-        let shape = shape::analyze(&ctx);
+        let shape = shape::analyze_with(&ctx, walk_pins);
         if !shape.diagnostics.is_empty() {
             return Err((Stage::Analyze, shape.diagnostics));
         }
@@ -1246,6 +1269,158 @@ fn str_key_derives_agree_across_the_abi() {
         words.len(),
         corpus_literals
     );
+}
+
+/// THE SUBSET DISCIPLINE'S DIFFERENTIAL LEG (the pin-owed register,
+/// census §3 cluster A rows 1/2/3/6/7/8 + cluster D row 25): every
+/// walk-side pin is a documented SUBSET of the pin the checker's own
+/// discipline would land at the same site — "a walk pin and the
+/// checker pin it preempts bind the same resolved head to the same
+/// scalar; the final store, and every fact derived from it, is
+/// identical" (pins.rs). Violation is silent by nature (both halves
+/// run, only the store's contents differ), so the pin is differential:
+/// with the lever off, the checker's pins alone must reproduce the
+/// byte-identical `.ll` on acceptance and the identical diagnostics on
+/// rejection — over the whole corpus and the generated programs.
+#[test]
+fn walk_pins_are_a_pure_subset_over_the_corpus() {
+    let mut bases: Vec<(String, String)> = Vec::new(); // (label, source)
+    let mut rng = Rng::new(0xA11_5EED);
+    for i in 0..16 {
+        let (source, _) = gen_program(&mut rng);
+        bases.push((format!("generated#{i}"), source));
+    }
+    let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
+    let entries = std::fs::read_dir(&cases_dir).unwrap_or_else(|e| {
+        panic!(
+            "property_tests: failed to read corpus directory {}: {e}",
+            cases_dir.display()
+        )
+    });
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".lua"))
+        .collect();
+    names.sort();
+    for name in &names {
+        if let Ok(source) = std::fs::read_to_string(cases_dir.join(name)) {
+            bases.push((name.clone(), source));
+        }
+    }
+    assert!(
+        bases.len() > 16,
+        "the differential leg only found {} base programs — cases/ vanished?",
+        bases.len()
+    );
+
+    let mut accepted = 0usize;
+    for (label, source) in &bases {
+        match (compile_with(source, true), compile_with(source, false)) {
+            (Ok(on), Ok(off)) => {
+                accepted += 1;
+                assert_eq!(
+                    on, off,
+                    "walk pins changed the emitted IR for {label} — the subset discipline broke"
+                );
+            }
+            (Err((stage_on, diags_on)), Err((stage_off, diags_off))) => {
+                assert_eq!(
+                    stage_on.name(),
+                    stage_off.name(),
+                    "walk pins changed the rejecting stage for {label}"
+                );
+                assert_eq!(
+                    diags_on, diags_off,
+                    "walk pins changed the diagnostics for {label} — the subset discipline broke"
+                );
+            }
+            (on, off) => {
+                panic!(
+                    "walk pins flipped acceptance for {label}:\n  pins on : {}\n  pins off: {}",
+                    match &on {
+                        Ok(_) => "accepted".to_string(),
+                        Err((s, d)) => format!("{}: {}", s.name(), d.join("; ")),
+                    },
+                    match &off {
+                        Ok(_) => "accepted".to_string(),
+                        Err((s, d)) => format!("{}: {}", s.name(), d.join("; ")),
+                    }
+                );
+            }
+        }
+    }
+    assert!(
+        accepted >= 10,
+        "only {accepted}/{} differential bases reached the lowerer — the accepted leg \
+         was never exercised",
+        bases.len()
+    );
+    eprintln!(
+        "walk-pin differential: {} bases, {accepted} accepted (byte-identical .ll)",
+        bases.len()
+    );
+}
+
+/// W3a's Data Transfer Contract, drive and spawn faces (the pin-owed
+/// register, census §3 cluster B row 19): a closure-carrying table may
+/// not cross a module boundary — the env pointer is this module's heap
+/// state. The `return` face is pinned by escape_no_crossing; the drive
+/// call and coroutine.resume faces live behind the exe-only gate in
+/// the driver (main.rs refuses the ffi surface in .so mode before
+/// analysis runs), so the in-process pipeline — which owns the TYPE
+/// discipline, not the packaging policy — is their pin home.
+#[test]
+fn w3a_crossing_faces_reject_on_both_drive_and_spawn() {
+    let drive_face = r#"
+        local ffi = require("ffi")
+        ffi.cdef("void* alm_exec(void*);")
+        local lib = ffi.load(arg[0])
+        local function Tick() return 1 end
+        local pkt = { step = Tick, seed = 3 }
+        lib.alm_exec(pkt)
+    "#;
+    let spawn_face = r#"
+        local coroutine = require("coroutine")
+        local ffi = require("ffi")
+        ffi.cdef("void* alm_exec(void*);")
+        local lib = ffi.load(arg[0])
+        local co = coroutine.create(lib)
+        local function Tick() return 1 end
+        local pkt = { step = Tick, seed = 3 }
+        coroutine.resume(co, pkt)
+    "#;
+    for (label, source, needle) in [
+        (
+            "drive",
+            drive_face,
+            "a closure cannot cross a module boundary — the drive table marshals flat \
+             cells only",
+        ),
+        (
+            "spawn",
+            spawn_face,
+            "a closure cannot cross a module boundary — the spawn table marshals flat \
+             cells only",
+        ),
+    ] {
+        match compile(source) {
+            Err((Stage::Analyze, diags)) => {
+                assert!(
+                    diags.iter().any(|d| d.contains(needle)),
+                    "the {label} face rejected with the wrong text: {}",
+                    diags.join("; ")
+                );
+            }
+            other => panic!(
+                "the {label} crossing face did not reject at analysis: {}",
+                match other {
+                    Ok(_) => "accepted".to_string(),
+                    Err((s, d)) => format!("{}: {}", s.name(), d.join("; ")),
+                }
+            ),
+        }
+    }
 }
 
 fn indent(source: &str) -> String {

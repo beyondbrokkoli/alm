@@ -513,6 +513,7 @@ impl<'a> Parser<'a> {
     /// Unlike has_break, assignments to the loop variable are rejected even
     /// from nested While bodies (they still mutate the outer loop var), and a
     /// LocalDecl of the same name shadows it for the rest of its block.
+    /// Pinned by for_var_nested_while_rejected.
     fn body_assigns_to(stmts: &[Stmt], var: &str) -> bool {
         for s in stmts {
             match s {
@@ -904,6 +905,7 @@ impl<'a> Parser<'a> {
         // Record field identity: a named key and a literal-string expr key
         // name the same field, so both dedupe through one set. (A dynamic
         // expr key's type is the checker's call — see its TableCtor arm.)
+        // Pinned by ctor_dup_key_spellings_rejected.
         let mut names: BTreeSet<String> = BTreeSet::new();
         let mut next_pos: i64 = 0;
         loop {

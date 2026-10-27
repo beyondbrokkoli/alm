@@ -409,6 +409,31 @@ impl<'a> IrLowerer<'a> {
     }
 
     fn emit_root_frees(&mut self) -> Result<(), LowerError> {
+        // W3a (the pin-owed register, census §3 cluster B row 17): an
+        // env is never one of their keeps — the analyzer's keep
+        // computation has no env concept, so nothing structural
+        // verifies it; a keep naming an env register would exempt it
+        // from the deep free it still needs (a leak). The census fires
+        // in debug/test builds at the one site where envs and keeps
+        // meet: the root tail, after every mint, before the env frees.
+        for f in &self.shape.root_exit_frees {
+            for k in &f.keeps {
+                if let Keep::Name(n) = k {
+                    let local = self.read_var(n)?;
+                    let reg = ptr_of(local.reg).map_err(|_| {
+                        LowerError(format!(
+                            "Lower Error: borrower '{n}' planned as a keep holds a \
+                             non-pointer register — the analyzer and the lowerer disagree"
+                        ))
+                    })?;
+                    debug_assert!(
+                        !self.env_regs.iter().any(|e| e.id == reg.id),
+                        "an env register rode a root free's keeps — the env's one \
+                         owner is its mint"
+                    );
+                }
+            }
+        }
         self.emit_frees(&self.shape.root_exit_frees)?;
         let arms = self.shape.arm_root_exit_frees.clone();
         for e in &arms {
@@ -2198,8 +2223,13 @@ impl<'a> IrLowerer<'a> {
                 // W3a, R3: which fields carry closure faces — their
                 // stores ride the Ptr lane and the table's own cells go
                 // 8-byte (a closure record's non-closure fields must be
-                // Int/Flt/Str; the checker's elem join already rejects
-                // the rest as conflicts)
+                // Int/Flt/Str; the checker's R3 field-kind rule rejects
+                // the rest at the ctor — pinned by
+                // escape_record_bool_field_rejected and
+                // escape_record_table_field_rejected, folded 2026-10-27
+                // after the elem join was shown NOT to reject them: a
+                // Bool/Any cell aborted at runtime on the mis-sized
+                // record, a table cell double-freed)
                 let has_closure_fields = entries.iter().any(|(k, _)| match k {
                     CtorKey::Str(n) => ctor_site
                         .is_some_and(|s| self.shape.closure_fields.contains_key(&(s, n.clone()))),

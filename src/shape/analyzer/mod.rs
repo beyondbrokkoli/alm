@@ -332,6 +332,9 @@ struct Analyzer {
     holds: HoldsState,
     reads: ReadSideState,
     layout: LayoutFactsState,
+    /// the differential lever (see `analyze_with`): false disarms the
+    /// walk-side use-site pins so only the checker's own land.
+    walk_pins: bool,
     stmt_lines: BTreeMap<*const Stmt, usize>,
     ctor_lines: Vec<usize>,
     fn_rets: Vec<Option<TableShape>>,
@@ -370,8 +373,20 @@ struct Analyzer {
 }
 
 pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
+    analyze_with(ctx, true)
+}
+
+/// The differential leg's lever (the pin-owed register, census §3
+/// cluster A row 3): the walk's use-site pins are a documented SUBSET
+/// of the checker's own — with the lever off, the checker's pins
+/// alone must land the identical constraint store, hence the
+/// identical facts, hence the identical pipeline output. The property
+/// harness asserts exactly that over the whole corpus and the
+/// generated programs (`walk_pins_are_a_pure_subset_over_the_corpus`).
+pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
     let n = ctx.sites.len();
     let mut a = Analyzer {
+        walk_pins,
         walk: WalkState {
             scopes: vec![boundary_root_scope()],
             fn_scopes: vec![BTreeMap::new()],
@@ -548,7 +563,21 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
         fn_captures: a.fn_captures.clone(),
     });
     let mut checker_ran = elems_diags.is_empty();
+    // The interleaving pin (census §3 cluster A row 1): the checker's
+    // pre-statement snapshot must read the walk's UNCHANGED post-state
+    // of the previous statement — nothing walks between the two
+    // snapshots, and the walk runs one statement ahead of the checker.
+    // A driver that walked first would hand the checker a post-walk
+    // snapshot where a pre-walk one is due, and this census fires.
+    let mut last_post: Option<Vec<BTreeMap<String, TableShape>>> = None;
+    let mut walk_completed = true;
     for stmt in ctx.ast {
+        if let Some(post) = &last_post {
+            debug_assert_eq!(
+                a.walk.scopes, *post,
+                "the interleaving broke: the walk moved between the checker's snapshots"
+            );
+        }
         chk.snapshot_pre(&a.walk, &a.holds.moved_severed);
         if let Err(err) = a.walk_stmt(rec, stmt) {
             signal!(rec.on(), trace::TRACE_GHOST_BAIL);
@@ -558,9 +587,11 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
                 None => err.0,
             });
             checker_ran = false;
+            walk_completed = false;
             break;
         }
         chk.snapshot_post(&a.walk, &a.holds.moved_severed);
+        last_post = Some(a.walk.scopes.clone());
         if checker_ran && let Err(msg) = chk.check_stmt(&mut a.lattice.unknowns, stmt) {
             signal!(trace::TRACE_GHOST_BAIL_CHECKER);
             if msg.contains("disagree") {
@@ -573,9 +604,34 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
             });
             // a top-level checker error stops the walk, but the closing
             // moves still run — the standalone pass did the same
+            walk_completed = false;
             break;
         }
     }
+    // The reproduction pin (census §3 cluster A row 2): the recorded
+    // pass reproduces the fixpoint's final scope state — that is what
+    // convergence means, and it is the whole soundness of computing
+    // `adopt_lines`/`static_elems` from the fixpoint's end before the
+    // recorded pass runs. Gated on a clean walk: a rejected program
+    // stops mid-stream by design.
+    if walk_completed {
+        debug_assert_eq!(
+            a.walk.scopes, prev_end,
+            "the recorded pass diverged from the fixpoint's converged end state"
+        );
+    }
+    // The id-space census (census §3 cluster C row 21): the four id
+    // families — real site ids 0..n, static-elem ghosts counting DOWN
+    // from ROW_GHOST_FLOOR, row ghosts counting UP from
+    // ROW_GHOST_FLOOR+1, unknown nodes counting DOWN from usize::MAX.
+    // The two ghost families are disjoint BY CONSTRUCTION (floor-
+    // adjacent, growing apart); the one genuinely approaching pair is
+    // row ghosts ↑ vs the unknown-node minter ↓ — the census is their
+    // headroom check.
+    debug_assert!(
+        a.lattice.row_ghost_next <= a.lattice.unknowns.next_id() + 1,
+        "id-space exhausted: row ghosts crossed the unknown-node minter"
+    );
     if checker_ran {
         chk.finish(&mut a.lattice.unknowns);
     }
