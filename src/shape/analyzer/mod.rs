@@ -356,6 +356,16 @@ struct Analyzer {
     /// defining-scope chain snapshot taken at its definition walk (see
     /// `walk_fn_def`). Read by the checking half's call resolution.
     fn_def_sites: BTreeMap<*const Expr, BTreeMap<String, Option<*const Expr>>>,
+    /// W3a's capture sets (the invariance argument lives HERE, fold d
+    /// B4 style): per fn literal, the enclosing-scope (below-top-level)
+    /// non-fn names its body transitively reads. WHICH names a body
+    /// captures is AST-structural (the chain snapshot plus the body's
+    /// transitive free names, nested literals as holes), hence
+    /// instantiation-INVARIANT — recorded once by the walk at the
+    /// definition, consumed by the checking half (env faces, capture
+    /// guard). The CELL TYPES are per-instantiation checker territory
+    /// (`env_faces`).
+    fn_captures: BTreeMap<*const Expr, BTreeSet<String>>,
     loop_scope_entries: Vec<usize>,
 }
 
@@ -452,6 +462,7 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
         fn_walk: Vec::new(),
         fn_scope_entries: Vec::new(),
         fn_def_sites: BTreeMap::new(),
+        fn_captures: BTreeMap::new(),
         loop_scope_entries: Vec::new(),
     };
 
@@ -466,6 +477,7 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
         a.walk.prov = vec![BTreeMap::new()];
         a.walk.scalar_nodes = vec![BTreeMap::new()];
         a.fn_def_sites.clear();
+        a.fn_captures.clear();
         a.walk_stmts(None, ctx.ast);
         let end = a.walk.scopes.clone();
         let stable = end == prev_end && !a.walk.changed;
@@ -533,6 +545,7 @@ pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
         sites: a.lattice.sites.clone(),
         elems: static_elems.clone(),
         fn_def_sites: a.fn_def_sites.clone(),
+        fn_captures: a.fn_captures.clone(),
     });
     let mut checker_ran = elems_diags.is_empty();
     for stmt in ctx.ast {
@@ -743,6 +756,10 @@ impl Recorded {
             arm_root_exit_frees: self.own.arm_root_exit_frees,
             fn_touched: BTreeMap::new(),
             fn_defs: self.chk.fn_defs,
+            env_faces: self.chk.env_faces,
+            creation_envs: self.chk.creation_envs,
+            closure_calls: self.chk.closure_calls,
+            closure_fields: self.chk.closure_fields,
             call_defs: self.chk.call_defs,
             call_rets: self.chk.call_rets,
             ffi_verbs: self.chk.ffi_verbs,
@@ -764,16 +781,16 @@ fn get_base_identifier(expr: &Expr) -> Option<&String> {
     }
 }
 
-/// The ONE "not an expansion" diagnostic (R5's double-prefix closure;
-/// the Wordturn reworded it 2026-10-26 — the `function` KEYWORD stays,
-/// Lua source compatibility is the surface, but the machine's own
-/// text names the macro): both halves print this exact text —
-/// whichever fires first. Post-F5 sugar the wording carries no
-/// "anonymous" (a named `function f()` is the same binding).
-pub(super) fn not_a_function_msg(name: &str) -> String {
+/// W3a's value-call diagnostic: a callee name that is neither an
+/// expansion nor a closure value (a plain scalar/table read in call
+/// position). The old text claimed values are never callable; the
+/// closure value is. Both halves would print this exact text —
+/// whichever fires first (post-W3a the walk tolerates value calls, so
+/// the checker owns the reject).
+pub(super) fn value_call_msg(name: &str) -> String {
     format!(
-        "Type Error: '{name}' is not an expansion — only macros assigned \
-         directly to variables are callable"
+        "Type Error: '{name}' is not an expansion — a call through a value \
+         needs a closure"
     )
 }
 

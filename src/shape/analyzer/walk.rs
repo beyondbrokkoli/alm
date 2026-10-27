@@ -52,6 +52,19 @@ impl Analyzer {
     }
 
     pub(super) fn walk_stmt(&mut self, rec: Gate, stmt: &Stmt) -> Result<(), ShapeError> {
+        // W3a's creation sever (the Env Law's move half, walk side): a
+        // fn name read as a VALUE in this statement is a creation site
+        // — the read closure's TABLE captures move into the env HERE,
+        // exactly as `local u = t` moves at its own statement. It runs
+        // BEFORE the statement's own walk so every free plan this
+        // statement makes (the Return arm's ret-path frees, the scope
+        // exits) already sees the moved marker — a capture never frees
+        // with its dying scope.
+        self.sever_creation_captures(rec, stmt);
+        self.walk_stmt_inner(rec, stmt)
+    }
+
+    fn walk_stmt_inner(&mut self, rec: Gate, stmt: &Stmt) -> Result<(), ShapeError> {
         match stmt {
             Stmt::LocalDecl { names, exprs } => {
                 let mut sets = Vec::with_capacity(names.len());

@@ -1,4 +1,229 @@
 use super::*;
+
+/// W3a: the creation-read scanner — fn names in VALUE positions of one
+/// statement (argument, operand, record field, assigned/rhs, returned).
+/// The call-callee identifier is NOT a value read (it resolves through
+/// the expansion maps, P1); nested fn literals are not entered (their
+/// own bodies' statements sever when the walk reaches them).
+fn collect_creation_reads_stmt(stmt: &Stmt, out: &mut Vec<String>) {
+    match stmt {
+        Stmt::LocalDecl { exprs, .. } => {
+            for expr in exprs {
+                collect_creation_reads_expr(expr, out);
+            }
+        }
+        Stmt::Assignment { expr, .. } => collect_creation_reads_expr(expr, out),
+        Stmt::IndexAssign { obj, key, value } => {
+            collect_creation_reads_expr(obj, out);
+            collect_creation_reads_expr(key, out);
+            collect_creation_reads_expr(value, out);
+        }
+        Stmt::While { condition, body } => {
+            collect_creation_reads_expr(condition, out);
+            for s in body {
+                collect_creation_reads_stmt(s, out);
+            }
+        }
+        Stmt::Do { body } => {
+            for s in body {
+                collect_creation_reads_stmt(s, out);
+            }
+        }
+        Stmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            collect_creation_reads_expr(condition, out);
+            for s in then_body.iter().chain(else_body.iter()) {
+                collect_creation_reads_stmt(s, out);
+            }
+        }
+        Stmt::Return { value } => {
+            if let Some(e) = value {
+                collect_creation_reads_expr(e, out);
+            }
+        }
+        Stmt::Print { exprs } => {
+            for e in exprs {
+                collect_creation_reads_expr(e, out);
+            }
+        }
+        Stmt::Expr { expr } => collect_creation_reads_expr(expr, out),
+        Stmt::Break => {}
+    }
+}
+
+fn collect_creation_reads_expr(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Identifier(n) => out.push(n.clone()),
+        Expr::TableCtor(entries) => {
+            for (k, v) in entries {
+                if let CtorKey::Expr(ke) = k {
+                    collect_creation_reads_expr(ke, out);
+                }
+                collect_creation_reads_expr(v, out);
+            }
+        }
+        Expr::Index { obj, key } => {
+            collect_creation_reads_expr(obj, out);
+            collect_creation_reads_expr(key, out);
+        }
+        Expr::Field { obj, .. } => collect_creation_reads_expr(obj, out),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_creation_reads_expr(left, out);
+            collect_creation_reads_expr(right, out);
+        }
+        Expr::UnaryOp { expr, .. } => collect_creation_reads_expr(expr, out),
+        Expr::Call { callee, args } => {
+            if !matches!(callee.as_ref(), Expr::Identifier(_)) {
+                collect_creation_reads_expr(callee, out);
+            }
+            for a in args {
+                collect_creation_reads_expr(a, out);
+            }
+        }
+        Expr::Function { .. } => {}
+        Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::Boolean(_)
+        | Expr::String(_)
+        | Expr::Nil
+        | Expr::SysAllocCount
+        | Expr::SysExecCount
+        | Expr::FfiModule
+        | Expr::CoroModule => {}
+    }
+}
+
+/// W3a: the transitive free-name collector — one pass over statements,
+/// accumulating each body's own declarations into `bound` as they bind,
+/// so a use sees only the names lexically live at its position. Nested
+/// fn literals are HOLES: their params and body-locals bind inside the
+/// hole (the hole's frees bubble up to THIS level's set — the
+/// intermediate closure must capture what its nested literals read
+/// from further out), and their bodies are walked, so frees two or
+/// more levels up still surface here.
+fn transitive_free_names(stmts: &[Stmt], bound: &mut BTreeSet<String>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for stmt in stmts {
+        free_of_stmt(stmt, bound, &mut out);
+    }
+    out
+}
+
+fn free_of_stmt(stmt: &Stmt, bound: &mut BTreeSet<String>, out: &mut BTreeSet<String>) {
+    match stmt {
+        Stmt::LocalDecl { names, exprs } => {
+            for expr in exprs {
+                free_of_expr(expr, bound, out);
+            }
+            for name in names {
+                bound.insert(name.clone());
+            }
+        }
+        Stmt::Assignment { name, expr } => {
+            free_of_expr(expr, bound, out);
+            if !bound.contains(name) {
+                out.insert(name.clone());
+            }
+        }
+        Stmt::IndexAssign { obj, key, value } => {
+            free_of_expr(obj, bound, out);
+            free_of_expr(key, bound, out);
+            free_of_expr(value, bound, out);
+        }
+        Stmt::While { condition, body } => {
+            free_of_expr(condition, bound, out);
+            for s in body {
+                free_of_stmt(s, bound, out);
+            }
+        }
+        Stmt::Do { body } => {
+            for s in body {
+                free_of_stmt(s, bound, out);
+            }
+        }
+        Stmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            free_of_expr(condition, bound, out);
+            let mut then_bound = bound.clone();
+            for s in then_body {
+                free_of_stmt(s, &mut then_bound, out);
+            }
+            let mut else_bound = bound.clone();
+            for s in else_body {
+                free_of_stmt(s, &mut else_bound, out);
+            }
+        }
+        Stmt::Return { value } => {
+            if let Some(e) = value {
+                free_of_expr(e, bound, out);
+            }
+        }
+        Stmt::Print { exprs } => {
+            for e in exprs {
+                free_of_expr(e, bound, out);
+            }
+        }
+        Stmt::Break => {}
+        Stmt::Expr { expr } => free_of_expr(expr, bound, out),
+    }
+}
+
+fn free_of_expr(expr: &Expr, bound: &BTreeSet<String>, out: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Identifier(n) => {
+            if !bound.contains(n) {
+                out.insert(n.clone());
+            }
+        }
+        Expr::Integer(_) | Expr::Float(_) | Expr::Boolean(_) | Expr::String(_) | Expr::Nil => {}
+        Expr::TableCtor(entries) => {
+            for (k, v) in entries {
+                if let CtorKey::Expr(ke) = k {
+                    free_of_expr(ke, bound, out);
+                }
+                free_of_expr(v, bound, out);
+            }
+        }
+        Expr::Index { obj, key } => {
+            free_of_expr(obj, bound, out);
+            free_of_expr(key, bound, out);
+        }
+        Expr::Field { obj, .. } => free_of_expr(obj, bound, out),
+        Expr::BinaryOp { left, right, .. } => {
+            free_of_expr(left, bound, out);
+            free_of_expr(right, bound, out);
+        }
+        Expr::UnaryOp { expr, .. } => free_of_expr(expr, bound, out),
+        Expr::Call { callee, args } => {
+            // the callee is a NAME read, not a value read — a free
+            // callee resolves through the expansion maps at each site
+            // (P1 discipline); only the args are value positions
+            if !matches!(callee.as_ref(), Expr::Identifier(_)) {
+                free_of_expr(callee, bound, out);
+            }
+            for a in args {
+                free_of_expr(a, bound, out);
+            }
+        }
+        Expr::Function { params, body } => {
+            // the hole: its params bind inside it, its body's frees
+            // bubble up to the enclosing level's set
+            let mut hole = bound.clone();
+            hole.extend(params.iter().cloned());
+            for s in body {
+                free_of_stmt(s, &mut hole, out);
+            }
+        }
+        Expr::SysAllocCount | Expr::SysExecCount | Expr::FfiModule | Expr::CoroModule => {}
+    }
+}
+
 impl Analyzer {
     pub(super) fn resolve_fn(&self, name: &str) -> Option<*const Expr> {
         for scope in self.walk.fn_scopes.iter().rev() {
@@ -51,7 +276,23 @@ impl Analyzer {
                 chain.insert(n.clone(), *p);
             }
         }
-        self.fn_def_sites.insert(fn_ptr, chain);
+        self.fn_def_sites.insert(fn_ptr, chain.clone());
+        // W3a's walk-side capture set (the invariance argument lives at
+        // `fn_captures` in facts.rs): the body's TRANSITIVE free names —
+        // nested literals walk as holes, their frees bubble up, so a
+        // name only a nested literal uses still captures here — that
+        // resolve through the defining-scope chain to a NON-FN binding
+        // (None marks one). Top-level names stay late reads (P3); fn
+        // names stay expansion-map territory (the capture guard at the
+        // call arm owns them).
+        let mut bound = BTreeSet::new();
+        bound.extend(params.iter().cloned());
+        let free = transitive_free_names(body, &mut bound);
+        let captures: BTreeSet<String> = free
+            .into_iter()
+            .filter(|n| chain.get(n) == Some(&None))
+            .collect();
+        self.fn_captures.insert(fn_ptr, captures);
         // anchor the function's return node in the lattice's unknown
         // store — the checking half's bind_function reads the same node
         self.lattice.unknowns.ensure_fn_ret(fn_ptr);
@@ -81,6 +322,14 @@ impl Analyzer {
                     },
                 );
             }
+            // W3a: params ride the fn scope as NON-FN shadows (None) —
+            // a nested literal's defining-scope chain (and capture set)
+            // must see them: a param is an enclosing-scope capture like
+            // any local (P4's `scale` is the canonical case).
+            let fns = an.walk.fn_scopes.last_mut().unwrap();
+            for p in params {
+                fns.insert(p.clone(), None);
+            }
             an.walk_stmts(rec, body);
             if let Err(err) = an.decide_scope_exit(rec, key) {
                 result = Err(err);
@@ -101,6 +350,56 @@ impl Analyzer {
             self.fn_ret_shapes.insert(fn_ptr, shape);
         }
         result
+    }
+
+    pub(super) fn sever_creation_captures(&mut self, rec: Gate, stmt: &Stmt) {
+        // W3a: collect this statement's fn names read as VALUES (the
+        // creation positions — mirror of the checker's escape set),
+        // then sever each read closure's TABLE captures: the binding
+        // becomes the MOVED marker (later reads reject through the
+        // moved poison law), the sites ride moved_severed (the
+        // name's type slot survives for adoption), and the recorded
+        // pass books the poison in move_poisons so the lowerer zeroes
+        // the source registers at this statement. Scalars copy at
+        // mint and never sever.
+        let mut readers = Vec::new();
+        collect_creation_reads_stmt(stmt, &mut readers);
+        if readers.is_empty() {
+            return;
+        }
+        let mut severed: Vec<(usize, String)> = Vec::new();
+        for name in readers {
+            let Some(ptr) = self.resolve_fn(&name) else {
+                continue;
+            };
+            let Some(caps) = self.fn_captures.get(&ptr).cloned() else {
+                continue;
+            };
+            for cap in caps {
+                if let Ok((d, bind)) = self.resolve(rec, &cap)
+                    && matches!(bind.ty, Tbl(_))
+                    && !severed.iter().any(|(_, n)| n == &cap)
+                {
+                    severed.push((d, cap));
+                }
+            }
+        }
+        if severed.is_empty() {
+            return;
+        }
+        for (d, cap) in &severed {
+            self.poison_moved(*d, cap);
+        }
+        if rec.on() {
+            let entry = self
+                .own
+                .move_poisons
+                .entry(stmt as *const Stmt)
+                .or_default();
+            for (_, cap) in &severed {
+                entry.insert(cap.clone());
+            }
+        }
     }
 
     pub(super) fn return_reaches_param(&self, expr: &Expr, params: &[String]) -> BTreeSet<usize> {

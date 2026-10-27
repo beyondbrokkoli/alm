@@ -4,8 +4,8 @@ mod bridges;
 
 use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp, has_break};
 use crate::ir::{
-    AnyReg, BasicBlock, BlockId, Bool, DbgBind, Instruction, Int, IrProgram, Ptr, Reg, RegId,
-    RegKind, SourceLoc, TableKey, Terminator, repr_of,
+    AnyReg, BasicBlock, BlockId, Bool, CellRepr, DbgBind, Instruction, Int, IrProgram, Ptr, Reg,
+    RegId, RegKind, SourceLoc, TableKey, Terminator, repr_of,
 };
 use crate::shape::{
     ArmFreeEntry, DoExitFree, FfiVerb, Keep, KeyLane, LayoutVerdict, ShapeFacts, TagSrc, Ty,
@@ -33,6 +33,9 @@ pub fn boundary_elem_of(elem: Ty) -> alm_rt::AlmElem {
         Ty::Any => alm_rt::AlmElem::Any,
         Ty::Int | Ty::Tbl(_) | Ty::Unknown(_) => alm_rt::AlmElem::Integer,
         Ty::Ffi | Ty::FfiLib | Ty::Coro => alm_rt::AlmElem::Integer,
+        // a closure never rides the boundary (W3-R5's reject pin) —
+        // the boundary elem fact is scalar-only by construction
+        Ty::Closure(_) => unreachable!("a closure never rides the boundary elem"),
         // the boundary elem fact is a resolved checker value — flow
         // state never rides the artifact path
         Ty::Pending | Ty::Conflict => unreachable!("flow state never rides the artifact path"),
@@ -125,6 +128,46 @@ pub struct IrLowerer<'a> {
     /// a break inside an expansion may only bind a loop of its OWN
     /// body, never the caller's (whose ctx would sit below the base).
     expansion_break_bases: Vec<usize>,
+    /// W3a: the per-statement env mint memo — every closure created by
+    /// ONE statement shares ONE env (sibling sharing, L3); the memo
+    /// resets at each statement lowering. `stored` guards the union:
+    /// a later creation in the same statement only stores its
+    /// not-yet-stored captures.
+    env_memo: Option<EnvMemo>,
+    /// W3a: every minted env — freed at ROOT exit (W3-R1: module
+    /// lifetime; the deep free reclaims boxes and moved tables).
+    env_regs: Vec<Reg<Ptr>>,
+    /// W3a: per ACTIVE call-through expansion — the env register and
+    /// the face (capture name → cell type). Captures materialize as
+    /// ordinary vars at entry; scalar rebinds write the box back.
+    env_ctxs: Vec<EnvCtx>,
+    /// the statement currently lowering (the env memo's key).
+    cur_stmt: Option<*const Stmt>,
+}
+
+/// W3a's env representation: a strkey table whose EVERY cell is a
+/// table pointer — captured tables ride their own headers, captured
+/// scalars ride one-cell dense boxes of their own elem (the runtime's
+/// deep free chases only pointer cells, so a mixed env must keep
+/// every cell pointer-shaped; boxes carry contains_tables=0 and are
+/// freed as headers, their scalar payloads never chased).
+struct EnvMemo {
+    stmt: *const Stmt,
+    reg: Reg<Ptr>,
+    stored: BTreeSet<String>,
+}
+
+struct EnvCtx {
+    reg: Reg<Ptr>,
+    faces: BTreeMap<String, Ty>,
+}
+impl Clone for EnvCtx {
+    fn clone(&self) -> Self {
+        EnvCtx {
+            reg: self.reg,
+            faces: self.faces.clone(),
+        }
+    }
 }
 
 impl<'a> IrLowerer<'a> {
@@ -153,6 +196,10 @@ impl<'a> IrLowerer<'a> {
             inline_stack: Vec::new(),
             expansion_sites: Vec::new(),
             expansion_break_bases: Vec::new(),
+            env_memo: None,
+            env_regs: Vec::new(),
+            env_ctxs: Vec::new(),
+            cur_stmt: None,
         }
     }
 
@@ -353,6 +400,13 @@ impl<'a> IrLowerer<'a> {
         let arms = self.shape.arm_root_exit_frees.clone();
         for e in &arms {
             self.emit_arm_free(e)?;
+        }
+        // W3a, W3-R1: envs live to root exit. The deep free reclaims
+        // the whole tree — boxes and moved-in tables alike — after the
+        // name-carried frees (an env is never one of their keeps).
+        let envs = std::mem::take(&mut self.env_regs);
+        for env in envs {
+            self.emit(Instruction::TableFree { table: env });
         }
         Ok(())
     }
@@ -714,6 +768,10 @@ impl<'a> IrLowerer<'a> {
 
     fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), LowerError> {
         self.cur_loc = self.stmt_locs.get(&(stmt as *const Stmt)).copied();
+        // W3a: one env per creation statement (sibling sharing) — the
+        // memo resets at every statement lowering
+        self.env_memo = None;
+        self.cur_stmt = Some(stmt as *const Stmt);
         match stmt {
             Stmt::LocalDecl { names, exprs } => {
                 let mut bindings = Vec::with_capacity(exprs.len());
@@ -764,7 +822,7 @@ impl<'a> IrLowerer<'a> {
                             });
                             AnyReg::Bool(Reg::new(reg_id))
                         }
-                        Ty::Tbl(_) | Ty::Unknown(_) | Ty::Str => {
+                        Ty::Tbl(_) | Ty::Unknown(_) | Ty::Str | Ty::Closure(_) => {
                             self.emit(Instruction::LoadNull {
                                 target: Reg::new(reg_id),
                             });
@@ -907,6 +965,9 @@ impl<'a> IrLowerer<'a> {
                     }
                 }
                 self.update_var(name, actual_reg, ty, layout)?;
+                // W3a: a captured scalar's rebind writes the env box —
+                // later calls (and siblings) read it back (L3)
+                self.env_write_back(name, actual_reg)?;
                 self.null_moves_of(stmt)?;
                 self.emit_stmt_temp_frees(stmt);
             }
@@ -1390,6 +1451,9 @@ impl<'a> IrLowerer<'a> {
                 }
                 self.emit_frees(&frees)?;
                 self.emit_stmt_temp_frees(stmt);
+                // W3a: the creation sever's poison (a ctor return that
+                // moved captures into the env zeroes the sources here)
+                self.null_moves_of(stmt)?;
                 self.terminate(Terminator::Jump(exit));
                 self.current_block = self.new_block();
             }
@@ -1673,6 +1737,179 @@ impl<'a> IrLowerer<'a> {
         }
     }
 
+    /// W3a's ENV MINT (the Env Law, lower half): one env per creation
+    /// statement — every cell a table pointer (captured tables direct,
+    /// captured scalars in one-cell boxes of their own elem), so the
+    /// root-exit deep free is sound on the whole tree at once. Tables
+    /// MOVE in (the sources poison through the walk-booked
+    /// move_poisons — the existing move law); scalars copy at mint.
+    fn mint_env(&mut self, ptr: *const Expr) -> Result<Reg<Ptr>, LowerError> {
+        let faces: BTreeMap<String, Ty> =
+            self.shape.env_faces.get(&ptr).cloned().unwrap_or_default();
+        let stmt = self
+            .cur_stmt
+            .ok_or_else(|| LowerError("Lower Error: an env mint outside a statement".into()))?;
+        if let Some(memo) = self.take_env_memo_for(stmt) {
+            let reg = memo.reg;
+            let stored = memo.stored;
+            self.store_env_cells(reg, faces, stored)?;
+            return Ok(reg);
+        }
+        let env_id = self.next_reg();
+        let env = Reg::new(env_id);
+        let flags = 0x01 | if faces.is_empty() { 0x00 } else { 0x80 };
+        self.emit(Instruction::TableNew {
+            target: env,
+            elem: Ty::Str,
+            flags,
+        });
+        self.env_regs.push(env);
+        let mut stored = BTreeSet::new();
+        for name in faces.keys() {
+            stored.insert(name.clone());
+        }
+        self.store_env_cells(env, faces, BTreeSet::new())?;
+        self.env_memo = Some(EnvMemo {
+            stmt,
+            reg: env,
+            stored,
+        });
+        Ok(env)
+    }
+
+    fn take_env_memo_for(&mut self, stmt: *const Stmt) -> Option<EnvMemo> {
+        if let Some(memo) = &self.env_memo
+            && memo.stmt == stmt
+        {
+            return self.env_memo.take();
+        }
+        None
+    }
+
+    fn store_env_cells(
+        &mut self,
+        env: Reg<Ptr>,
+        faces: BTreeMap<String, Ty>,
+        already: BTreeSet<String>,
+    ) -> Result<(), LowerError> {
+        for (name, ty) in faces {
+            if already.contains(&name) {
+                continue;
+            }
+            let local = self.read_var(&name)?;
+            let key = self.next_reg();
+            self.emit(Instruction::StrKeyConst {
+                target: Reg::new(key),
+                val: alm_rt::rt::str_key_of_bytes(name.as_bytes()),
+            });
+            if matches!(ty, Ty::Tbl(_)) {
+                let reg = ptr_of(local.reg)?;
+                self.table_set(
+                    env,
+                    TableKey::Str(Reg::new(key)),
+                    AnyReg::Ptr(reg),
+                    &Ty::Str,
+                )?;
+            } else {
+                // the scalar's box: one dense cell of its own elem
+                let box_id = self.next_reg();
+                let box_reg = Reg::new(box_id);
+                self.emit(Instruction::TableNew {
+                    target: box_reg,
+                    elem: ty.clone(),
+                    flags: 0,
+                });
+                let idx = self.next_reg();
+                self.emit(Instruction::LoadInt {
+                    target: Reg::new(idx),
+                    val: 0,
+                });
+                self.table_set(box_reg, TableKey::Int(Reg::new(idx)), local.reg, &ty)?;
+                self.table_set(
+                    env,
+                    TableKey::Str(Reg::new(key)),
+                    AnyReg::Ptr(box_reg),
+                    &Ty::Str,
+                )?;
+            }
+            if let Some(memo) = &mut self.env_memo {
+                memo.stored.insert(name);
+            }
+        }
+        Ok(())
+    }
+
+    /// W3a's call-through env entry: materialize every captured name as
+    /// an ordinary var (tables direct, scalars unboxed from their
+    /// cells) so the body's own lowering needs no further plumbing;
+    /// scalar rebinds write the box back (the Assignment arm consults
+    /// `env_ctxs`).
+    fn enter_env_ctx(&mut self, env: Reg<Ptr>, ptr: *const Expr) -> Result<(), LowerError> {
+        let faces: BTreeMap<String, Ty> =
+            self.shape.env_faces.get(&ptr).cloned().unwrap_or_default();
+        for (name, ty) in faces.clone() {
+            let key = self.next_reg();
+            self.emit(Instruction::StrKeyConst {
+                target: Reg::new(key),
+                val: alm_rt::rt::str_key_of_bytes(name.as_bytes()),
+            });
+            let cell_id = self.next_reg();
+            let cell = Reg::new(cell_id);
+            self.emit(Instruction::TableGet(<Ptr as CellRepr>::get(
+                cell,
+                env,
+                TableKey::Str(Reg::new(key)),
+            )));
+            if matches!(ty, Ty::Tbl(_)) {
+                self.declare_var(name, AnyReg::Ptr(cell), ty, LayoutVerdict::Sparse);
+            } else {
+                let idx = self.next_reg();
+                self.emit(Instruction::LoadInt {
+                    target: Reg::new(idx),
+                    val: 0,
+                });
+                let out = self.next_reg();
+                let v = self.table_get(out, cell, TableKey::Int(Reg::new(idx)), &ty);
+                self.declare_var(name, v, ty, LayoutVerdict::default());
+            }
+        }
+        self.env_ctxs.push(EnvCtx { reg: env, faces });
+        Ok(())
+    }
+
+    /// The scalar write-back: a captured name's rebind lands in the env
+    /// box (later calls — and siblings — read it back; L3).
+    fn env_write_back(&mut self, name: &str, value: AnyReg) -> Result<(), LowerError> {
+        let Some(ctx) = self.env_ctxs.last().cloned() else {
+            return Ok(());
+        };
+        let Some(ty) = ctx.faces.get(name).cloned() else {
+            return Ok(());
+        };
+        if matches!(ty, Ty::Tbl(_)) {
+            return Ok(());
+        }
+        let key = self.next_reg();
+        self.emit(Instruction::StrKeyConst {
+            target: Reg::new(key),
+            val: alm_rt::rt::str_key_of_bytes(name.as_bytes()),
+        });
+        let cell_id = self.next_reg();
+        let cell = Reg::new(cell_id);
+        self.emit(Instruction::TableGet(<Ptr as CellRepr>::get(
+            cell,
+            ctx.reg,
+            TableKey::Str(Reg::new(key)),
+        )));
+        let idx = self.next_reg();
+        self.emit(Instruction::LoadInt {
+            target: Reg::new(idx),
+            val: 0,
+        });
+        self.table_set(cell, TableKey::Int(Reg::new(idx)), value, &ty)?;
+        Ok(())
+    }
+
     fn lower_expr(&mut self, expr: &Expr, target: Option<RegId>) -> Result<TypedReg, LowerError> {
         let reg = target.unwrap_or_else(|| self.next_reg());
 
@@ -1792,6 +2029,38 @@ impl<'a> IrLowerer<'a> {
                                 .into(),
                         )
                     })?;
+                // W3a's dispatch, lower half: a call-through reads the
+                // closure VALUE's register — the env pointer. An
+                // Identifier callee whose binding carries a Closure type
+                // dispatches off the binding's own register; a Field
+                // callee reads the record cell ONLY when the checker
+                // recorded a closure dispatch — a D4 dot-ns expansion
+                // call rides the same callee shape and reads nothing.
+                let call_env: Option<Reg<Ptr>> = match callee.as_ref() {
+                    Expr::Identifier(n) => match self.read_var(n) {
+                        Ok(local) if matches!(local.ty, Ty::Closure(_)) => Some(ptr_of(local.reg)?),
+                        _ => None,
+                    },
+                    Expr::Field { obj, name }
+                        if self.shape.closure_calls.contains(&(call_ptr, site)) =>
+                    {
+                        let t_any = self.lower_expr(obj, None)?.reg;
+                        let t_reg = ptr_of(t_any)?;
+                        let k = self.next_reg();
+                        self.emit(Instruction::StrKeyConst {
+                            target: Reg::new(k),
+                            val: alm_rt::rt::str_key_of_bytes(name.as_bytes()),
+                        });
+                        let cell = self.next_reg();
+                        self.emit(Instruction::TableGet(<Ptr as CellRepr>::get(
+                            Reg::new(cell),
+                            t_reg,
+                            TableKey::Str(Reg::new(k)),
+                        )));
+                        Some(Reg::new(cell))
+                    }
+                    _ => None,
+                };
                 if self.inline_stack.contains(&fn_ptr) {
                     return Err(LowerError(
                         "Lower Error: recursive inlining — \
@@ -1841,6 +2110,12 @@ impl<'a> IrLowerer<'a> {
                 self.in_block(|an| {
                     for (p, (tr, layout)) in def.params.iter().zip(arg_regs) {
                         an.declare_var(p.clone(), tr.reg, tr.ty, layout);
+                    }
+                    // W3a: the call-through materializes its captures as
+                    // ordinary vars off the env (inside this block's
+                    // scope — they die with the expansion)
+                    if let Some(env) = call_env {
+                        an.enter_env_ctx(env, fn_ptr)?;
                     }
                     for s in body {
                         an.lower_stmt(s)?;
@@ -1895,6 +2170,9 @@ impl<'a> IrLowerer<'a> {
                 self.inline_stack.pop();
                 self.expansion_sites.pop();
                 self.expansion_break_bases.pop();
+                if call_env.is_some() {
+                    self.env_ctxs.pop();
+                }
                 Ok(TypedReg {
                     reg: result,
                     ty: call_ret,
@@ -1902,6 +2180,18 @@ impl<'a> IrLowerer<'a> {
             }
             Expr::TableCtor(entries) => {
                 let elem = self.shape.elem_of(expr);
+                let ctor_site = self.shape.sites.get(&(expr as *const Expr)).copied();
+
+                // W3a, R3: which fields carry closure faces — their
+                // stores ride the Ptr lane and the table's own cells go
+                // 8-byte (a closure record's non-closure fields must be
+                // Int/Flt/Str; the checker's elem join already rejects
+                // the rest as conflicts)
+                let has_closure_fields = entries.iter().any(|(k, _)| match k {
+                    CtorKey::Str(n) => ctor_site
+                        .is_some_and(|s| self.shape.closure_fields.contains_key(&(s, n.clone()))),
+                    _ => false,
+                });
 
                 if matches!(elem, crate::shape::Ty::Unknown(_)) {
                     signal!(trace::TRACE_TABLE_NEW_UNDECIDED);
@@ -1914,17 +2204,24 @@ impl<'a> IrLowerer<'a> {
                     }
                 }
 
-                let ctor_site = self.shape.sites.get(&(expr as *const Expr));
                 let is_stored_parent =
-                    ctor_site.is_some_and(|s| self.shape.stored_ctor_parents.contains(s));
+                    ctor_site.is_some_and(|s| self.shape.stored_ctor_parents.contains(&s));
 
                 let contains_tables = matches!(elem, crate::shape::Ty::Tbl(_))
                     && (has_inline_tables || is_stored_parent);
 
                 let mut elem_regs = Vec::with_capacity(entries.len());
-                for (_, e) in entries {
+                for (key, e) in entries {
                     let TypedReg { reg: r, .. } = self.lower_expr(e, None)?;
-                    let r = if matches!(elem, Ty::Any) {
+                    // a closure field's cell rides the Ptr lane raw —
+                    // never packed into an Any elem
+                    let is_closure_field = match key {
+                        CtorKey::Str(n) => ctor_site.is_some_and(|s| {
+                            self.shape.closure_fields.contains_key(&(s, n.clone()))
+                        }),
+                        _ => false,
+                    };
+                    let r = if matches!(elem, Ty::Any) && !is_closure_field {
                         self.pack_any(r)?
                     } else {
                         r
@@ -1949,9 +2246,16 @@ impl<'a> IrLowerer<'a> {
                 let flags = mode_bit | if contains_tables { 0x80 } else { 0x00 };
 
                 let tbl = Reg::<Ptr>::new(reg);
+                // W3a: a closure record's cells are 8-byte (Ptr-lane raw
+                // stores share the buffer with Int/Flt/Str fields)
+                let new_elem = if has_closure_fields {
+                    Ty::Str
+                } else {
+                    elem.clone()
+                };
                 self.emit(Instruction::TableNew {
                     target: tbl,
-                    elem: elem.clone(),
+                    elem: new_elem,
                     flags,
                 });
                 if let Some(&site) = self.shape.sites.get(&(expr as *const Expr)) {
@@ -1973,7 +2277,15 @@ impl<'a> IrLowerer<'a> {
                                 target: Reg::new(k),
                                 val: alm_rt::rt::str_key_of_bytes(name.as_bytes()),
                             });
-                            self.table_set(tbl, TableKey::Str(Reg::new(k)), v_reg, &elem)?;
+                            // W3a, R3: the closure face rides the field —
+                            // its cell stores the env pointer raw
+                            let store_face = match ctor_site
+                                .and_then(|s| self.shape.closure_fields.get(&(s, name.clone())))
+                            {
+                                Some(&ptr) => Ty::Closure(ptr),
+                                None => elem.clone(),
+                            };
+                            self.table_set(tbl, TableKey::Str(Reg::new(k)), v_reg, &store_face)?;
                         }
                         CtorKey::Expr(ke) => {
                             // the checker runs check_index_key on ctor keys —
@@ -2026,6 +2338,17 @@ impl<'a> IrLowerer<'a> {
                 })
             }
             Expr::Identifier(name) => {
+                // W3a's creation: a fn name read as a value mints (or
+                // joins) this statement's env and answers the env
+                // pointer — a closure value's register IS its env.
+                let site = self.fact_site(expr as *const Expr);
+                if let Some(&ptr) = self.shape.creation_envs.get(&(expr as *const Expr, site)) {
+                    let reg = self.mint_env(ptr)?;
+                    return Ok(TypedReg {
+                        reg: AnyReg::Ptr(reg),
+                        ty: Ty::Closure(ptr),
+                    });
+                }
                 let local = self.read_var(name)?;
                 if target.is_some() && reg != local.reg.id() {
                     let moved = self.emit_move_into(reg, local.reg);

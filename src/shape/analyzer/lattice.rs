@@ -96,6 +96,10 @@ impl Analyzer {
             Ffi => Ffi,
             FfiLib => FfiLib,
             Coro => Coro,
+            // a closure face never rides a site elem — the walk infers
+            // fn reads Pending and closure ctor fields skip the elem
+            // join (R3: the face rides the field)
+            Ty::Closure(_) => unreachable!("a closure face never rides a site elem"),
             Ty::Unknown(_) => unreachable!(
                 "site_elem holds no nominal unknowns — the walk mints none; unknowns live in \
                  the constraint store"
@@ -139,6 +143,7 @@ impl Analyzer {
             Ffi => Ffi,
             FfiLib => FfiLib,
             Coro => Coro,
+            Ty::Closure(_) => unreachable!("a closure face never rides a site elem"),
             Tbl(inner) => {
                 signal!(trace::TRACE_TY_STATIC_TBL);
                 Ty::Tbl(Box::new(self.materialize_elem(inner, site)))

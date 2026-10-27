@@ -23,10 +23,17 @@ pub enum Ty {
     FfiLib,
     Coro,
     Any,
+    /// W3a (the escaped expansion): an owned env table TYPED by its
+    /// expansion — the fn-literal pointer is the expansion id, the
+    /// env pointer rides a Ptr register at runtime. Atomic in the
+    /// lattice: two ids never join (the Dispatch Law — divergent
+    /// expansions cannot meet at one call), one id joins itself.
+    Closure(*const Expr),
     Unknown(usize),
     Conflict,
 }
 
+use crate::ast::Expr;
 use Ty::{Any, Bool, Conflict, Flt, Int, Pending, Str, Tbl};
 
 pub fn pinned_scalar(t: &Ty) -> bool {

@@ -143,6 +143,38 @@ pub struct ShapeFacts {
     pub fn_scope_keys: BTreeMap<*const Expr, (*const Stmt, u8)>,
     pub fn_touched: BTreeMap<*const Expr, BTreeSet<String>>,
     pub fn_defs: BTreeMap<*const Expr, FnDef>,
+    /// KEYING DISCIPLINE (W3a): per fn literal, the RESOLVED env face —
+    /// capture name → cell type — recorded at the FIRST creation site
+    /// and unified (never contradicted) at later sites: the enclosing
+    /// expansion's monomorphic signature pins the capture kinds, so
+    /// every creation site of one fn literal in one program agrees.
+    /// `resolve_fn_defs_through_subs` re-resolves these through the
+    /// final store (the Store Window Law rides here as everywhere).
+    pub env_faces: BTreeMap<*const Expr, BTreeMap<String, Ty>>,
+    /// KEYING DISCIPLINE: same `(expr, expansion site)` pairs as
+    /// `call_defs` — the creation sites themselves: an fn name read as
+    /// a VALUE (escape position) mints the env here. Map value is the
+    /// fn literal the value names. One identifier expr may be checked
+    /// once per expansion site; the pair key keeps each lowering on
+    /// its own mint.
+    pub creation_envs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
+    /// KEYING DISCIPLINE (W3a): same `(call expr, expansion site)`
+    /// pairs as `call_defs` — WHICH resolved calls dispatch through a
+    /// closure VALUE (a record field's singleton) rather than the
+    /// expansion maps. The lowerer must not re-derive the dispatch
+    /// kind: a dotted callee may be either a D4 dot-ns expansion call
+    /// or a closure-field dispatch, and the two lower differently
+    /// (env cell read vs. no read at all).
+    pub closure_calls: BTreeSet<(*const Expr, *const Expr)>,
+    /// KEYING DISCIPLINE (W3a, R3's record-face rule): (ctor SITE,
+    /// field name) → the fn literal the field carries. The closure
+    /// face rides the FIELD, never the elem — a record's array elem
+    /// stays the non-closure join, and the field's dispatch id is
+    /// pinned per constructor, so `t.f(...)` resolves the singleton
+    /// statically. Sites flow to readers through the existing alias
+    /// machinery (that is what table identity IS in the checker's
+    /// world).
+    pub closure_fields: BTreeMap<(usize, String), *const Expr>,
     /// KEYING DISCIPLINE (the R1 law): keyed by the pair
     /// `(call expr, expansion site)` where the expansion site is the
     /// OUTERMOST call whose inline expansion the call expr is being

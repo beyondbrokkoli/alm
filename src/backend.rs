@@ -780,6 +780,13 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                                     "Type Error: the module surfaces cannot be printed".to_string(),
                                 ]);
                             }
+                            // the checker's print reject owns closures —
+                            // one never rides a print operand here
+                            Ty::Closure(_) => {
+                                return Err(vec![
+                                    "Type Error: closures cannot be printed".to_string(),
+                                ]);
+                            }
                             Ty::Unknown(_) => code.push_str("  call void @alm_print_int(i64 0)\n"),
                             // print operands carry resolved lowerer types —
                             // flow state never rides the artifact path

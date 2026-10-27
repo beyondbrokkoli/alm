@@ -200,6 +200,17 @@ impl Analyzer {
                 (Int, BTreeSet::new(), BTreeMap::new())
             });
         }
+        // W3a: a TABLE base names a record field call — a closure
+        // field's dispatch. The walk has no per-field faces (R3 keeps
+        // them checker-side, keyed by ctor site); the checker's Call
+        // arm owns the accept/reject. Infer the args and answer
+        // Pending.
+        if matches!(bind.ty, Tbl(_)) {
+            for a in args {
+                self.infer_expr(rec, a)?;
+            }
+            return Ok((Pending, BTreeSet::new(), BTreeMap::new()));
+        }
         Err(ShapeError(format!(
             "Scope Error: '{base}' is not the ffi module, a loaded library, or the coroutine \
              module — '.' is the module surfaces', tables use '[]'"
@@ -743,9 +754,19 @@ impl Analyzer {
                     }
                 };
                 let name = name.as_str();
-                let fn_ptr = self
-                    .resolve_fn(name)
-                    .ok_or_else(|| ShapeError(not_a_function_msg(name)))?;
+                let Some(fn_ptr) = self.resolve_fn(name) else {
+                    // W3a: a callee the fn maps do not answer is a call
+                    // through a VALUE (a closure-typed param, alias, or
+                    // field read) — the checker's Call arm owns the
+                    // accept/reject and the dispatch; the walk infers
+                    // the operands and answers Pending.
+                    for a in args {
+                        self.infer_expr(rec, a)?;
+                        self.check_uses(rec, a)?;
+                    }
+                    signal!(rec.on(), trace::TRACE_INFER_IDENT);
+                    return Ok((Pending, BTreeSet::new(), BTreeMap::new()));
+                };
                 let params = self.fn_params.get(&fn_ptr).cloned().unwrap_or_default();
                 let stored_params = self.fn_store_params.get(&fn_ptr).cloned();
                 let moved_params = self.fn_moved_params.get(&fn_ptr).cloned();

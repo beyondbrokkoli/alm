@@ -1,6 +1,11 @@
 // async/probe/probe_tenant.rs — exercises the alm tenant & trace layer of
 // libalm_async.so: deterministic exec registration (lowest free slot), the
 // census mirror, the sole-owner sticky plate, and the chronology ring.
+// W4 resolved here: the exit-time leak report (the substrate's ONE atexit
+// walk over every exec's census mirror) is pinned end-to-end by a
+// sacrificial child that leaves a live mirror behind on purpose — the
+// parent asserts the named stderr line + slot 90 on the child's plate,
+// then resets its own mirror and exits quiet.
 // Runs from any CWD; creates .alm_rt_trace.bin next to the CWD (dev scratch).
 
 use std::ffi::{c_char, CStr};
@@ -28,6 +33,16 @@ fn name_of(id: i32) -> String {
 }
 
 fn main() {
+    // child mode: the exit-leak pin below re-execs this binary with the
+    // gate set and a fresh CWD; everything after this gate is parent-only
+    if std::env::var_os("ALM_PROBE_TENANT_EXIT_LEAK").is_some() {
+        let id = unsafe { vx_exec_register(c"worker.so".as_ptr(), 0x2) };
+        assert!(id >= 0);
+        unsafe { vx_exec_census_set(id, 6, 10) };
+        println!("probe_tenant[child]: worker.so left live at exit on purpose");
+        return;
+    }
+
     // deterministic lowest-free allocation: main exe first, then modules
     let a = unsafe { vx_exec_register(c"main.exe".as_ptr(), 0x1) };
     let b = unsafe { vx_exec_register(c"worker.so".as_ptr(), 0x2) };
@@ -43,6 +58,38 @@ fn main() {
     unsafe { vx_exec_state_set(c, 3 /* FINISHED */) };
     assert_eq!(unsafe { vx_exec_state_get(c) }, 3);
     assert_eq!(name_of(99), "");
+
+    // W4 pin — the exit-time leak report, end-to-end: the child (gate
+    // above) registers worker.so with a live mirror of 6 and exits; the
+    // substrate's atexit walk must name the module and the count on
+    // stderr, poke slot 90 on the child's OWN plate (fresh CWD — the
+    // sole-owner unlink/recreate keeps it isolated from ours), and still
+    // exit 0: the report is a diagnostic, the plate is the CI signal.
+    {
+        use std::process::Command;
+        let tmp = std::env::temp_dir()
+            .join(format!("alm_probe_tenant_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("child CWD");
+        let out = Command::new(std::env::current_exe().expect("self"))
+            .env("ALM_PROBE_TENANT_EXIT_LEAK", "1")
+            .current_dir(&tmp)
+            .output()
+            .expect("sacrificial child");
+        assert!(
+            out.status.success(),
+            "a leak report never fails the exit status"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("slot 90"), "names its slot: {err}");
+        assert!(err.contains("worker.so"), "names the module: {err}");
+        assert!(err.contains("== 6"), "names the live count: {err}");
+        let plate = std::fs::read(tmp.join(".alm_rt_trace.bin"))
+            .expect("child's plate");
+        assert_eq!(plate.len(), 256);
+        assert_eq!(plate[90], 1, "slot 90 sticky on the child's plate");
+        assert_eq!(plate[50], 0, "no other slot fired");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     // sticky plate: exec-tagged + anonymous (foreign C companion) pokes
     // share the one MAP_SHARED file the .so owns
@@ -125,7 +172,13 @@ fn main() {
     );
 
     unsafe { vx_exec_dump() };
+    // the mirror exercise ends: worker.so's ledger reads clean again, so
+    // this process's own exit walk stays quiet (the report itself is
+    // pinned by the child above)
+    unsafe { vx_exec_census_set(b, 0, 10) };
     println!("probe_tenant: 3 execs registered, plate + ring verified");
     println!("probe_tenant: 9th register -1 + anonymous tag, ring wrap at 8192, \
               str_pool dedup — GREEN");
+    println!("probe_tenant: exit leak report pinned via child (slot 90 + named \
+              module), own mirror reset — exits clean");
 }

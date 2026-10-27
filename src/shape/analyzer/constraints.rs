@@ -174,6 +174,14 @@ impl UnknownStore {
 
             (Ty::Tbl(e1), Ty::Tbl(e2)) => self.unify(e1, e2),
 
+            // THE DISPATCH LAW (W3a): two DIFFERENT expansion ids may
+            // never join — static monomorphic dispatch needs the
+            // singleton id held through the dataflow; a join of two
+            // ids at one site is L2 (the fat cell), which is parked.
+            (Ty::Closure(a), Ty::Closure(b)) if a != b => {
+                Err("Type Error: divergent expansions cannot meet at one call".to_string())
+            }
+
             _ => Err(format!(
                 "Type Error: type conflict — {} vs {}",
                 type_name(&expected),

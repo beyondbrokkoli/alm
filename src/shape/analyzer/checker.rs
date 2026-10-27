@@ -32,7 +32,7 @@ use super::super::facts::{FfiVerb, FnDef, KeyLane};
 use super::super::{is_ghost, is_root, join_ty};
 use super::WalkState;
 use super::constraints::UnknownStore;
-use super::{calls_through_fn_var_msg, dotted_callee, not_a_function_msg};
+use super::{calls_through_fn_var_msg, dotted_callee, value_call_msg};
 use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
 use crate::shape::ty::Ty;
 use alm_rt::{signal, trace};
@@ -97,6 +97,10 @@ pub(super) struct CheckCtx {
     /// resolves an expansion's free names through it — never through
     /// the caller's frames.
     pub fn_def_sites: BTreeMap<*const Expr, BTreeMap<String, Option<*const Expr>>>,
+    /// W3a's walk-side capture sets (the invariance argument at
+    /// `fn_captures` in facts.rs) — the checker reads them at creation
+    /// sites (the env face) and at call arms (the capture guard).
+    pub fn_captures: BTreeMap<*const Expr, BTreeSet<String>>,
 }
 
 /// Everything the checker records for the lowerer, handed to `analyze` at
@@ -107,6 +111,10 @@ pub(super) struct CheckFacts {
     pub fn_defs: BTreeMap<*const Expr, FnDef>,
     pub call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
     pub call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
+    pub env_faces: BTreeMap<*const Expr, BTreeMap<String, Ty>>,
+    pub creation_envs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
+    pub closure_calls: BTreeSet<(*const Expr, *const Expr)>,
+    pub closure_fields: BTreeMap<(usize, String), *const Expr>,
     pub ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
     pub index_key_lanes: BTreeMap<(*const Expr, *const Expr), KeyLane>,
     pub access_elems: BTreeMap<(*const Expr, *const Expr), Ty>,
@@ -153,6 +161,37 @@ pub(super) struct Checker {
     fn_defs: BTreeMap<*const Expr, FnDef>,
     call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
     call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
+    /// W3a: the per-fn env faces (creation sites record, later sites
+    /// unify — monomorphism of the enclosing signature pins the kinds;
+    /// the keying discipline at `env_faces` in facts.rs).
+    env_faces: BTreeMap<*const Expr, BTreeMap<String, Ty>>,
+    /// W3a: the creation sites themselves — `(fn-name identifier,
+    /// expansion site) → fn literal` (the lowerer mints here).
+    creation_envs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
+    /// W3a: which resolved calls dispatch through a closure value (the
+    /// lowerer's env-cell read rides this — a D4 dot-ns call lowers
+    /// with no read).
+    closure_calls: BTreeSet<(*const Expr, *const Expr)>,
+    /// W3a: R3's record-face rule — `(ctor site, field name) → fn
+    /// literal` (a record's closure cells dispatch by field, the elem
+    /// stays the non-closure join).
+    closure_fields: BTreeMap<(usize, String), *const Expr>,
+    /// W3a: per ACTIVE expansion, Some(env face) at call-throughs (the
+    /// closure's captures resolve through it), None at direct
+    /// expansions (the defining scope's frames ARE live — P2's
+    /// discipline). Parallel to `inline_stack`.
+    expansion_envs: Vec<Option<BTreeMap<String, Ty>>>,
+    /// W3a: per ACTIVE call-through expansion, the sequential writes
+    /// to captured scalars — later statements in the same body read
+    /// the override, never the mint-time face (write-through, L3).
+    env_overrides: Vec<BTreeMap<String, Ty>>,
+    /// W3a's straight-line law for creations: an env mint inside a
+    /// conditional arm or loop body has no one register to free at
+    /// root exit (the tag-physics of arm frees is walk-planned; envs
+    /// are compiler-minted) — creations live in straight-line scope.
+    /// The census factories create at the ctor-return; the bound is
+    /// documented in the archived W3a closure record (V1 rows).
+    cond_depth: usize,
     ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
     index_key_lanes: BTreeMap<(*const Expr, *const Expr), KeyLane>,
     access_elems: BTreeMap<(*const Expr, *const Expr), Ty>,
@@ -207,6 +246,13 @@ impl Checker {
             fn_defs: BTreeMap::new(),
             call_defs: BTreeMap::new(),
             call_rets: BTreeMap::new(),
+            env_faces: BTreeMap::new(),
+            creation_envs: BTreeMap::new(),
+            closure_calls: BTreeSet::new(),
+            closure_fields: BTreeMap::new(),
+            expansion_envs: Vec::new(),
+            env_overrides: Vec::new(),
+            cond_depth: 0,
             ffi_verbs: BTreeMap::new(),
             index_key_lanes: BTreeMap::new(),
             access_elems: BTreeMap::new(),
@@ -398,6 +444,10 @@ impl Checker {
             fn_defs,
             call_defs,
             call_rets,
+            env_faces,
+            creation_envs,
+            closure_calls,
+            closure_fields,
             ffi_verbs,
             index_key_lanes,
             access_elems,
@@ -410,6 +460,10 @@ impl Checker {
             fn_defs,
             call_defs,
             call_rets,
+            env_faces,
+            creation_envs,
+            closure_calls,
+            closure_fields,
             ffi_verbs,
             index_key_lanes,
             access_elems,
@@ -484,6 +538,14 @@ impl Checker {
         }
         for ret in self.call_rets.values_mut() {
             *ret = lat.resolve(ret);
+        }
+        // W3a: the env faces ride the same Store Window discipline —
+        // recorded early (still-Unknown cells are rewound by later
+        // bindings), resolved once here to the one final truth.
+        for face in self.env_faces.values_mut() {
+            for ty in face.values_mut() {
+                *ty = lat.resolve(ty);
+            }
         }
     }
 
@@ -562,14 +624,67 @@ impl Checker {
         Ok(())
     }
 
-    /// The name→type query. Frames (innermost out) shadow; the top-level
+    /// W3a: the innermost ACTIVE call-through's env face — the
+    /// closure's capture cells. Applies only while the innermost
+    /// expansion IS that call-through (a deeper direct expansion owns
+    /// its own chain; the Hygiene Law keeps the env out of it).
+    fn active_env(&self) -> Option<&BTreeMap<String, Ty>> {
+        self.expansion_envs.last()?.as_ref()
+    }
+
+    /// W3a: the same env's sequential overrides (captured scalars
+    /// rebound inside this body — write-through, L3).
+    fn active_env_override(&self, name: &str) -> Option<Ty> {
+        if self.expansion_envs.last()?.is_some() {
+            self.env_overrides.last()?.get(name).cloned()
+        } else {
+            None
+        }
+    }
+
+    fn active_env_face(&self, name: &str) -> Option<Ty> {
+        if let Some(face) = self.active_env() {
+            face.get(name).cloned()
+        } else {
+            None
+        }
+    }
+
+    /// W3a: the frame-scan bound — frames below the innermost
+    /// call-through boundary are the caller's world and never
+    /// participate in name resolution inside the closure (the Hygiene
+    /// Law's value-name half). Zero when no call-through is active:
+    /// today's unbounded discipline, bit for bit.
+    fn call_through_base(&self) -> usize {
+        self.expansion_envs
+            .iter()
+            .rposition(|e| e.is_some())
+            .map(|i| self.expansion_frame_bases[i])
+            .unwrap_or(0)
+    }
+
+    fn frames_resolve(&self, name: &str) -> Option<Ty> {
+        let base = self.call_through_base();
+        self.frames[base..]
+            .iter()
+            .rev()
+            .find_map(|f| f.types.get(name).cloned())
+    }
+
+    /// The name→type query. Frames (innermost out, bounded by the
+    /// innermost call-through) shadow; the active env's cells answer
+    /// captured names (override first — write-through); the top-level
     /// sequential delta shadows the view; everything else is the pure
     /// view over the walk's pre-statement state.
     fn var_type(&mut self, lat: &mut UnknownStore, name: &str) -> Result<Ty, String> {
-        for frame in self.frames.iter().rev() {
-            if let Some(ty) = frame.types.get(name) {
-                return Ok(lat.resolve(ty));
-            }
+        if let Some(ty) = self.frames_resolve(name) {
+            return Ok(lat.resolve(&ty));
+        }
+        if let Some(ty) = self.active_env_override(name) {
+            return Ok(ty);
+        }
+        if let Some(ty) = self.active_env_face(name) {
+            return Ok(ty);
         }
         if let Some(ty) = self.top.get(name) {
             return Ok(lat.resolve(ty));
@@ -579,6 +694,30 @@ impl Checker {
             self.seed_read = true;
         }
         view.ok_or_else(|| format!("Scope Error: reference to undeclared variable '{}'", name))
+    }
+
+    /// The quiet twin of `var_type` for call-dispatch attempts: a name
+    /// that resolves to no callable (undeclared, or a plain value)
+    /// answers None instead of its scope error — the caller owns the
+    /// diagnostic.
+    fn var_type_callable(&mut self, lat: &mut UnknownStore, name: &str) -> Option<Ty> {
+        if let Some(ty) = self.frames_resolve(name) {
+            return Some(lat.resolve(&ty));
+        }
+        if let Some(ty) = self.active_env_override(name) {
+            return Some(ty);
+        }
+        if let Some(ty) = self.active_env_face(name) {
+            return Some(ty);
+        }
+        if let Some(ty) = self.top.get(name) {
+            return Some(lat.resolve(ty));
+        }
+        let (view, seed_read) = self.view_type(lat, name, &self.snap);
+        if seed_read {
+            self.seed_read = true;
+        }
+        view.map(|t| lat.resolve(&t))
     }
 
     /// The pure name→type view over lattice state — computed, not held.
@@ -768,6 +907,28 @@ impl Checker {
                 }
                 self.assign_fn_binding(name, None);
                 let expected = self.var_type(lat, name)?;
+                // W3a's write-through witness: whether this assignment
+                // writes a CAPTURED name of the active call-through (the
+                // env owns the cell; the override keeps this body's later
+                // statements on the new truth — L3).
+                let env_hit = self.active_env().is_some_and(|f| f.contains_key(name))
+                    || self
+                        .env_overrides
+                        .last()
+                        .is_some_and(|o| o.contains_key(name));
+                if env_hit && !matches!(expected, Ty::Unknown(_)) {
+                    // a captured TABLE binding is the env's own — the
+                    // move already happened at the mint; a rebind inside
+                    // the body has no affine home (census verdict: mutate
+                    // cells, or rebind in the defining scope)
+                    if matches!(expected, Ty::Tbl(_)) {
+                        return Err(format!(
+                            "Type Error: '{name}' is a captured table — it cannot be \
+                             rebound inside its closure (mutate its cells, or rebind in \
+                             the defining scope)"
+                        ));
+                    }
+                }
                 if matches!(expr, Expr::Nil) {
                     if !matches!(expected, Ty::Tbl(_) | Ty::Unknown(_)) {
                         return Err(format!(
@@ -792,12 +953,28 @@ impl Checker {
                     let resolved = lat.resolve(&actual);
                     self.write_back(name, resolved);
                 }
+                // W3a: the env cell adopts the rebind either way —
+                // later statements in this body read the override (L3)
+                if env_hit && let Some(o) = self.env_overrides.last_mut() {
+                    o.insert(name.to_string(), lat.resolve(&actual));
+                }
             }
             Stmt::IndexAssign { obj, key, value } => {
                 let (elem, _obj_desc) = self.check_index_base(lat, obj)?;
                 let _key_ty = self.check_index_key(lat, key)?;
 
                 let val_ty = self.check_expr(lat, value)?;
+
+                // W3a (the Escape Law's narrowed reject set): a closure
+                // value enters a record's LITERAL fields only — computed
+                // cells carry scalars and tables, never faces.
+                if matches!(lat.resolve(&val_ty), Ty::Closure(_)) {
+                    return Err(
+                        "Type Error: a closure value enters only a record's literal \
+                         fields — computed cells carry scalars and tables"
+                            .to_string(),
+                    );
+                }
 
                 if matches!(lat.resolve(&elem), Ty::Any) {
                     match lat.resolve(&val_ty) {
@@ -815,6 +992,15 @@ impl Checker {
                             return Err("Type Error: an Any table's cells hold scalars — the ffi \
                                  surface cannot enter a dynamic cell"
                                 .to_string());
+                        }
+                        // unreachable in practice: the closure reject above
+                        // fired — the arm keeps the match total
+                        Ty::Closure(_) => {
+                            return Err(
+                                "Type Error: a closure value enters only a record's literal \
+                                 fields — computed cells carry scalars and tables"
+                                    .to_string(),
+                            );
                         }
                         // flow state never rides a resolved checker type —
                         // the elems table materializes it before this half
@@ -843,7 +1029,9 @@ impl Checker {
                 self.check_condition(lat, condition, "while")?;
                 self.begin_scope();
                 self.loop_depth += 1;
+                self.cond_depth += 1;
                 self.check_block(lat, body);
+                self.cond_depth -= 1;
                 self.loop_depth -= 1;
                 self.end_scope();
             }
@@ -859,10 +1047,14 @@ impl Checker {
             } => {
                 self.check_condition(lat, condition, "if")?;
                 self.begin_scope();
+                self.cond_depth += 1;
                 self.check_block(lat, then_body);
+                self.cond_depth -= 1;
                 self.end_scope();
                 self.begin_scope();
+                self.cond_depth += 1;
                 self.check_block(lat, else_body);
+                self.cond_depth -= 1;
                 self.end_scope();
             }
             Stmt::Do { body } => {
@@ -876,6 +1068,13 @@ impl Checker {
                     if matches!(ty, Ty::Tbl(_)) {
                         return Err("Type Error: cannot print a table — print its cells instead"
                             .to_string());
+                    }
+                    if matches!(ty, Ty::Closure(_)) {
+                        return Err(
+                            "Type Error: cannot print a closure — call it, alias it, or \
+                             store it in a record field"
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -894,7 +1093,19 @@ impl Checker {
                 Some(ReturnCtx::Boundary) => match value {
                     None | Some(Expr::Nil) => {}
                     Some(expr) => match self.check_expr(lat, expr)? {
-                        Ty::Tbl(_) => {}
+                        Ty::Tbl(_) => {
+                            // W3a, W3-R5 (the Data Transfer Contract): the
+                            // boundary return marshals flat cells to the
+                            // host — a closure field would smuggle this
+                            // module's heap state across.
+                            if self.carries_closure(expr) {
+                                return Err(
+                                    "Type Error: a closure cannot cross a module boundary — \
+                                     the boundary 'return' marshals flat cells only"
+                                        .to_string(),
+                                );
+                            }
+                        }
                         other => {
                             return Err(format!(
                                 "Type Error: 'return' hands a value to the host — \
@@ -1137,6 +1348,11 @@ impl Checker {
                         let t = lat.resolve(&raw);
                         match t {
                             Ty::Tbl(_) => {
+                                if self.carries_closure(&args[1]) {
+                                    return Err("Type Error: a closure cannot cross a module \
+                                         boundary — the spawn table marshals flat cells only"
+                                        .to_string());
+                                }
                                 self.record_verb(call, FfiVerb::CoroResume);
                                 Ok(Ty::Int)
                             }
@@ -1280,6 +1496,14 @@ impl Checker {
                 let t = lat.resolve(&raw);
                 match t {
                     Ty::Tbl(_) => {
+                        // W3a, W3-R5: the drive call marshals the boundary
+                        // table into the target process's heap — a closure
+                        // field cannot ride it.
+                        if self.carries_closure(&args[0]) {
+                            return Err("Type Error: a closure cannot cross a module boundary — \
+                                 the drive table marshals flat cells only"
+                                .to_string());
+                        }
                         self.record_verb(
                             expr,
                             FfiVerb::Drive {
@@ -1317,6 +1541,98 @@ impl Checker {
             ));
         }
         Ok(())
+    }
+
+    /// W3a's THE ESCAPE LAW, creation half: the env face of the fn
+    /// literal being read as a value — each capture's resolved type at
+    /// THIS program point (frames → active env → top, per `var_type`;
+    /// captures are below-top by construction, so a top fall-through
+    /// is an undeclared name and rejects naturally). Recorded at the
+    /// first creation site; later sites unify — the enclosing
+    /// expansion's monomorphic signature pins the kinds, so two sites
+    /// of one literal agree or reject as divergent (the Dispatch Law).
+    fn create_closure(
+        &mut self,
+        lat: &mut UnknownStore,
+        expr: &Expr,
+        name: &str,
+        ptr: *const Expr,
+    ) -> Result<Ty, String> {
+        if self.inline_stack.contains(&ptr) {
+            return Err(format!(
+                "Type Error: '{name}' cannot escape its own expansion — \
+                 a closure cannot capture itself"
+            ));
+        }
+        if self.cond_depth > 0 {
+            return Err(format!(
+                "Type Error: '{name}' cannot be created inside a conditional arm \
+                 or loop body — creations are straight-line (V1)"
+            ));
+        }
+        let caps = self.ctx.fn_captures.get(&ptr).cloned().unwrap_or_default();
+        let mut face: BTreeMap<String, Ty> = BTreeMap::new();
+        for cap in &caps {
+            let ty = self.var_type(lat, cap)?;
+            face.insert(cap.clone(), lat.resolve(&ty));
+        }
+        match self.env_faces.get(&ptr) {
+            None => {
+                self.env_faces.insert(ptr, face);
+            }
+            Some(prev) => {
+                for (n, t) in &face {
+                    match prev.get(n) {
+                        Some(p) => {
+                            lat.unify(p, t)?;
+                        }
+                        None => {
+                            return Err(format!(
+                                "Type Error: '{name}' has no capture '{n}' at an earlier \
+                                 creation site — the checker and the analyzer disagree"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let site = self.fact_site(expr as *const Expr);
+        self.creation_envs.insert((expr as *const Expr, site), ptr);
+        Ok(Ty::Closure(ptr))
+    }
+
+    /// W3a, R3's record-face read half: does the obj's ctor pin this
+    /// field to a closure singleton? V1 bound: the receiver must be a
+    /// walk-visible (top-level) name — table identity IS the alias
+    /// sites, and only the walk's binding view carries them.
+    fn closure_field_fn(&self, obj: &Expr, field: &str) -> Option<*const Expr> {
+        let Expr::Identifier(n) = obj else {
+            return None;
+        };
+        let bind = self.snap.binds.get(n)?;
+        for s in bind.aliases.iter() {
+            if !is_root(s)
+                && !is_ghost(s)
+                && let Some(ptr) = self.closure_fields.get(&(*s, field.to_string()))
+            {
+                return Some(*ptr);
+            }
+        }
+        None
+    }
+
+    /// W3a, W3-R5 (the Data Transfer Contract): does this table-valued
+    /// expr carry a closure field? Such a table may not cross a module
+    /// boundary — the env pointer is this module's heap state.
+    fn carries_closure(&self, expr: &Expr) -> bool {
+        if let Expr::Identifier(n) = expr
+            && let Some(bind) = self.snap.binds.get(n)
+        {
+            return bind.aliases.iter().any(|s| {
+                !is_root(s) && !is_ghost(s) && self.closure_fields.keys().any(|(site, _)| site == s)
+            });
+        }
+        false
     }
 
     fn check_expr(&mut self, lat: &mut UnknownStore, expr: &Expr) -> Result<Ty, String> {
@@ -1363,6 +1679,31 @@ impl Checker {
                         );
                     }
                     let ty = self.check_expr(lat, e)?;
+                    // W3a, R3 (the record-face rule): a closure-valued
+                    // field pins the ctor's per-field singleton and
+                    // NEVER joins the elem — the face rides the field.
+                    // Array cells and computed keys carry no closure.
+                    if let Ty::Closure(ptr) = ty {
+                        match key {
+                            CtorKey::Str(field) => {
+                                let Some(&site) = self.ctx.sites.get(&(expr as *const Expr)) else {
+                                    return Err(
+                                        "Type Error: a closure field's constructor carries no \
+                                         site — the checker and the analyzer disagree"
+                                            .to_string(),
+                                    );
+                                };
+                                self.closure_fields.insert((site, field.clone()), ptr);
+                                continue;
+                            }
+                            _ => {
+                                return Err("Type Error: a closure value enters only a record's \
+                                     literal fields — array cells and computed keys carry \
+                                     scalars and tables"
+                                    .to_string());
+                            }
+                        }
+                    }
                     if matches!(elem, Ty::Tbl(_)) && matches!(ty, Ty::Tbl(_)) {
                         let expected_inner = match &elem {
                             Ty::Tbl(inner) => inner.as_ref(),
@@ -1408,16 +1749,19 @@ impl Checker {
                 Ok(elem)
             }
             Expr::Identifier(name) => {
-                // THE EXPANSION LAW's value boundary: a fn binding read as
-                // a VALUE (argument, operand, store, print, return) is a
-                // rejection at the checker — the expansion has no runtime
-                // representation. Call arms resolve callees through the fn
-                // maps directly and never reach here.
+                // THE ESCAPE LAW (W3a, amending law #1): a fn name read
+                // as a VALUE is a CREATION — the value is an owned env
+                // store naming the expansion. The blanket reject
+                // narrows to the consumer-side laws: print, arithmetic,
+                // computed-key stores, and the boundary crossing. Call
+                // arms resolve callees through the fn maps directly and
+                // never reach here.
                 if self.resolves_to_fn(name) {
-                    return Err(format!(
-                        "Type Error: '{name}' is an expansion, not a value — \
-                         macros in alm have no runtime representation"
-                    ));
+                    let ptr = self
+                        .resolve_fn_binding(name)
+                        .flatten()
+                        .expect("resolves_to_fn");
+                    return self.create_closure(lat, expr, name, ptr);
                 }
                 self.var_type(lat, name)
             }
@@ -1555,13 +1899,23 @@ impl Checker {
             Expr::SysAllocCount | Expr::SysExecCount => Ok(Ty::Int),
             Expr::FfiModule => Ok(Ty::Ffi),
             Expr::CoroModule => Ok(Ty::Coro),
-            Expr::Field { obj, .. } => {
+            Expr::Field { obj, name } => {
                 // non-callee dot access is a record read; the ffi verbs
                 // dispatch in the Call arm before check_expr sees them
                 let ty = self.check_expr(lat, obj)?;
                 let ty = lat.resolve(&ty);
                 match ty {
                     Ty::Tbl(elem) => {
+                        // W3a, R3: the closure face rides the FIELD — a
+                        // ctor that pinned this field to a closure
+                        // singleton answers the singleton here (the
+                        // elem stays the non-closure join)
+                        if let Some(ptr) = self.closure_field_fn(obj, name) {
+                            let site = self.fact_site(obj.as_ref() as *const Expr);
+                            self.access_elems
+                                .insert((obj.as_ref() as *const Expr, site), Ty::Closure(ptr));
+                            return Ok(Ty::Closure(ptr));
+                        }
                         // the dispatch: a Table receiver desugars the dot
                         // to a string-keyed index (negative interned key)
                         signal!(trace::TRACE_PARSE_STRKEY_DOT);
@@ -1596,6 +1950,24 @@ impl Checker {
                             && self.resolve_fn_binding(&dotted).is_some()
                         {
                             dotted
+                        } else if let Some(ptr) = self.closure_field_fn(obj, name) {
+                            // W3a: a record field whose face pins a
+                            // closure singleton — the call dispatches
+                            // through the field (static, monomorphic).
+                            // Record the obj-read face so the lowerer's
+                            // cell read lands on the Ptr lane, and the
+                            // dispatch kind so a D4 dot-ns call never
+                            // reads a cell.
+                            let site = self.fact_site(obj.as_ref() as *const Expr);
+                            self.access_elems
+                                .insert((obj.as_ref() as *const Expr, site), Ty::Closure(ptr));
+                            let call_site = self
+                                .expansion_sites
+                                .first()
+                                .copied()
+                                .unwrap_or(expr as *const Expr);
+                            self.closure_calls.insert((expr as *const Expr, call_site));
+                            return self.expand_call(lat, expr, obj, name, ptr, true, args);
                         } else {
                             return self.check_ffi_call(lat, expr, obj, name, args);
                         }
@@ -1617,108 +1989,204 @@ impl Checker {
                 } else {
                     self.resolve_fn_binding(&name).flatten()
                 };
-                let fn_ptr = fn_ptr.ok_or_else(|| not_a_function_msg(&name))?;
-                if self.inline_stack.contains(&fn_ptr) {
-                    return Err(format!(
-                        "Type Error: '{name}' is recursive — inline closures expand at \
-                         their call sites, so a call chain may not reach back into itself"
-                    ));
-                }
-                let def = self.fn_defs.get(&fn_ptr).cloned().ok_or_else(|| {
-                    format!(
-                        "Type Error: '{name}' holds no function body — \
-                             the checker and the analyzer disagree"
-                    )
-                })?;
-                if args.len() != def.params.len() {
-                    return Err(format!(
-                        "Type Error: '{name}' takes {} argument(s), got {}",
-                        def.params.len(),
-                        args.len()
-                    ));
-                }
-                let mut arg_tys = Vec::with_capacity(args.len());
-                let stmt_position = std::mem::take(&mut self.stmt_position_call);
-                for a in args {
-                    arg_tys.push(self.check_expr(lat, a)?);
-                }
-
-                match &def.signature {
-                    None => {
-                        if let Some(d) = self.fn_defs.get_mut(&fn_ptr) {
-                            d.signature = Some(arg_tys.clone());
+                // W3a's DISPATCH: a name the fn maps do not answer may
+                // still hold a closure VALUE (a param, an alias, a
+                // field-read binding) — its register is the env, and
+                // the id rides the type.
+                let (fn_ptr, call_through) = match fn_ptr {
+                    Some(ptr) => (ptr, false),
+                    None => match self.var_type_callable(lat, &name) {
+                        Some(Ty::Closure(ptr)) => (ptr, true),
+                        _ => {
+                            return Err(value_call_msg(&name));
                         }
-                    }
-                    Some(fixed) => {
-                        for (i, (f, a)) in fixed.iter().zip(arg_tys.iter()).enumerate() {
-                            if lat.unify(f, a).is_err() {
-                                let want = type_name(&lat.resolve(f));
-                                let got = type_name(&lat.resolve(a));
-                                return Err(format!(
-                                    "Type Error: argument {} of '{name}' is {got} where \
-                                     the first call fixed {want} — calls are monomorphic",
-                                    i + 1
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                let body = unsafe { def.body() };
-
-                // R15 (owner ruling 2026-10-26): an expansion with NO
-                // valued return produces no value — consuming its result
-                // rejects; the statement position is the procedure form
-                // and stays legal. A body with ANY valued return is not
-                // valueless: its fall-off path answers the R13 typed zero
-                // by the Store Window Law.
-                if !stmt_position && !body_has_valued_return(body) {
-                    return Err(format!(
-                        "Type Error: '{name}' is an expansion with no return — \
-                         it produces no value"
-                    ));
-                }
-
-                // the per-instantiation fact key: the OUTERMOST expansion
-                // this call is checked inside (the call itself at no
-                // expansion). One call expr may be checked once per site;
-                // the pair key keeps every site's resolution its own.
-                let call_ptr = expr as *const Expr;
-                let site = self.expansion_sites.first().copied().unwrap_or(call_ptr);
-
-                self.inline_stack.push(fn_ptr);
-                self.expansion_sites.push(call_ptr);
-                self.expansion_frame_bases.push(self.frames.len());
-                self.expansion_params.push(def.params.clone());
-                self.begin_scope();
-                for (p, aty) in def.params.iter().zip(arg_tys) {
-                    let pty = lat.fresh();
-                    self.declare_var(lat, p.clone(), pty.clone())?;
-                    lat.unify(&pty, &aty)?;
-                }
-                self.push_return_ctx(def.ret.clone());
-                let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
-                self.check_block(lat, body);
-                self.loop_depth = saved_loop_depth;
-                let ret = match self.return_ctxs.pop() {
-                    Some(ReturnCtx::Internal(ty)) => lat.resolve(&ty),
-                    _ => unreachable!("push_return_ctx just pushed an Internal context"),
+                    },
                 };
-                self.end_scope();
-                self.inline_stack.pop();
-                self.expansion_sites.pop();
-                self.expansion_frame_bases.pop();
-                self.expansion_params.pop();
-
-                // the resolved return type is per-instantiation; the
-                // def's own `ret` stays the shared lattice anchor the
-                // next expansion seeds its return context from (the
-                // monomorphic law is per-definition)
-                self.call_rets.insert((call_ptr, site), ret.clone());
-                self.call_defs.insert((call_ptr, site), fn_ptr);
-                Ok(ret)
+                self.expand_call(
+                    lat,
+                    expr,
+                    callee.as_ref(),
+                    &name,
+                    fn_ptr,
+                    call_through,
+                    args,
+                )
             }
         }
+    }
+
+    /// The one inline-expansion path, shared by direct calls and W3a's
+    /// call-through dispatch. `call_through` marks a dispatch off a
+    /// closure VALUE: the captures resolve through the env (pushed as
+    /// the expansion's face), and no live-world guard applies.
+    #[allow(clippy::too_many_arguments)]
+    fn expand_call(
+        &mut self,
+        lat: &mut UnknownStore,
+        expr: &Expr,
+        callee: &Expr,
+        name: &str,
+        fn_ptr: *const Expr,
+        call_through: bool,
+        args: &[Expr],
+    ) -> Result<Ty, String> {
+        if self.inline_stack.contains(&fn_ptr) {
+            return Err(format!(
+                "Type Error: '{name}' is recursive — inline closures expand at \
+                 their call sites, so a call chain may not reach back into itself"
+            ));
+        }
+        if !call_through {
+            // W3a's capture guard (the direct-call half): a fn with a
+            // non-empty capture set inlines directly only while its
+            // captures are LIVE — resolvable in the current frames or
+            // an active env. Outside the defining world the call must
+            // go through the value.
+            if let Some(caps) = self.ctx.fn_captures.get(&fn_ptr)
+                && !caps.is_empty()
+            {
+                for cap in caps {
+                    if self.frames_resolve(cap).is_none()
+                        && self.active_env_override(cap).is_none()
+                        && self.active_env_face(cap).is_none()
+                    {
+                        return Err(format!(
+                            "Type Error: '{name}' is a closure — call it through its value"
+                        ));
+                    }
+                }
+            }
+        }
+        let def = self.fn_defs.get(&fn_ptr).cloned().ok_or_else(|| {
+            format!(
+                "Type Error: '{name}' holds no function body — \
+                     the checker and the analyzer disagree"
+            )
+        })?;
+        if args.len() != def.params.len() {
+            return Err(format!(
+                "Type Error: '{name}' takes {} argument(s), got {}",
+                def.params.len(),
+                args.len()
+            ));
+        }
+        let mut arg_tys = Vec::with_capacity(args.len());
+        let stmt_position = std::mem::take(&mut self.stmt_position_call);
+        for a in args {
+            arg_tys.push(self.check_expr(lat, a)?);
+        }
+
+        match &def.signature {
+            None => {
+                if let Some(d) = self.fn_defs.get_mut(&fn_ptr) {
+                    d.signature = Some(arg_tys.clone());
+                }
+            }
+            Some(fixed) => {
+                for (i, (f, a)) in fixed.iter().zip(arg_tys.iter()).enumerate() {
+                    // W3a, W3-R2 (the Dispatch Law): a
+                    // closure-typed PARAMETER pins
+                    // per-INSTANTIATION, not per-definition —
+                    // two expansions of one body may each feed a
+                    // different closure id. The per-instantiation
+                    // truth rides the inner dispatch's own
+                    // `(call, site)` keys; only the non-closure
+                    // kinds carry the per-definition pin.
+                    let both_closures = matches!(lat.resolve(f), Ty::Closure(_))
+                        && matches!(lat.resolve(a), Ty::Closure(_));
+                    if both_closures || lat.unify(f, a).is_ok() {
+                        continue;
+                    }
+                    let want = type_name(&lat.resolve(f));
+                    let got = type_name(&lat.resolve(a));
+                    return Err(format!(
+                        "Type Error: argument {} of '{name}' is {got} where \
+                                 the first call fixed {want} — calls are monomorphic",
+                        i + 1
+                    ));
+                }
+            }
+        }
+
+        let body = unsafe { def.body() };
+
+        // R15 (owner ruling 2026-10-26): an expansion with NO
+        // valued return produces no value — consuming its result
+        // rejects; the statement position is the procedure form
+        // and stays legal. A body with ANY valued return is not
+        // valueless: its fall-off path answers the R13 typed zero
+        // by the Store Window Law.
+        if !stmt_position && !body_has_valued_return(body) {
+            return Err(format!(
+                "Type Error: '{name}' is an expansion with no return — \
+                 it produces no value"
+            ));
+        }
+
+        // the per-instantiation fact key: the OUTERMOST expansion
+        // this call is checked inside (the call itself at no
+        // expansion). One call expr may be checked once per site;
+        // the pair key keeps every site's resolution its own.
+        let call_ptr = expr as *const Expr;
+        let site = self.expansion_sites.first().copied().unwrap_or(call_ptr);
+
+        // W3a: the call-through's env face — recorded at the creation
+        // site (program order guarantees it precedes every dispatch
+        // off the value), resolved through the current store.
+        let env_face = if call_through {
+            match self.env_faces.get(&fn_ptr) {
+                Some(face) => face
+                    .iter()
+                    .map(|(n, t)| (n.clone(), lat.resolve(t)))
+                    .collect(),
+                None => {
+                    return Err(format!(
+                        "Type Error: '{name}' dispatches with no recorded env — \
+                         the checker and the analyzer disagree"
+                    ));
+                }
+            }
+        } else {
+            BTreeMap::new()
+        };
+
+        self.inline_stack.push(fn_ptr);
+        self.expansion_sites.push(call_ptr);
+        self.expansion_frame_bases.push(self.frames.len());
+        self.expansion_params.push(def.params.clone());
+        self.expansion_envs
+            .push(if call_through { Some(env_face) } else { None });
+        self.env_overrides.push(BTreeMap::new());
+        self.begin_scope();
+        for (p, aty) in def.params.iter().zip(arg_tys) {
+            let pty = lat.fresh();
+            self.declare_var(lat, p.clone(), pty.clone())?;
+            lat.unify(&pty, &aty)?;
+        }
+        self.push_return_ctx(def.ret.clone());
+        let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
+        self.check_block(lat, body);
+        self.loop_depth = saved_loop_depth;
+        let ret = match self.return_ctxs.pop() {
+            Some(ReturnCtx::Internal(ty)) => lat.resolve(&ty),
+            _ => unreachable!("push_return_ctx just pushed an Internal context"),
+        };
+        self.end_scope();
+        self.inline_stack.pop();
+        self.expansion_sites.pop();
+        self.expansion_frame_bases.pop();
+        self.expansion_params.pop();
+        self.expansion_envs.pop();
+        self.env_overrides.pop();
+
+        // the resolved return type is per-instantiation; the
+        // def's own `ret` stays the shared lattice anchor the
+        // next expansion seeds its return context from (the
+        // monomorphic law is per-definition)
+        self.call_rets.insert((call_ptr, site), ret.clone());
+        self.call_defs.insert((call_ptr, site), fn_ptr);
+        let _ = callee;
+        Ok(ret)
     }
 
     /// Walks until the first error, records it with its line, keeps going
@@ -1909,6 +2377,7 @@ pub(super) fn type_name(ty: &Ty) -> String {
         Ty::FfiLib => "FfiLib".to_string(),
         Ty::Coro => "Coro".to_string(),
         Ty::Any => "Any".to_string(),
+        Ty::Closure(_) => "Closure".to_string(),
         // totality only — flow state never rides a resolved checker type
         Ty::Pending => "Pending".to_string(),
         Ty::Conflict => "Conflict".to_string(),

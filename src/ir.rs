@@ -262,6 +262,7 @@ pub fn repr_of(ty: &Ty) -> RegKind {
         Ty::Any => RegKind::Any,
         Ty::Str | Ty::Tbl(_) | Ty::Unknown(_) => RegKind::Ptr,
         Ty::Ffi | Ty::FfiLib | Ty::Coro => RegKind::Ptr,
+        Ty::Closure(_) => RegKind::Ptr,
         // the artifact path sees only decided kinds and unknowns — the
         // elem table materializes flow state before facts assemble
         Ty::Pending | Ty::Conflict => unreachable!("flow state never rides the artifact path"),
@@ -305,6 +306,7 @@ impl CellTy {
             Ty::Any => CellTy::Any,
             Ty::Str | Ty::Tbl(_) => CellTy::Ptr,
             Ty::Ffi | Ty::FfiLib | Ty::Coro | Ty::Unknown(_) => CellTy::Byte,
+            Ty::Closure(_) => CellTy::Ptr,
             Ty::Pending | Ty::Conflict => unreachable!("flow state never rides the artifact path"),
         }
     }
