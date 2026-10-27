@@ -367,6 +367,19 @@ impl<'a> IrLowerer<'a> {
         let mut kept: Vec<(Reg<Ptr>, Vec<Reg<Ptr>>)> = Vec::new();
         for f in frees {
             let carrier = self.read_var(&f.carrier)?;
+            // W3a's Extraction Law, lowering half: a closure-typed
+            // register is a VIEW of its env — the mint is the one
+            // owner, freed at root exit. A closure carrier here means
+            // a face read reached a binding past the checker's
+            // reject; freeing the view would fire an untracked second
+            // free on a live env.
+            if matches!(carrier.ty, Ty::Closure(_)) {
+                return Err(LowerError(format!(
+                    "a closure value's env has one owner (its mint) — '{}' carries a \
+                     face; the checker and the lowerer disagree",
+                    f.carrier
+                )));
+            }
             let table = ptr_of(carrier.reg)?;
             signal!(trace::TRACE_DO_EXIT_FREE_PHI);
             if f.keeps.is_empty() {

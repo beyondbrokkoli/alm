@@ -847,7 +847,9 @@ impl Checker {
                         expr_types.push(self.bind_function(lat, name, expr));
                     } else {
                         self.declare_fn_binding(name, None);
-                        expr_types.push(self.check_expr(lat, expr)?);
+                        let ty = self.check_expr(lat, expr)?;
+                        Self::reject_face_extraction(expr, &ty)?;
+                        expr_types.push(ty);
                     }
                 }
                 for name in &names[exprs.len()..] {
@@ -944,6 +946,7 @@ impl Checker {
                     return Ok(());
                 }
                 let actual = self.check_expr(lat, expr)?;
+                Self::reject_face_extraction(expr, &actual)?;
                 if expected != actual {
                     // every cleanly-joinable elem mix was already adopted
                     // by the lattice (the rebind's site exchange, the
@@ -1599,6 +1602,23 @@ impl Checker {
         let site = self.fact_site(expr as *const Expr);
         self.creation_envs.insert((expr as *const Expr, site), ptr);
         Ok(Ty::Closure(ptr))
+    }
+
+    /// W3a's Extraction Law: a closure face rides its record's FIELD —
+    /// the field read answers the bare env pointer, and the env's ONE
+    /// owner is its mint (freed at root exit). A binding that receives
+    /// the read would carry an untracked second free at its own scope
+    /// exit, so a face read feeds only the escape positions — a call
+    /// argument, a return, a literal record field — never a name.
+    fn reject_face_extraction(expr: &Expr, ty: &Ty) -> Result<(), String> {
+        if matches!(expr, Expr::Field { .. }) && matches!(ty, Ty::Closure(_)) {
+            return Err(
+                "Type Error: the face rides the field — a closure field cannot be \
+                 extracted into a name; call it through the record"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// W3a, R3's record-face read half: does the obj's ctor pin this
