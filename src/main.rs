@@ -121,19 +121,24 @@ fn references_arg(stmts: &[Stmt]) -> bool {
     }
     fn go(stmts: &[Stmt]) -> bool {
         stmts.iter().any(|s| match s {
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs } => exprs.iter().any(expr),
+            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => exprs.iter().any(expr),
             Stmt::Assignment { expr: value, .. } => expr(value),
-            Stmt::IndexAssign { obj, key, value } => expr(obj) || expr(key) || expr(value),
-            Stmt::While { condition, body } => expr(condition) || go(body),
-            Stmt::Do { body } => go(body),
+            Stmt::IndexAssign {
+                obj, key, value, ..
+            } => expr(obj) || expr(key) || expr(value),
+            Stmt::While {
+                condition, body, ..
+            } => expr(condition) || go(body),
+            Stmt::Do { body, .. } => go(body),
             Stmt::If {
                 condition,
                 then_body,
                 else_body,
+                ..
             } => expr(condition) || go(then_body) || go(else_body),
-            Stmt::Expr { expr: inner } => expr(inner),
-            Stmt::Return { value } => value.as_ref().is_some_and(expr),
-            Stmt::Break => false,
+            Stmt::Expr { expr: inner, .. } => expr(inner),
+            Stmt::Return { value, .. } => value.as_ref().is_some_and(expr),
+            Stmt::Break { .. } => false,
         })
     }
     go(stmts)
@@ -165,19 +170,24 @@ fn uses_ffi(stmts: &[Stmt]) -> bool {
     }
     fn go(stmts: &[Stmt]) -> bool {
         stmts.iter().any(|s| match s {
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs } => exprs.iter().any(expr),
+            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => exprs.iter().any(expr),
             Stmt::Assignment { expr: value, .. } => expr(value),
-            Stmt::IndexAssign { obj, key, value } => expr(obj) || expr(key) || expr(value),
-            Stmt::While { condition, body } => expr(condition) || go(body),
-            Stmt::Do { body } => go(body),
+            Stmt::IndexAssign {
+                obj, key, value, ..
+            } => expr(obj) || expr(key) || expr(value),
+            Stmt::While {
+                condition, body, ..
+            } => expr(condition) || go(body),
+            Stmt::Do { body, .. } => go(body),
             Stmt::If {
                 condition,
                 then_body,
                 else_body,
+                ..
             } => expr(condition) || go(then_body) || go(else_body),
-            Stmt::Expr { expr: inner } => expr(inner),
-            Stmt::Return { value } => value.as_ref().is_some_and(expr),
-            Stmt::Break => false,
+            Stmt::Expr { expr: inner, .. } => expr(inner),
+            Stmt::Return { value, .. } => value.as_ref().is_some_and(expr),
+            Stmt::Break { .. } => false,
         })
     }
     go(stmts)

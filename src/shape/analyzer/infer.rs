@@ -87,7 +87,7 @@ pub(super) fn guard_only_ascends(
 ) -> bool {
     for s in stmts {
         match s {
-            Stmt::Assignment { name, expr } if name == guard => {
+            Stmt::Assignment { name, expr, .. } if name == guard => {
                 let Expr::BinaryOp {
                     op: BinOp::Add,
                     left,
@@ -103,7 +103,7 @@ pub(super) fn guard_only_ascends(
                     return false;
                 }
             }
-            Stmt::While { body, .. } | Stmt::Do { body } => {
+            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
                 if !guard_only_ascends(num_assigns, body, guard) {
                     return false;
                 }
@@ -930,7 +930,7 @@ impl Analyzer {
                     fills.insert(table_name.clone());
                 }
                 match stmt {
-                    Stmt::While { body, .. } | Stmt::Do { body } => {
+                    Stmt::While { body, .. } | Stmt::Do { body, .. } => {
                         collect_fills(body, guard, mutated, fills)
                     }
                     Stmt::If {

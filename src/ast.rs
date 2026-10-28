@@ -72,43 +72,85 @@ pub enum Expr {
     },
 }
 
+/// Where a statement was born: the (line, col) of its leading token,
+/// stamped at construction (H5) — attribution rides the node, so a
+/// desugar copies the stamp instead of pre-pushing counter entries.
+/// NOT a byte offset: line/col are what consumers eat, and stamped
+/// values are byte-identical to the seq pushes they replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Loc {
+    pub line: u32,
+    pub col: u32,
+}
+
 #[derive(Debug, Clone)]
 pub enum Stmt {
     LocalDecl {
         names: Vec<String>,
         exprs: Vec<Expr>,
+        loc: Loc,
     },
     Assignment {
         name: String,
         expr: Expr,
+        loc: Loc,
     },
     IndexAssign {
         obj: Expr,
         key: Expr,
         value: Expr,
+        loc: Loc,
     },
     While {
         condition: Expr,
         body: Vec<Stmt>,
+        loc: Loc,
     },
     Do {
         body: Vec<Stmt>,
+        loc: Loc,
     },
     If {
         condition: Expr,
         then_body: Vec<Stmt>,
         else_body: Vec<Stmt>,
+        loc: Loc,
     },
     Print {
         exprs: Vec<Expr>,
+        loc: Loc,
     },
     Expr {
         expr: Expr,
+        loc: Loc,
     },
     Return {
         value: Option<Expr>,
+        loc: Loc,
     },
-    Break,
+    Break {
+        loc: Loc,
+    },
+}
+
+impl Stmt {
+    /// The statement's birth stamp (H5): every variant carries `loc`,
+    /// and this is the one read face — a field off the enum is not
+    /// spellable, so the accessor keeps the stamp's consumers uniform.
+    pub fn loc(&self) -> Loc {
+        match self {
+            Stmt::LocalDecl { loc, .. }
+            | Stmt::Assignment { loc, .. }
+            | Stmt::IndexAssign { loc, .. }
+            | Stmt::While { loc, .. }
+            | Stmt::Do { loc, .. }
+            | Stmt::If { loc, .. }
+            | Stmt::Print { loc, .. }
+            | Stmt::Expr { loc, .. }
+            | Stmt::Return { loc, .. }
+            | Stmt::Break { loc } => *loc,
+        }
+    }
 }
 
 /// True when a `break` belongs to THIS loop level: recurses into Do/If
@@ -121,8 +163,8 @@ pub enum Stmt {
 /// twin carries the reserve, the break twin the checked stores).
 pub fn has_break(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        Stmt::Break => true,
-        Stmt::Do { body } => has_break(body),
+        Stmt::Break { .. } => true,
+        Stmt::Do { body, .. } => has_break(body),
         Stmt::While { .. } => false,
         Stmt::If {
             then_body,

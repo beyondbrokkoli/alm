@@ -179,31 +179,36 @@ fn collect_body_sites(
 ) {
     fn walk_stmt(s: &Stmt, sites: &BTreeMap<*const Expr, usize>, out: &mut BTreeSet<usize>) {
         match s {
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs } => {
+            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
                 exprs.iter().for_each(|e| walk_expr(e, sites, out))
             }
-            Stmt::Assignment { expr, .. } | Stmt::Expr { expr } => walk_expr(expr, sites, out),
-            Stmt::Break => {}
-            Stmt::IndexAssign { obj, key, value } => {
+            Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => walk_expr(expr, sites, out),
+            Stmt::Break { .. } => {}
+            Stmt::IndexAssign {
+                obj, key, value, ..
+            } => {
                 walk_expr(obj, sites, out);
                 walk_expr(key, sites, out);
                 walk_expr(value, sites, out);
             }
-            Stmt::While { condition, body } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 walk_expr(condition, sites, out);
                 body.iter().for_each(|s| walk_stmt(s, sites, out));
             }
-            Stmt::Do { body } => body.iter().for_each(|s| walk_stmt(s, sites, out)),
+            Stmt::Do { body, .. } => body.iter().for_each(|s| walk_stmt(s, sites, out)),
             Stmt::If {
                 condition,
                 then_body,
                 else_body,
+                ..
             } => {
                 walk_expr(condition, sites, out);
                 then_body.iter().for_each(|s| walk_stmt(s, sites, out));
                 else_body.iter().for_each(|s| walk_stmt(s, sites, out));
             }
-            Stmt::Return { value } => {
+            Stmt::Return { value, .. } => {
                 if let Some(e) = value {
                     walk_expr(e, sites, out);
                 }
@@ -252,34 +257,40 @@ fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
                 }
                 walk_obj_value(s, out);
             }
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs } => {
+            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
                 exprs.iter().for_each(|e| walk_expr(e, out))
             }
-            Stmt::Assignment { expr, .. } | Stmt::Expr { expr } => walk_expr(expr, out),
-            Stmt::While { condition, body } => {
+            Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => walk_expr(expr, out),
+            Stmt::While {
+                condition, body, ..
+            } => {
                 walk_expr(condition, out);
                 body.iter().for_each(|s| walk_stmt(s, out));
             }
-            Stmt::Do { body } => body.iter().for_each(|s| walk_stmt(s, out)),
+            Stmt::Do { body, .. } => body.iter().for_each(|s| walk_stmt(s, out)),
             Stmt::If {
                 condition,
                 then_body,
                 else_body,
+                ..
             } => {
                 walk_expr(condition, out);
                 then_body.iter().for_each(|s| walk_stmt(s, out));
                 else_body.iter().for_each(|s| walk_stmt(s, out));
             }
-            Stmt::Return { value } => {
+            Stmt::Return { value, .. } => {
                 if let Some(e) = value {
                     walk_expr(e, out);
                 }
             }
-            Stmt::Break => {}
+            Stmt::Break { .. } => {}
         }
     }
     fn walk_obj_value(s: &Stmt, out: &mut BTreeSet<String>) {
-        if let Stmt::IndexAssign { obj, key, value } = s {
+        if let Stmt::IndexAssign {
+            obj, key, value, ..
+        } = s
+        {
             walk_expr(obj, out);
             walk_expr(key, out);
             walk_expr(value, out);

@@ -28,13 +28,17 @@ pub fn build_context<'a>(
         stmt_col_seq.len(),
         "stmt column sequence out of step with the line sequence"
     );
-    let mut stmt_lines = BTreeMap::new();
-    let mut stmt_locs = BTreeMap::new();
+    // The SHADOW (H5 sessions 2–3): the parser's parallel attribution
+    // arrays, consumed pre-order. The count asserts around this walk
+    // stay — under-run, over-run — until session 4 deletes the arrays
+    // and this whole half with them.
+    let mut seq_lines = BTreeMap::new();
+    let mut seq_locs = BTreeMap::new();
     let mut i = 0;
     record_stmt_lines(
         ast,
-        &mut stmt_lines,
-        &mut stmt_locs,
+        &mut seq_lines,
+        &mut seq_locs,
         stmt_line_seq,
         stmt_col_seq,
         &mut i,
@@ -48,10 +52,27 @@ pub fn build_context<'a>(
         stmt_line_seq.len(),
         i
     );
+    // The TRUTH (H5 session 2): attribution derived from the nodes' own
+    // loc stamps — the returned maps come from HERE, so session 4's
+    // deletion removes a shadow, not a load-bearing path. The dual-run
+    // assert below pins the two derivations together in the meantime.
+    let mut stmt_lines = BTreeMap::new();
+    let mut stmt_locs = BTreeMap::new();
+    let mut kinds = BTreeMap::new();
+    derive_from_locs(ast, &mut stmt_lines, &mut stmt_locs, &mut kinds);
+    assert_dual_run(
+        &seq_lines,
+        &seq_locs,
+        &stmt_lines,
+        &stmt_locs,
+        &kinds,
+        stmt_line_seq.len(),
+    );
     // H5's misattribution half: the count asserts prove totals in both
     // directions; they cannot prove a fabricated entry points at the
     // RIGHT line. The census pins the one multi-statement desugar's
-    // attribution discipline on every compile.
+    // attribution discipline on every compile — now over the loc-derived
+    // map (identical to the shadow's by the assert above).
     census_for_desugar(ast, &stmt_lines);
 
     AnalysisContext {
@@ -116,8 +137,164 @@ fn stmt_kind(s: &Stmt) -> &'static str {
         Stmt::Print { .. } => "Print",
         Stmt::Expr { .. } => "Expr",
         Stmt::Return { .. } => "Return",
-        Stmt::Break => "Break",
+        Stmt::Break { .. } => "Break",
     }
+}
+
+/// H5 session 2's truth half: attribution derived from the nodes' own
+/// `loc` stamps. Statements live in fn-literal bodies inside exprs, so
+/// the recursion mirrors record_stmt_lines exactly — same walk, no
+/// counter, nothing to miscount. `kinds` rides along so the dual-run
+/// assert can name the diverging construct when it cries wolf.
+fn derive_from_locs(
+    stmts: &[Stmt],
+    lines: &mut BTreeMap<*const Stmt, usize>,
+    locs: &mut BTreeMap<*const Stmt, SourceLoc>,
+    kinds: &mut BTreeMap<*const Stmt, &'static str>,
+) {
+    for s in stmts {
+        let stamp = s.loc();
+        lines.insert(s as *const Stmt, stamp.line as usize);
+        locs.insert(
+            s as *const Stmt,
+            SourceLoc {
+                line: stamp.line,
+                col: stamp.col,
+            },
+        );
+        kinds.insert(s as *const Stmt, stmt_kind(s));
+        derive_stmt_exprs(s, lines, locs, kinds);
+    }
+}
+
+/// The loc-derivation's expression half — the statement lists hiding in
+/// fn-literal bodies inside every expression position.
+fn derive_stmt_exprs(
+    stmt: &Stmt,
+    lines: &mut BTreeMap<*const Stmt, usize>,
+    locs: &mut BTreeMap<*const Stmt, SourceLoc>,
+    kinds: &mut BTreeMap<*const Stmt, &'static str>,
+) {
+    let expr = |e: &Expr,
+                lines: &mut BTreeMap<*const Stmt, usize>,
+                locs: &mut BTreeMap<*const Stmt, SourceLoc>,
+                kinds: &mut BTreeMap<*const Stmt, &'static str>| {
+        derive_expr(e, lines, locs, kinds)
+    };
+    match stmt {
+        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
+            for e in exprs {
+                expr(e, lines, locs, kinds);
+            }
+        }
+        Stmt::Assignment { expr: ev, .. } | Stmt::Expr { expr: ev, .. } => {
+            expr(ev, lines, locs, kinds)
+        }
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => {
+            expr(obj, lines, locs, kinds);
+            expr(key, lines, locs, kinds);
+            expr(value, lines, locs, kinds);
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            expr(condition, lines, locs, kinds);
+            derive_from_locs(body, lines, locs, kinds);
+        }
+        Stmt::Do { body, .. } => derive_from_locs(body, lines, locs, kinds),
+        Stmt::If {
+            condition,
+            then_body,
+            else_body,
+            ..
+        } => {
+            expr(condition, lines, locs, kinds);
+            derive_from_locs(then_body, lines, locs, kinds);
+            derive_from_locs(else_body, lines, locs, kinds);
+        }
+        Stmt::Return { value, .. } => {
+            if let Some(e) = value {
+                expr(e, lines, locs, kinds);
+            }
+        }
+        Stmt::Break { .. } => {}
+    }
+}
+
+fn derive_expr(
+    e: &Expr,
+    lines: &mut BTreeMap<*const Stmt, usize>,
+    locs: &mut BTreeMap<*const Stmt, SourceLoc>,
+    kinds: &mut BTreeMap<*const Stmt, &'static str>,
+) {
+    match e {
+        Expr::Function { body, .. } => derive_from_locs(body, lines, locs, kinds),
+        Expr::TableCtor(entries) => {
+            for (k, v) in entries {
+                if let CtorKey::Expr(ke) = k {
+                    derive_expr(ke, lines, locs, kinds);
+                }
+                derive_expr(v, lines, locs, kinds);
+            }
+        }
+        Expr::Index { obj, key } => {
+            derive_expr(obj, lines, locs, kinds);
+            derive_expr(key, lines, locs, kinds);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            derive_expr(left, lines, locs, kinds);
+            derive_expr(right, lines, locs, kinds);
+        }
+        Expr::UnaryOp { expr, .. } => derive_expr(expr, lines, locs, kinds),
+        Expr::Call { callee, args } => {
+            derive_expr(callee, lines, locs, kinds);
+            for a in args {
+                derive_expr(a, lines, locs, kinds);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// THE H5 DUAL-RUN ASSERT (sessions 2–3 scaffolding): the loc-stamped
+/// truth and the seq-derived shadow must agree on every statement —
+/// same pointers, same line, same col. Any drift means a stamp was
+/// minted wrong (fix the STAMP, never this assert). Session 4 deletes
+/// the shadow half; this assert goes with it.
+fn assert_dual_run(
+    seq_lines: &BTreeMap<*const Stmt, usize>,
+    seq_locs: &BTreeMap<*const Stmt, SourceLoc>,
+    loc_lines: &BTreeMap<*const Stmt, usize>,
+    loc_locs: &BTreeMap<*const Stmt, SourceLoc>,
+    kinds: &BTreeMap<*const Stmt, &'static str>,
+    seq_len: usize,
+) {
+    if seq_lines == loc_lines && seq_locs == loc_locs {
+        return;
+    }
+    let mut keys: Vec<*const Stmt> = seq_lines.keys().copied().collect();
+    keys.extend(loc_lines.keys().copied());
+    keys.sort_unstable();
+    keys.dedup();
+    let bad = keys
+        .into_iter()
+        .find(|&k| seq_lines.get(&k) != loc_lines.get(&k) || seq_locs.get(&k) != loc_locs.get(&k))
+        .expect("maps differ but no key diverges");
+    panic!(
+        "H5 dual-run: loc-stamped attribution disagrees with the seq derivation at a {} \
+         statement ({:p}) — the loc stamp says {:?}, the seq entry says {:?} ({} seq entries \
+         total); fix the stamp, not the assert",
+        kinds
+            .get(&bad)
+            .copied()
+            .unwrap_or("<statement the loc walk missed>"),
+        bad,
+        loc_locs.get(&bad),
+        seq_locs.get(&bad),
+        seq_len
+    );
 }
 
 /// THE DESUGAR ATTRIBUTION CENSUS (H5). The count asserts above are
@@ -140,7 +317,7 @@ fn stmt_kind(s: &Stmt) -> &'static str {
 /// open (omniscience, not convention).
 fn census_for_desugar(stmts: &[Stmt], lines: &BTreeMap<*const Stmt, usize>) {
     for s in stmts {
-        if let Stmt::Do { body } = s
+        if let Stmt::Do { body, .. } = s
             && matches!(
                 body.get(1),
                 Some(Stmt::LocalDecl { names, .. })
@@ -183,7 +360,7 @@ fn census_for_desugar(stmts: &[Stmt], lines: &BTreeMap<*const Stmt, usize>) {
         // bodies riding inside expressions (a for can hide in any of
         // them)
         match s {
-            Stmt::While { body, .. } | Stmt::Do { body } => census_for_desugar(body, lines),
+            Stmt::While { body, .. } | Stmt::Do { body, .. } => census_for_desugar(body, lines),
             Stmt::If {
                 then_body,
                 else_body,
@@ -203,25 +380,27 @@ fn census_for_desugar(stmts: &[Stmt], lines: &BTreeMap<*const Stmt, usize>) {
 fn census_for_desugar_in_exprs(stmt: &Stmt, lines: &BTreeMap<*const Stmt, usize>) {
     let walk = |e: &Expr| census_expr(e, lines);
     match stmt {
-        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs } => {
+        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
             for e in exprs {
                 walk(e);
             }
         }
-        Stmt::Assignment { expr, .. } | Stmt::Expr { expr } => walk(expr),
-        Stmt::IndexAssign { obj, key, value } => {
+        Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => walk(expr),
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => {
             walk(obj);
             walk(key);
             walk(value);
         }
         Stmt::While { condition, .. } => walk(condition),
         Stmt::If { condition, .. } => walk(condition),
-        Stmt::Return { value } => {
+        Stmt::Return { value, .. } => {
             if let Some(e) = value {
                 walk(e);
             }
         }
-        Stmt::Break | Stmt::Do { .. } => {}
+        Stmt::Break { .. } | Stmt::Do { .. } => {}
     }
 }
 
@@ -268,37 +447,42 @@ fn record_stmt_exprs(
                 locs: &mut BTreeMap<*const Stmt, SourceLoc>,
                 i: &mut usize| { record_expr_lines(e, map, locs, seq, cols, i) };
     match stmt {
-        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs } => {
+        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
             for e in exprs {
                 expr(e, map, locs, i);
             }
         }
-        Stmt::Assignment { expr: ev, .. } | Stmt::Expr { expr: ev } => expr(ev, map, locs, i),
-        Stmt::IndexAssign { obj, key, value } => {
+        Stmt::Assignment { expr: ev, .. } | Stmt::Expr { expr: ev, .. } => expr(ev, map, locs, i),
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => {
             expr(obj, map, locs, i);
             expr(key, map, locs, i);
             expr(value, map, locs, i);
         }
-        Stmt::While { condition, body } => {
+        Stmt::While {
+            condition, body, ..
+        } => {
             expr(condition, map, locs, i);
             record_stmt_lines(body, map, locs, seq, cols, i);
         }
-        Stmt::Do { body } => record_stmt_lines(body, map, locs, seq, cols, i),
+        Stmt::Do { body, .. } => record_stmt_lines(body, map, locs, seq, cols, i),
         Stmt::If {
             condition,
             then_body,
             else_body,
+            ..
         } => {
             expr(condition, map, locs, i);
             record_stmt_lines(then_body, map, locs, seq, cols, i);
             record_stmt_lines(else_body, map, locs, seq, cols, i);
         }
-        Stmt::Return { value } => {
+        Stmt::Return { value, .. } => {
             if let Some(e) = value {
                 expr(e, map, locs, i);
             }
         }
-        Stmt::Break => {}
+        Stmt::Break { .. } => {}
     }
 }
 
@@ -353,39 +537,44 @@ fn number_stmt(stmt: &Stmt, sites: &mut BTreeMap<*const Expr, usize>) {
             }
         }
         Stmt::Assignment { expr, .. } => number_expr(expr, sites),
-        Stmt::IndexAssign { obj, key, value } => {
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => {
             number_expr(obj, sites);
             number_expr(key, sites);
             number_expr(value, sites);
         }
-        Stmt::While { condition, body } => {
+        Stmt::While {
+            condition, body, ..
+        } => {
             number_expr(condition, sites);
             number_sites(body, sites);
         }
-        Stmt::Do { body } => {
+        Stmt::Do { body, .. } => {
             number_sites(body, sites);
         }
         Stmt::If {
             condition,
             then_body,
             else_body,
+            ..
         } => {
             number_expr(condition, sites);
             number_sites(then_body, sites);
             number_sites(else_body, sites);
         }
-        Stmt::Print { exprs } => {
+        Stmt::Print { exprs, .. } => {
             for e in exprs {
                 number_expr(e, sites);
             }
         }
-        Stmt::Expr { expr } => number_expr(expr, sites),
-        Stmt::Return { value } => {
+        Stmt::Expr { expr, .. } => number_expr(expr, sites),
+        Stmt::Return { value, .. } => {
             if let Some(e) = value {
                 number_expr(e, sites);
             }
         }
-        Stmt::Break => {}
+        Stmt::Break { .. } => {}
     }
 }
 
@@ -475,17 +664,19 @@ fn scan_stmt(
         }
     }
     match stmt {
-        Stmt::LocalDecl { names, exprs } => {
+        Stmt::LocalDecl { names, exprs, .. } => {
             for e in exprs {
                 scan_expr(e, scopes, current_fn.as_deref_mut(), touched);
             }
             scopes.last_mut().unwrap().extend(names.iter().cloned());
         }
-        Stmt::Assignment { name, expr } => {
+        Stmt::Assignment { name, expr, .. } => {
             record(current_fn.as_deref_mut(), scopes, name);
             scan_expr(expr, scopes, current_fn.as_deref_mut(), touched);
         }
-        Stmt::IndexAssign { obj, key, value } => {
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => {
             if let Some(base) = base_identifier(obj) {
                 record(current_fn.as_deref_mut(), scopes, base);
             }
@@ -493,13 +684,15 @@ fn scan_stmt(
             scan_expr(key, scopes, current_fn.as_deref_mut(), touched);
             scan_expr(value, scopes, current_fn.as_deref_mut(), touched);
         }
-        Stmt::While { condition, body } => {
+        Stmt::While {
+            condition, body, ..
+        } => {
             scan_expr(condition, scopes, current_fn.as_deref_mut(), touched);
             scopes.push(Default::default());
             scan_stmts(body, scopes, current_fn.as_deref_mut(), touched);
             scopes.pop();
         }
-        Stmt::Do { body } => {
+        Stmt::Do { body, .. } => {
             scopes.push(Default::default());
             scan_stmts(body, scopes, current_fn.as_deref_mut(), touched);
             scopes.pop();
@@ -508,6 +701,7 @@ fn scan_stmt(
             condition,
             then_body,
             else_body,
+            ..
         } => {
             scan_expr(condition, scopes, current_fn.as_deref_mut(), touched);
             scopes.push(Default::default());
@@ -517,18 +711,18 @@ fn scan_stmt(
             scan_stmts(else_body, scopes, current_fn.as_deref_mut(), touched);
             scopes.pop();
         }
-        Stmt::Print { exprs } => {
+        Stmt::Print { exprs, .. } => {
             for e in exprs {
                 scan_expr(e, scopes, current_fn.as_deref_mut(), touched);
             }
         }
-        Stmt::Expr { expr } => scan_expr(expr, scopes, current_fn.as_deref_mut(), touched),
-        Stmt::Return { value } => {
+        Stmt::Expr { expr, .. } => scan_expr(expr, scopes, current_fn.as_deref_mut(), touched),
+        Stmt::Return { value, .. } => {
             if let Some(e) = value {
                 scan_expr(e, scopes, current_fn, touched);
             }
         }
-        Stmt::Break => {}
+        Stmt::Break { .. } => {}
     }
 }
 

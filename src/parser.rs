@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
+use crate::ast::{BinOp, CtorKey, Expr, Loc, Stmt, UnOp};
 use crate::lexer::Token;
 use crate::shape::BOUNDS_FAIL_THRESHOLD;
 use std::collections::BTreeSet;
@@ -110,12 +110,22 @@ impl<'a> Parser<'a> {
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
         let off = self.tokens.peek_off().unwrap_or(self.tokens.last_off);
-        self.stmt_line_seq.push(self.line_of(off));
-        self.stmt_col_seq.push(self.col_of(off));
-        self.parse_stmt_inner()
+        let line = self.line_of(off);
+        let col = self.col_of(off);
+        self.stmt_line_seq.push(line);
+        self.stmt_col_seq.push(col);
+        // H5: the stamp rides the node from birth — the same (line, col)
+        // the seq pushes carry, captured once and handed to whatever
+        // Stmt this parse mints (desugars included: they copy the stamp
+        // instead of pre-pushing counter entries).
+        let at = Loc {
+            line: line as u32,
+            col: col as u32,
+        };
+        self.parse_stmt_inner(at)
     }
 
-    fn parse_stmt_inner(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_stmt_inner(&mut self, at: Loc) -> Result<Stmt, ParseError> {
         match self.tokens.peek().cloned() {
             Some(Token::Local) => {
                 self.tokens.next();
@@ -137,6 +147,7 @@ impl<'a> Parser<'a> {
                     return Ok(Stmt::LocalDecl {
                         names: vec![name],
                         exprs: vec![expr],
+                        loc: at,
                     });
                 }
                 let mut names = Vec::new();
@@ -174,7 +185,11 @@ impl<'a> Parser<'a> {
                     }
                 }
 
-                Ok(Stmt::LocalDecl { names, exprs })
+                Ok(Stmt::LocalDecl {
+                    names,
+                    exprs,
+                    loc: at,
+                })
             }
             Some(Token::While) => {
                 self.tokens.next();
@@ -187,15 +202,23 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(Token::End)?;
 
-                Ok(Stmt::While { condition, body })
+                Ok(Stmt::While {
+                    condition,
+                    body,
+                    loc: at,
+                })
             }
             Some(Token::For) => {
-                // parse_stmt pushed one seq entry for the desugared Stmt::Do.
-                // record_stmt_lines consumes entries in AST pre-order, so the
-                // synthesized LocalDecls (counter, limit latch), While, and
-                // inner-body Do need their own entries BEFORE the body
-                // parses, and the synthetic i = i + 1 one after — all
-                // pointing at the for header, desugared code reports there.
+                // parse_stmt pushed one seq entry (and stamped `at`) for
+                // the desugared Stmt::Do. record_stmt_lines consumes
+                // entries in AST pre-order, so the synthesized LocalDecls
+                // (counter, limit latch), While, and inner-body Do need
+                // their own entries BEFORE the body parses, and the
+                // synthetic i = i + 1 one after — all pointing at the for
+                // header, desugared code reports there. H5: the six
+                // statements carry the same law as their `loc` stamps
+                // (`at`, the header); the seq pushes remain as the
+                // dual-run shadow until session 4 deletes them.
                 let for_line = *self.stmt_line_seq.last().unwrap_or(&1);
                 let for_col = *self.stmt_col_seq.last().unwrap_or(&1);
                 self.stmt_line_seq.push(for_line);
@@ -275,16 +298,19 @@ impl<'a> Parser<'a> {
                         left: Box::new(Expr::Identifier(var.clone())),
                         right: Box::new(Expr::Integer(1)),
                     },
+                    loc: at,
                 };
                 Ok(Stmt::Do {
                     body: vec![
                         Stmt::LocalDecl {
                             names: vec![var.clone()],
                             exprs: vec![start],
+                            loc: at,
                         },
                         Stmt::LocalDecl {
                             names: vec![limit_slot.clone()],
                             exprs: vec![limit],
+                            loc: at,
                         },
                         Stmt::While {
                             condition: Expr::BinaryOp {
@@ -292,14 +318,16 @@ impl<'a> Parser<'a> {
                                 left: Box::new(Expr::Identifier(var)),
                                 right: Box::new(Expr::Identifier(limit_slot)),
                             },
-                            body: vec![Stmt::Do { body }, increment],
+                            body: vec![Stmt::Do { body, loc: at }, increment],
+                            loc: at,
                         },
                     ],
+                    loc: at,
                 })
             }
             Some(Token::Break) => {
                 self.tokens.next();
-                Ok(Stmt::Break)
+                Ok(Stmt::Break { loc: at })
             }
             Some(Token::If) => {
                 self.tokens.next();
@@ -337,6 +365,7 @@ impl<'a> Parser<'a> {
                     condition,
                     then_body,
                     else_body,
+                    loc: at,
                 })
             }
             Some(Token::Do) => {
@@ -346,7 +375,7 @@ impl<'a> Parser<'a> {
                     body.push(self.parse_stmt()?);
                 }
                 self.expect(Token::End)?;
-                Ok(Stmt::Do { body })
+                Ok(Stmt::Do { body, loc: at })
             }
             Some(Token::Print) => {
                 self.tokens.next();
@@ -360,7 +389,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(Token::RightParen)?;
-                Ok(Stmt::Print { exprs })
+                Ok(Stmt::Print { exprs, loc: at })
             }
             Some(Token::Return) => {
                 self.tokens.next();
@@ -381,7 +410,7 @@ impl<'a> Parser<'a> {
                     ) => Some(self.parse_expr()?),
                     _ => None,
                 };
-                Ok(Stmt::Return { value })
+                Ok(Stmt::Return { value, loc: at })
             }
             Some(Token::Function) => {
                 // D4 surface sugar, pure desugar — no new semantics:
@@ -392,12 +421,16 @@ impl<'a> Parser<'a> {
                 // redeclares. The dotted name rides as ONE string key
                 // (the fn maps are String-keyed); deeper chains `A.B.c`
                 // fall out the same way. The desugar is 1 AST stmt per
-                // parse_stmt call, so the stmt_line_seq pre-push stays
-                // exact (H5).
+                // parse_stmt call stamped with the same `at` the push
+                // used (H5).
                 self.tokens.next();
                 let name = self.parse_fn_stmt_name()?;
                 let expr = self.parse_fn_literal()?;
-                Ok(Stmt::Assignment { name, expr })
+                Ok(Stmt::Assignment {
+                    name,
+                    expr,
+                    loc: at,
+                })
             }
             Some(Token::Identifier(_)) => {
                 let lhs = self.parse_expr()?;
@@ -405,7 +438,11 @@ impl<'a> Parser<'a> {
                     self.tokens.next();
                     let rhs = self.parse_expr()?;
                     match lhs {
-                        Expr::Identifier(name) => Ok(Stmt::Assignment { name, expr: rhs }),
+                        Expr::Identifier(name) => Ok(Stmt::Assignment {
+                            name,
+                            expr: rhs,
+                            loc: at,
+                        }),
                         Expr::Field { obj, name } => {
                             // dot write sugar desugars to a string-keyed
                             // index at parse time (the checker later
@@ -417,17 +454,19 @@ impl<'a> Parser<'a> {
                                 obj: *obj,
                                 key: Expr::String(name),
                                 value: rhs,
+                                loc: at,
                             })
                         }
                         Expr::Index { obj, key } => Ok(Stmt::IndexAssign {
                             obj: *obj,
                             key: *key,
                             value: rhs,
+                            loc: at,
                         }),
                         _ => Err(ParseError("Syntax Error: Invalid assignment target".into())),
                     }
                 } else if matches!(lhs, Expr::Call { .. }) {
-                    Ok(Stmt::Expr { expr: lhs })
+                    Ok(Stmt::Expr { expr: lhs, loc: at })
                 } else if let Expr::Identifier(name) = &lhs {
                     if name == "continue" {
                         // C3's named rejection: 'continue' parses as a
@@ -521,7 +560,7 @@ impl<'a> Parser<'a> {
                     return false;
                 }
                 Stmt::Assignment { name, .. } if name == var => return true,
-                Stmt::Do { body } | Stmt::While { body, .. } => {
+                Stmt::Do { body, .. } | Stmt::While { body, .. } => {
                     if Self::body_assigns_to(body, var) {
                         return true;
                     }
@@ -543,8 +582,16 @@ impl<'a> Parser<'a> {
 
     fn parse_elseif_chain(&mut self) -> Result<Stmt, ParseError> {
         let off = self.tokens.peek_off().unwrap_or(self.tokens.last_off);
-        self.stmt_line_seq.push(self.line_of(off));
-        self.stmt_col_seq.push(self.col_of(off));
+        let line = self.line_of(off);
+        let col = self.col_of(off);
+        self.stmt_line_seq.push(line);
+        self.stmt_col_seq.push(col);
+        // H5: the elseif's nested If is stamped at its own leading
+        // token — the same (line, col) the push above carries.
+        let at = Loc {
+            line: line as u32,
+            col: col as u32,
+        };
         self.expect(Token::ElseIf)?;
         let condition = self.parse_expr()?;
         self.expect(Token::Then)?;
@@ -580,6 +627,7 @@ impl<'a> Parser<'a> {
             condition,
             then_body,
             else_body,
+            loc: at,
         })
     }
 

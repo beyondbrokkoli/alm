@@ -1482,7 +1482,7 @@ fn h5_for_desugar_reports_at_the_header_pin() {
     let (ast, lines, cols, ctor) = parse_parts(source);
     let ctx = analysis::build_context(&ast, &lines, &cols, ctor);
     assert_eq!(ast.len(), 3);
-    let Stmt::Do { body } = &ast[1] else {
+    let Stmt::Do { body, .. } = &ast[1] else {
         panic!("the for-desugar rides a Do block");
     };
     let Stmt::While { body: wbody, .. } = &body[2] else {
@@ -1503,7 +1503,7 @@ fn h5_for_desugar_reports_at_the_header_pin() {
             "the {what} must report the for header's line"
         );
     }
-    let Stmt::Do { body: ubody } = &wbody[0] else {
+    let Stmt::Do { body: ubody, .. } = &wbody[0] else {
         panic!("desugar shape: the While body opens with the user's inner Do");
     };
     assert_eq!(
@@ -1614,19 +1614,25 @@ fn h5_overcount_fails_loudly() {
 /// are count-exact but line-wrong (the increment reports 9 while the
 /// header family reports 2). The count asserts pass; the census must
 /// cry wolf. This is the drift class only a FABRICATING desugar can
-/// produce — hand-built here because a correct parser cannot.
+/// produce — hand-built here because a correct parser cannot. Since
+/// session 2 the drift is fabricated on BOTH sides consistently (the
+/// increment's `loc` stamp AND the seq entry both say 9): the dual-run
+/// assert must stay quiet, the census must not.
 #[test]
 #[should_panic(expected = "attribution drift")]
 fn h5_census_trips_on_right_count_wrong_line() {
+    let at = |line: u32| crate::ast::Loc { line, col: 1 };
     let ast = vec![Stmt::Do {
         body: vec![
             Stmt::LocalDecl {
                 names: vec!["i".into()],
                 exprs: vec![Expr::Integer(0)],
+                loc: at(2),
             },
             Stmt::LocalDecl {
                 names: vec!["for$limit".into()],
                 exprs: vec![Expr::Integer(4)],
+                loc: at(2),
             },
             Stmt::While {
                 condition: Expr::BinaryOp {
@@ -1635,7 +1641,10 @@ fn h5_census_trips_on_right_count_wrong_line() {
                     right: Box::new(Expr::Identifier("for$limit".into())),
                 },
                 body: vec![
-                    Stmt::Do { body: vec![] },
+                    Stmt::Do {
+                        body: vec![],
+                        loc: at(2),
+                    },
                     Stmt::Assignment {
                         name: "i".into(),
                         expr: Expr::BinaryOp {
@@ -1643,10 +1652,13 @@ fn h5_census_trips_on_right_count_wrong_line() {
                             left: Box::new(Expr::Identifier("i".into())),
                             right: Box::new(Expr::Integer(1)),
                         },
+                        loc: at(9),
                     },
                 ],
+                loc: at(2),
             },
         ],
+        loc: at(2),
     }];
     let lines = vec![2, 2, 2, 2, 2, 9];
     let cols = vec![1, 1, 1, 1, 1, 1];

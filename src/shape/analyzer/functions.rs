@@ -13,18 +13,22 @@ fn collect_creation_reads_stmt(stmt: &Stmt, out: &mut Vec<String>) {
             }
         }
         Stmt::Assignment { expr, .. } => collect_creation_reads_expr(expr, out),
-        Stmt::IndexAssign { obj, key, value } => {
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => {
             collect_creation_reads_expr(obj, out);
             collect_creation_reads_expr(key, out);
             collect_creation_reads_expr(value, out);
         }
-        Stmt::While { condition, body } => {
+        Stmt::While {
+            condition, body, ..
+        } => {
             collect_creation_reads_expr(condition, out);
             for s in body {
                 collect_creation_reads_stmt(s, out);
             }
         }
-        Stmt::Do { body } => {
+        Stmt::Do { body, .. } => {
             for s in body {
                 collect_creation_reads_stmt(s, out);
             }
@@ -33,24 +37,25 @@ fn collect_creation_reads_stmt(stmt: &Stmt, out: &mut Vec<String>) {
             condition,
             then_body,
             else_body,
+            ..
         } => {
             collect_creation_reads_expr(condition, out);
             for s in then_body.iter().chain(else_body.iter()) {
                 collect_creation_reads_stmt(s, out);
             }
         }
-        Stmt::Return { value } => {
+        Stmt::Return { value, .. } => {
             if let Some(e) = value {
                 collect_creation_reads_expr(e, out);
             }
         }
-        Stmt::Print { exprs } => {
+        Stmt::Print { exprs, .. } => {
             for e in exprs {
                 collect_creation_reads_expr(e, out);
             }
         }
-        Stmt::Expr { expr } => collect_creation_reads_expr(expr, out),
-        Stmt::Break => {}
+        Stmt::Expr { expr, .. } => collect_creation_reads_expr(expr, out),
+        Stmt::Break { .. } => {}
     }
 }
 
@@ -114,7 +119,7 @@ fn transitive_free_names(stmts: &[Stmt], bound: &mut BTreeSet<String>) -> BTreeS
 
 fn free_of_stmt(stmt: &Stmt, bound: &mut BTreeSet<String>, out: &mut BTreeSet<String>) {
     match stmt {
-        Stmt::LocalDecl { names, exprs } => {
+        Stmt::LocalDecl { names, exprs, .. } => {
             for expr in exprs {
                 free_of_expr(expr, bound, out);
             }
@@ -122,24 +127,28 @@ fn free_of_stmt(stmt: &Stmt, bound: &mut BTreeSet<String>, out: &mut BTreeSet<St
                 bound.insert(name.clone());
             }
         }
-        Stmt::Assignment { name, expr } => {
+        Stmt::Assignment { name, expr, .. } => {
             free_of_expr(expr, bound, out);
             if !bound.contains(name) {
                 out.insert(name.clone());
             }
         }
-        Stmt::IndexAssign { obj, key, value } => {
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => {
             free_of_expr(obj, bound, out);
             free_of_expr(key, bound, out);
             free_of_expr(value, bound, out);
         }
-        Stmt::While { condition, body } => {
+        Stmt::While {
+            condition, body, ..
+        } => {
             free_of_expr(condition, bound, out);
             for s in body {
                 free_of_stmt(s, bound, out);
             }
         }
-        Stmt::Do { body } => {
+        Stmt::Do { body, .. } => {
             for s in body {
                 free_of_stmt(s, bound, out);
             }
@@ -148,6 +157,7 @@ fn free_of_stmt(stmt: &Stmt, bound: &mut BTreeSet<String>, out: &mut BTreeSet<St
             condition,
             then_body,
             else_body,
+            ..
         } => {
             free_of_expr(condition, bound, out);
             let mut then_bound = bound.clone();
@@ -159,18 +169,18 @@ fn free_of_stmt(stmt: &Stmt, bound: &mut BTreeSet<String>, out: &mut BTreeSet<St
                 free_of_stmt(s, &mut else_bound, out);
             }
         }
-        Stmt::Return { value } => {
+        Stmt::Return { value, .. } => {
             if let Some(e) = value {
                 free_of_expr(e, bound, out);
             }
         }
-        Stmt::Print { exprs } => {
+        Stmt::Print { exprs, .. } => {
             for e in exprs {
                 free_of_expr(e, bound, out);
             }
         }
-        Stmt::Break => {}
-        Stmt::Expr { expr } => free_of_expr(expr, bound, out),
+        Stmt::Break { .. } => {}
+        Stmt::Expr { expr, .. } => free_of_expr(expr, bound, out),
     }
 }
 

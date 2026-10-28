@@ -66,7 +66,7 @@ impl Analyzer {
 
     fn walk_stmt_inner(&mut self, rec: Gate, stmt: &Stmt) -> Result<(), ShapeError> {
         match stmt {
-            Stmt::LocalDecl { names, exprs } => {
+            Stmt::LocalDecl { names, exprs, .. } => {
                 let mut sets = Vec::with_capacity(names.len());
                 let mut moved_srcs: Vec<(usize, String)> = Vec::new();
                 for (name, expr) in names.iter().zip(exprs.iter()) {
@@ -211,7 +211,7 @@ impl Analyzer {
                 }
             }
 
-            Stmt::Assignment { name, expr } => {
+            Stmt::Assignment { name, expr, .. } => {
                 let entry = self.holds.num_assigns.entry(name.clone()).or_default();
                 let shape = num_of(expr);
                 if !entry.contains(&shape) {
@@ -408,7 +408,9 @@ impl Analyzer {
                 )));
             }
 
-            Stmt::IndexAssign { obj, key, value } => {
+            Stmt::IndexAssign {
+                obj, key, value, ..
+            } => {
                 let (t, obj_sites, _) = self.infer_expr(rec, obj)?;
                 let (kty, _, _) = self.infer_expr(rec, key)?;
                 // the key discipline: an unresolved key the walk can
@@ -740,7 +742,9 @@ impl Analyzer {
                 }
             }
 
-            Stmt::While { condition, body } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 let (cty, _, _) = self.infer_expr(rec, condition)?;
                 // the condition discipline: an unresolved operand the
                 // walk can see pins to Boolean here, before the body
@@ -797,6 +801,7 @@ impl Analyzer {
                 condition,
                 then_body,
                 else_body,
+                ..
             } => {
                 signal!(rec.on(), trace::TRACE_STMT_IF);
                 let (cty, _, _) = self.infer_expr(rec, condition)?;
@@ -847,7 +852,7 @@ impl Analyzer {
                 }
             }
 
-            Stmt::Do { body } => {
+            Stmt::Do { body, .. } => {
                 signal!(rec.on(), trace::TRACE_STMT_DO);
                 self.with_scope(|an| {
                     an.walk_stmts(rec, body);
@@ -855,7 +860,7 @@ impl Analyzer {
                 })?
             }
 
-            Stmt::Print { exprs } => {
+            Stmt::Print { exprs, .. } => {
                 signal!(rec.on(), trace::TRACE_STMT_PRINT);
                 for e in exprs {
                     self.infer_expr(rec, e)?;
@@ -863,12 +868,12 @@ impl Analyzer {
                 }
             }
 
-            Stmt::Expr { expr } => {
+            Stmt::Expr { expr, .. } => {
                 self.infer_expr(rec, expr)?;
                 self.check_uses(rec, expr)?;
             }
 
-            Stmt::Break => {
+            Stmt::Break { .. } => {
                 // R8: a break may only leave a loop of the BODY it is
                 // written in — never cross a fn boundary (an expansion
                 // has no enclosing loop of the caller's to leave). The
@@ -893,7 +898,7 @@ impl Analyzer {
                 }
             }
 
-            Stmt::Return { value } => {
+            Stmt::Return { value, .. } => {
                 if let Some(v) = value {
                     let (ty, mut aliases, lineage) = self.infer_expr(rec, v)?;
                     self.check_uses(rec, v)?;

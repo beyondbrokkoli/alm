@@ -393,7 +393,7 @@ impl Checker {
                     self.collect_nested_fn_defs(lat, then_body);
                     self.collect_nested_fn_defs(lat, else_body);
                 }
-                Stmt::While { body, .. } | Stmt::Do { body } => {
+                Stmt::While { body, .. } | Stmt::Do { body, .. } => {
                     self.collect_nested_fn_defs(lat, body);
                 }
                 _ => {}
@@ -841,7 +841,7 @@ impl Checker {
             self.cur_decls.clear();
         }
         match stmt {
-            Stmt::LocalDecl { names, exprs } => {
+            Stmt::LocalDecl { names, exprs, .. } => {
                 let mut expr_types = Vec::with_capacity(exprs.len());
                 for (name, expr) in names.iter().zip(exprs.iter()) {
                     if let Expr::Function { .. } = expr {
@@ -883,7 +883,7 @@ impl Checker {
                     self.declare_var(lat, name.clone(), Ty::Unknown(id))?;
                 }
             }
-            Stmt::Assignment { name, expr } => {
+            Stmt::Assignment { name, expr, .. } => {
                 if let Expr::Function { .. } = expr {
                     let ty = self.bind_function(lat, name, expr);
                     if let Some(frame) = self
@@ -966,7 +966,9 @@ impl Checker {
                     o.insert(name.to_string(), lat.resolve(&actual));
                 }
             }
-            Stmt::IndexAssign { obj, key, value } => {
+            Stmt::IndexAssign {
+                obj, key, value, ..
+            } => {
                 let (elem, _obj_desc) = self.check_index_base(lat, obj)?;
                 let _key_ty = self.check_index_key(lat, key)?;
 
@@ -1032,7 +1034,9 @@ impl Checker {
                     lat.unify(&elem, &val_ty)?;
                 }
             }
-            Stmt::While { condition, body } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 self.check_condition(lat, condition, "while")?;
                 self.begin_scope();
                 self.loop_depth += 1;
@@ -1042,7 +1046,7 @@ impl Checker {
                 self.loop_depth -= 1;
                 self.end_scope();
             }
-            Stmt::Break => {
+            Stmt::Break { .. } => {
                 if self.loop_depth == 0 {
                     return Err("Type Error: 'break' outside of loop".to_string());
                 }
@@ -1051,6 +1055,7 @@ impl Checker {
                 condition,
                 then_body,
                 else_body,
+                ..
             } => {
                 self.check_condition(lat, condition, "if")?;
                 self.begin_scope();
@@ -1064,12 +1069,12 @@ impl Checker {
                 self.cond_depth -= 1;
                 self.end_scope();
             }
-            Stmt::Do { body } => {
+            Stmt::Do { body, .. } => {
                 self.begin_scope();
                 self.check_block(lat, body);
                 self.end_scope();
             }
-            Stmt::Print { exprs } => {
+            Stmt::Print { exprs, .. } => {
                 for e in exprs {
                     let ty = self.check_expr(lat, e)?;
                     if matches!(ty, Ty::Tbl(_)) {
@@ -1085,7 +1090,7 @@ impl Checker {
                     }
                 }
             }
-            Stmt::Expr { expr } => {
+            Stmt::Expr { expr, .. } => {
                 // R15: the whole-statement call is the procedure form —
                 // the one position a valueless expansion may occupy.
                 if matches!(expr, Expr::Call { .. }) {
@@ -1096,7 +1101,7 @@ impl Checker {
                 }
                 self.stmt_position_call = false;
             }
-            Stmt::Return { value } => match self.return_ctxs.last().cloned() {
+            Stmt::Return { value, .. } => match self.return_ctxs.last().cloned() {
                 Some(ReturnCtx::Boundary) => match value {
                     None | Some(Expr::Nil) => {}
                     Some(expr) => match self.check_expr(lat, expr)? {
@@ -2409,8 +2414,8 @@ fn types_compatible(l: &Ty, r: &Ty) -> bool {
 /// recursion, so a `return` inside any loop still counts.
 fn body_has_valued_return(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        Stmt::Return { value: Some(_) } => true,
-        Stmt::Do { body } | Stmt::While { body, .. } => body_has_valued_return(body),
+        Stmt::Return { value: Some(_), .. } => true,
+        Stmt::Do { body, .. } | Stmt::While { body, .. } => body_has_valued_return(body),
         Stmt::If {
             then_body,
             else_body,

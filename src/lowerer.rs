@@ -811,7 +811,7 @@ impl<'a> IrLowerer<'a> {
         self.env_memo = None;
         self.cur_stmt = Some(stmt as *const Stmt);
         match stmt {
-            Stmt::LocalDecl { names, exprs } => {
+            Stmt::LocalDecl { names, exprs, .. } => {
                 let mut bindings = Vec::with_capacity(exprs.len());
                 for expr in exprs {
                     let target_reg = self.next_reg();
@@ -918,7 +918,7 @@ impl<'a> IrLowerer<'a> {
                 self.null_moves_of(stmt)?;
                 self.emit_stmt_temp_frees(stmt);
             }
-            Stmt::Assignment { name, expr } => {
+            Stmt::Assignment { name, expr, .. } => {
                 // the sugar's #define face (D4): a fn-literal assignment
                 // to a name the lowering tables do not hold DECLARES it —
                 // the same placeholder slot `local f = function` gets
@@ -1009,7 +1009,9 @@ impl<'a> IrLowerer<'a> {
                 self.null_moves_of(stmt)?;
                 self.emit_stmt_temp_frees(stmt);
             }
-            Stmt::IndexAssign { obj, key, value } => {
+            Stmt::IndexAssign {
+                obj, key, value, ..
+            } => {
                 let TypedReg { reg: t_any, .. } = self.lower_expr(obj, None)?;
                 let t_reg = ptr_of(t_any)?;
                 let key = self.lower_index_key(key)?;
@@ -1086,7 +1088,9 @@ impl<'a> IrLowerer<'a> {
                 self.null_moves_of(stmt)?;
                 self.emit_stmt_temp_frees(stmt);
             }
-            Stmt::While { condition, body } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 let pre_header = self.current_block;
 
                 let header_block = self.new_block();
@@ -1320,14 +1324,14 @@ impl<'a> IrLowerer<'a> {
                     }
                 }
             }
-            Stmt::Do { body } => self.in_do(|an| -> Result<(), LowerError> {
+            Stmt::Do { body, .. } => self.in_do(|an| -> Result<(), LowerError> {
                 for s in body {
                     an.lower_stmt(s)?;
                 }
                 an.emit_scope_frees((stmt as *const Stmt, 0))
             })?,
 
-            Stmt::Print { exprs } => {
+            Stmt::Print { exprs, .. } => {
                 let mut operands = Vec::new();
                 for e in exprs {
                     let TypedReg { reg: r, ty } = self.lower_expr(e, None)?;
@@ -1336,11 +1340,11 @@ impl<'a> IrLowerer<'a> {
                 self.emit(Instruction::Print { operands });
                 self.emit_stmt_temp_frees(stmt);
             }
-            Stmt::Expr { expr } => {
+            Stmt::Expr { expr, .. } => {
                 self.lower_expr(expr, None)?;
                 self.emit_stmt_temp_frees(stmt);
             }
-            Stmt::Break => {
+            Stmt::Break { .. } => {
                 // defense in depth: a break inside an expansion may only
                 // bind a loop of its OWN body — the innermost ctx below
                 // the expansion's base belongs to the caller and must
@@ -1384,7 +1388,7 @@ impl<'a> IrLowerer<'a> {
                 self.terminate(Terminator::Jump(exit_block));
                 self.current_block = self.new_block();
             }
-            Stmt::Return { value } => {
+            Stmt::Return { value, .. } => {
                 let boundary = matches!(
                     self.return_ctxs.last().map(|ctx| &ctx.kind),
                     Some(ReturnKind::Boundary)
@@ -1499,6 +1503,7 @@ impl<'a> IrLowerer<'a> {
                 condition,
                 then_body,
                 else_body,
+                ..
             } => {
                 let cond_reg = bool_of(self.lower_expr(condition, None)?.reg)?;
                 self.emit_cond_temp_frees(stmt);
@@ -2708,7 +2713,7 @@ fn find_moved_names(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
             moved.extend(names.iter().cloned());
         }
         match stmt {
-            Stmt::While { body, .. } | Stmt::Do { body } => {
+            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
                 moved.extend(find_moved_names(body, shape));
             }
             Stmt::If {
@@ -2719,7 +2724,7 @@ fn find_moved_names(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
                 moved.extend(find_moved_names(then_body, shape));
                 moved.extend(find_moved_names(else_body, shape));
             }
-            Stmt::Expr { expr } => calls_touched(expr, shape, &mut moved),
+            Stmt::Expr { expr, .. } => calls_touched(expr, shape, &mut moved),
             _ => {}
         }
     }
@@ -2778,7 +2783,7 @@ fn find_mutated_vars(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
             Stmt::While { body, .. } => {
                 mutated.extend(find_mutated_vars(body, shape));
             }
-            Stmt::Do { body } => {
+            Stmt::Do { body, .. } => {
                 mutated.extend(find_mutated_vars(body, shape));
             }
             Stmt::If {
@@ -2789,7 +2794,7 @@ fn find_mutated_vars(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
                 mutated.extend(find_mutated_vars(then_body, shape));
                 mutated.extend(find_mutated_vars(else_body, shape));
             }
-            Stmt::Expr { expr } => calls_touched(expr, shape, &mut mutated),
+            Stmt::Expr { expr, .. } => calls_touched(expr, shape, &mut mutated),
             _ => {}
         }
     }
@@ -2805,7 +2810,7 @@ fn find_stored_bases(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
                     stored.insert(base.clone());
                 }
             }
-            Stmt::While { body, .. } | Stmt::Do { body } => {
+            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
                 stored.extend(find_stored_bases(body, shape));
             }
             Stmt::If {
@@ -2816,7 +2821,7 @@ fn find_stored_bases(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
                 stored.extend(find_stored_bases(then_body, shape));
                 stored.extend(find_stored_bases(else_body, shape));
             }
-            Stmt::Expr { expr } => calls_touched(expr, shape, &mut stored),
+            Stmt::Expr { expr, .. } => calls_touched(expr, shape, &mut stored),
             _ => {}
         }
     }
@@ -2905,7 +2910,7 @@ fn collect_fill_stores(
             Stmt::While { body, .. } => {
                 collect_fill_stores(body, guard, mutated, fills, nested_fills)
             }
-            Stmt::Do { body } => collect_fill_stores(body, guard, mutated, fills, nested_fills),
+            Stmt::Do { body, .. } => collect_fill_stores(body, guard, mutated, fills, nested_fills),
             Stmt::If {
                 then_body,
                 else_body,
@@ -2960,35 +2965,45 @@ mod desync_class_tests {
 #[cfg(test)]
 mod break_gate_tests {
     use crate::ast::has_break;
-    use crate::ast::{Expr, Stmt};
+    use crate::ast::{Expr, Loc, Stmt};
+
+    fn at() -> Loc {
+        Loc { line: 1, col: 1 }
+    }
 
     fn assign_i() -> Stmt {
         Stmt::Assignment {
             name: "i".to_string(),
             expr: Expr::Integer(1),
+            loc: at(),
         }
     }
 
     #[test]
     fn flat_break_is_this_loops() {
-        assert!(has_break(&[Stmt::Break]));
+        assert!(has_break(&[Stmt::Break { loc: at() }]));
         assert!(!has_break(&[assign_i()]));
     }
 
     #[test]
     fn break_through_do_and_if_counts() {
         let cond = Expr::Boolean(true);
-        let brk = vec![Stmt::Break];
-        assert!(has_break(&[Stmt::Do { body: brk.clone() }]));
+        let brk = vec![Stmt::Break { loc: at() }];
+        assert!(has_break(&[Stmt::Do {
+            body: brk.clone(),
+            loc: at(),
+        }]));
         assert!(has_break(&[Stmt::If {
             condition: cond.clone(),
             then_body: brk.clone(),
             else_body: vec![],
+            loc: at(),
         }]));
         assert!(has_break(&[Stmt::If {
             condition: cond,
             then_body: vec![],
             else_body: brk,
+            loc: at(),
         }]));
     }
 
@@ -2996,7 +3011,8 @@ mod break_gate_tests {
     fn break_inside_nested_while_binds_to_the_inner_loop() {
         let nested = vec![Stmt::While {
             condition: Expr::Boolean(true),
-            body: vec![Stmt::Break],
+            body: vec![Stmt::Break { loc: at() }],
+            loc: at(),
         }];
         assert!(!has_break(&nested));
     }
@@ -3011,8 +3027,9 @@ mod break_gate_tests {
             names: vec!["f".to_string()],
             exprs: vec![Expr::Function {
                 params: vec![],
-                body: vec![Stmt::Break],
+                body: vec![Stmt::Break { loc: at() }],
             }],
+            loc: at(),
         };
         assert!(!has_break(&[fn_with_break]));
 
@@ -3022,9 +3039,11 @@ mod break_gate_tests {
                 params: vec![],
                 body: vec![Stmt::While {
                     condition: Expr::Boolean(true),
-                    body: vec![Stmt::Break],
+                    body: vec![Stmt::Break { loc: at() }],
+                    loc: at(),
                 }],
             }],
+            loc: at(),
         };
         assert!(!has_break(&[fn_with_own_loop]));
     }

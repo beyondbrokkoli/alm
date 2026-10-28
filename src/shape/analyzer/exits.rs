@@ -392,12 +392,12 @@ impl Analyzer {
         for s in stmts {
             let mut sites = Vec::new();
             match s {
-                Stmt::Print { exprs } => {
+                Stmt::Print { exprs, .. } => {
                     for e in exprs {
                         self.collect_temp_sites(e, Fate::Dies, &mut sites);
                     }
                 }
-                Stmt::Expr { expr } => {
+                Stmt::Expr { expr, .. } => {
                     self.collect_temp_sites(expr, Fate::Dies, &mut sites);
                 }
                 Stmt::LocalDecl { exprs, .. } => {
@@ -408,22 +408,27 @@ impl Analyzer {
                 Stmt::Assignment { expr, .. } => {
                     self.collect_temp_sites(expr, Fate::Escapes, &mut sites);
                 }
-                Stmt::IndexAssign { obj, key, value } => {
+                Stmt::IndexAssign {
+                    obj, key, value, ..
+                } => {
                     self.collect_temp_sites(obj, Fate::Dies, &mut sites);
                     self.collect_temp_sites(key, Fate::Dies, &mut sites);
                     self.collect_temp_sites(value, Fate::Escapes, &mut sites);
                 }
                 Stmt::Return { .. } => {}
-                Stmt::Break => {}
-                Stmt::While { condition, body } => {
+                Stmt::Break { .. } => {}
+                Stmt::While {
+                    condition, body, ..
+                } => {
                     self.plan_cond_temp_frees(condition, s);
                     self.plan_stmt_temp_frees(body);
                 }
-                Stmt::Do { body } => self.plan_stmt_temp_frees(body),
+                Stmt::Do { body, .. } => self.plan_stmt_temp_frees(body),
                 Stmt::If {
                     condition,
                     then_body,
                     else_body,
+                    ..
                 } => {
                     self.plan_cond_temp_frees(condition, s);
                     self.plan_stmt_temp_frees(then_body);
@@ -454,26 +459,30 @@ impl Analyzer {
 
     pub(super) fn plan_arm_temp_frees_in_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs } => {
+            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
                 for e in exprs {
                     self.plan_arm_temp_frees_in_expr(e);
                 }
             }
-            Stmt::Assignment { expr, .. } | Stmt::Expr { expr } => {
+            Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => {
                 self.plan_arm_temp_frees_in_expr(expr)
             }
-            Stmt::IndexAssign { obj, key, value } => {
+            Stmt::IndexAssign {
+                obj, key, value, ..
+            } => {
                 self.plan_arm_temp_frees_in_expr(obj);
                 self.plan_arm_temp_frees_in_expr(key);
                 self.plan_arm_temp_frees_in_expr(value);
             }
-            Stmt::While { condition, body } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 self.plan_arm_temp_frees_in_expr(condition);
                 for s in body {
                     self.plan_arm_temp_frees_in_stmt(s);
                 }
             }
-            Stmt::Do { body } => {
+            Stmt::Do { body, .. } => {
                 for s in body {
                     self.plan_arm_temp_frees_in_stmt(s);
                 }
@@ -482,18 +491,19 @@ impl Analyzer {
                 condition,
                 then_body,
                 else_body,
+                ..
             } => {
                 self.plan_arm_temp_frees_in_expr(condition);
                 for s in then_body.iter().chain(else_body) {
                     self.plan_arm_temp_frees_in_stmt(s);
                 }
             }
-            Stmt::Return { value } => {
+            Stmt::Return { value, .. } => {
                 if let Some(e) = value {
                     self.plan_arm_temp_frees_in_expr(e);
                 }
             }
-            Stmt::Break => {}
+            Stmt::Break { .. } => {}
         }
     }
 
@@ -631,15 +641,17 @@ impl Analyzer {
 
     pub(super) fn plan_fn_bodies_in_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs } => {
+            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
                 for e in exprs {
                     self.plan_fn_bodies_in_expr(e);
                 }
             }
-            Stmt::Assignment { expr, .. } | Stmt::Expr { expr } => {
+            Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => {
                 self.plan_fn_bodies_in_expr(expr)
             }
-            Stmt::IndexAssign { obj, key, value } => {
+            Stmt::IndexAssign {
+                obj, key, value, ..
+            } => {
                 self.plan_fn_bodies_in_expr(obj);
                 self.plan_fn_bodies_in_expr(key);
                 self.plan_fn_bodies_in_expr(value);
@@ -647,12 +659,12 @@ impl Analyzer {
             Stmt::While { condition, .. } => self.plan_fn_bodies_in_expr(condition),
             Stmt::If { condition, .. } => self.plan_fn_bodies_in_expr(condition),
             Stmt::Do { .. } => {}
-            Stmt::Return { value } => {
+            Stmt::Return { value, .. } => {
                 if let Some(e) = value {
                     self.plan_fn_bodies_in_expr(e);
                 }
             }
-            Stmt::Break => {}
+            Stmt::Break { .. } => {}
         }
     }
 
