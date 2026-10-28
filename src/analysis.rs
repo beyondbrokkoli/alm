@@ -24,9 +24,10 @@ pub fn build_context<'a>(ast: &'a [Stmt]) -> AnalysisContext<'a> {
     derive_from_locs(ast, &mut stmt_lines, &mut stmt_locs);
     // H5's misattribution half: counts are structural now (a stamped
     // node cannot be un-counted), but a stamp can still be minted
-    // wrong — and the one multi-statement desugar (the for loop, R7)
-    // is the only place that stamps by hand-copy. The census pins its
-    // discipline on every compile, over the loc-derived map.
+    // wrong — and the multi-statement desugars (the for loop, R7;
+    // the tuple assignment, H8) are the places that stamp by
+    // hand-copy. The census pins their discipline on every compile,
+    // over the loc-derived map.
     census_for_desugar(ast, &stmt_lines);
     // The ctor half (H5 session 3): lines read off the nodes' own
     // stamps, collected in the same pre-order number_sites walks —
@@ -254,21 +255,21 @@ fn derive_ctor_line_expr(expr: &Expr, lines: &mut Vec<usize>) {
 
 /// THE DESUGAR ATTRIBUTION CENSUS (H5). Attribution rides the AST
 /// node, so counts are structural — but a stamp can still be minted
-/// wrong, and the one multi-statement desugar (the for loop, R7) is
-/// the only construct that stamps by hand-copy: its six statements
-/// must all carry the for header's stamp. This census walks the
-/// finished tree and pins the discipline: the block Do, the counter
-/// decl, the for$limit latch decl, the While, the body's inner Do,
-/// and the synthetic increment ALL report the for header's one line —
-/// any drift fails loudly at attribution time instead of whispering
-/// wrong line prefixes into diagnostics.
+/// wrong, and the multi-statement desugars (the for loop, R7; the
+/// tuple assignment, H8/row 3) are the only constructs that stamp by
+/// hand-copy: their synthetic statements must all carry the sugar
+/// header's stamp. This census walks the finished tree and pins the
+/// discipline; any drift fails loudly at attribution time instead of
+/// whispering wrong line prefixes into diagnostics.
 ///
-/// `for$limit` is unspellable (identifiers are [a-zA-Z_][a-zA-Z0-9_]*,
-/// lexer.rs), so the latch decl is an unforgeable fingerprint of the
-/// desugar: no user-shaped program can reach these panics. If the
-/// desugar's output shape itself changes, the census says so by name —
-/// it must be updated together with the desugar, on purpose, in the
-/// open (omniscience, not convention).
+/// `for$limit` and `tuple$tN` are unspellable (identifiers are
+/// [a-zA-Z_][a-zA-Z0-9_]*, lexer.rs), so both latch decls are
+/// unforgeable fingerprints of their desugars: no user-shaped
+/// program can reach these panics. If a desugar's output shape
+/// itself changes, the census says so by name — it must be updated
+/// together with the desugar (the pure elaborator, elaborate.rs, and
+/// its unit goldens), on purpose, in the open (omniscience, not
+/// convention).
 fn census_for_desugar(stmts: &[Stmt], lines: &BTreeMap<*const Stmt, usize>) {
     for s in stmts {
         if let Stmt::Do { body, .. } = s
@@ -308,6 +309,65 @@ fn census_for_desugar(stmts: &[Stmt], lines: &BTreeMap<*const Stmt, usize>) {
                     "for-desugar census: the While body is not [inner Do, increment] — the \
                      desugar shape changed; update the census with it (H5)"
                 ),
+            }
+        }
+        // The tuple-assign family (H8): a Do whose first statement is
+        // the `tuple$tN` temp decl. The same header-discipline check,
+        // plus the family's wiring shape — store i's value IS temp i.
+        if let Stmt::Do { body, .. } = s
+            && matches!(
+                body.first(),
+                Some(Stmt::LocalDecl { names, .. })
+                    if !names.is_empty() && names[0] == "tuple$t0"
+            )
+        {
+            let header = lines
+                .get(&(s as *const Stmt))
+                .expect("tuple-assign census: the block Do is unmapped (H8)");
+            let check = |what: &str, node: &Stmt| match lines.get(&(node as *const Stmt)) {
+                Some(&l) if l == *header => {}
+                Some(&l) => panic!(
+                    "tuple-assign attribution drift: the {what} reports line {l} but the tuple \
+                     header reports line {header} — every desugared statement must carry the \
+                     header's stamp (R7's law, H5's census)"
+                ),
+                None => panic!("tuple-assign census: the {what} is unmapped (H8)"),
+            };
+            let Stmt::LocalDecl { names, .. } = &body[0] else {
+                unreachable!("the fingerprint arm matched a LocalDecl")
+            };
+            for (i, name) in names.iter().enumerate() {
+                if name != &format!("tuple$t{i}") {
+                    panic!(
+                        "tuple-assign census: temp {i} is named '{name}', not 'tuple$t{i}' — \
+                         the desugar shape changed; update the census with it (H8)"
+                    );
+                }
+            }
+            check("temp decl", &body[0]);
+            if body.len() != names.len() + 1 {
+                panic!(
+                    "tuple-assign census: {} temps but {} statements in the block — the desugar \
+                     shape changed; update the census with it (H8)",
+                    names.len(),
+                    body.len() - 1
+                );
+            }
+            for (i, stmt) in body[1..].iter().enumerate() {
+                let Stmt::IndexAssign { value, .. } = stmt else {
+                    panic!(
+                        "tuple-assign census: the block's statement {} is not the cell store — \
+                         the desugar shape changed; update the census with it (H8)",
+                        i + 1
+                    );
+                };
+                if !matches!(value, Expr::Identifier(v) if v == &format!("tuple$t{i}")) {
+                    panic!(
+                        "tuple-assign census: store {i} does not read temp {i} — the desugar \
+                         shape changed; update the census with it (H8)"
+                    );
+                }
+                check(&format!("cell store {i}"), stmt);
             }
         }
         // recurse through every statement list, including fn-literal

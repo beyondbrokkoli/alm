@@ -203,9 +203,9 @@ impl<'a> Parser<'a> {
                 // statements (block Do, counter decl, for$limit latch
                 // decl, While, inner-body Do, synthetic increment) all
                 // carry `at` — the for header's stamp — so desugared
-                // code reports there. The census (analysis.rs) pins
-                // this on every compile; the counter bookkeeping that
-                // used to live here is gone by construction.
+                // code reports there. The shape lives in the pure
+                // elaborator (elaborate.rs, H8); the census
+                // (analysis.rs) pins it on every compile.
                 self.tokens.next();
                 let var = match self.tokens.next() {
                     Some(Token::Identifier(n)) => n.to_string(),
@@ -248,55 +248,10 @@ impl<'a> Parser<'a> {
                     )));
                 }
 
-                // Desugar: for i = a, b do B end is half-open (a ..< b) and
-                // becomes Do[ local i = a, local for$limit = b,
-                //              While i < for$limit { Do[ B ]; i = i + 1 } ]
-                // so the existing while phi/fill machinery handles everything.
-                // The limit LATCHES: b evaluates once at entry, before the
-                // first test — a body that rebinds b's source name cannot
-                // move the bound mid-flight (the R7 law). `for$limit` is
-                // unspellable (identifiers are [a-zA-Z_][a-zA-Z0-9_]*), so
-                // user code cannot read, assign, or collide with it. The
-                // user body rides its own inner scope: a `local i` in B
-                // shadows the counter only inside B, so the synthetic
-                // increment after it still reaches the counter (without the
-                // wrap it would increment the shadow — an infinite loop).
-                // Analysis walks the desugared tree, so *const Stmt keys
-                // stay consistent.
-                let limit_slot = "for$limit".to_string();
-                let increment = Stmt::Assignment {
-                    name: var.clone(),
-                    expr: Expr::BinaryOp {
-                        op: BinOp::Add,
-                        left: Box::new(Expr::Identifier(var.clone())),
-                        right: Box::new(Expr::Integer(1)),
-                    },
-                    loc: at,
-                };
-                Ok(Stmt::Do {
-                    body: vec![
-                        Stmt::LocalDecl {
-                            names: vec![var.clone()],
-                            exprs: vec![start],
-                            loc: at,
-                        },
-                        Stmt::LocalDecl {
-                            names: vec![limit_slot.clone()],
-                            exprs: vec![limit],
-                            loc: at,
-                        },
-                        Stmt::While {
-                            condition: Expr::BinaryOp {
-                                op: BinOp::LessThan,
-                                left: Box::new(Expr::Identifier(var)),
-                                right: Box::new(Expr::Identifier(limit_slot)),
-                            },
-                            body: vec![Stmt::Do { body, loc: at }, increment],
-                            loc: at,
-                        },
-                    ],
-                    loc: at,
-                })
+                // Desugar: the pure elaborator owns the shape (H8).
+                Ok(crate::elaborate::desugar_numeric_for(
+                    at, var, start, limit, body,
+                ))
             }
             Some(Token::Break) => {
                 self.tokens.next();
@@ -407,6 +362,12 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Identifier(_)) => {
                 let lhs = self.parse_expr()?;
+                if matches!(self.tokens.peek(), Some(Token::Comma)) {
+                    // a comma after a leading target expr can only be
+                    // the multi-target tuple sugar — plain statements
+                    // never continue with a comma
+                    return self.parse_tuple_assign(at, lhs);
+                }
                 if matches!(self.tokens.peek(), Some(Token::Assign)) {
                     self.tokens.next();
                     let rhs = self.parse_expr()?;
@@ -472,6 +433,64 @@ impl<'a> Parser<'a> {
                 self.tokens.peek()
             ))),
         }
+    }
+
+    /// Multi-target tuple assignment (RESIDUALS row 3, ruled parallel
+    /// 2026-10-28, probe-first — the sequential face silently
+    /// miscomputes the swap idiom): `t[k], t[k], … = v, v, …`.
+    /// Targets are CELLS — bracket or dot; a bare name among them is
+    /// a named refusal (the multi-name surface is `local`, the
+    /// rebinding surface is plain `=`). Counts must match, the
+    /// local-decl discipline. The shape is the pure elaborator's
+    /// (elaborate.rs); this half only parses, validates, and hands
+    /// over the pieces.
+    fn parse_tuple_assign(&mut self, at: Loc, first: Expr) -> Result<Stmt, ParseError> {
+        let mut targets = vec![first];
+        while matches!(self.tokens.peek(), Some(Token::Comma)) {
+            self.tokens.next();
+            targets.push(self.parse_expr()?);
+        }
+        self.expect(Token::Assign)?;
+        let mut values = Vec::new();
+        values.push(self.parse_expr()?);
+        while matches!(self.tokens.peek(), Some(Token::Comma)) {
+            self.tokens.next();
+            values.push(self.parse_expr()?);
+        }
+        if values.len() != targets.len() {
+            return Err(ParseError(format!(
+                "Syntax Error: tuple assignment binds {} targets to {} values — counts must match",
+                targets.len(),
+                values.len()
+            )));
+        }
+        let mut cells = Vec::with_capacity(targets.len());
+        for target in targets {
+            match target {
+                Expr::Index { obj, key } => cells.push((*obj, *key)),
+                Expr::Field { obj, name } => {
+                    // dot targets convert to the string-keyed store
+                    // here, the single-assign path's twin (the trace
+                    // signal fires at the parse site; the elaborator
+                    // stays pure)
+                    alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_STRKEY_DOT);
+                    cells.push((*obj, Expr::String(name)));
+                }
+                Expr::Identifier(name) => {
+                    return Err(ParseError(format!(
+                        "Syntax Error: cannot tuple-assign the name '{name}' — tuple assignment \
+                         targets cells ('t[k]' or 't.k'); names rebind through plain '=' or \
+                         'local'"
+                    )));
+                }
+                _ => {
+                    return Err(ParseError(
+                        "Syntax Error: tuple assignment targets cells — 't[k]' or 't.k'".into(),
+                    ));
+                }
+            }
+        }
+        Ok(crate::elaborate::desugar_tuple_assign(at, cells, values))
     }
 
     fn peek_not_block_end(&mut self) -> bool {

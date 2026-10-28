@@ -5,6 +5,7 @@ mod analysis;
 mod ast;
 mod backend;
 mod debug;
+mod elaborate;
 mod ir;
 mod lexer;
 mod lowerer;

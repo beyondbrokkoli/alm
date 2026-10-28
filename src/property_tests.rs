@@ -1416,10 +1416,10 @@ fn indent(source: &str) -> String {
 // construction); the parser's parallel arrays and their pre-push
 // discipline are gone, so the count-misfit class they made possible
 // is unrepresentable and its two tripwire pins died with them
-// (session 4). What remains: the one multi-statement desugar (the for
-// loop) stamps its whole family at the header — the census runs on
-// every compile (analysis.rs) and these tests are its golden register
-// and its tripwire proof.
+// (session 4). What remains: the multi-statement desugars (the for
+// loop, and the tuple assignment since H8) stamp their whole family
+// at the header — the census runs on every compile (analysis.rs)
+// and these tests are its golden register and its tripwire proof.
 
 /// Parse-only parts for the H5 pins: the AST, gated on clean front
 /// diagnostics. Attribution rides the nodes — there are no parallel
@@ -1608,6 +1608,175 @@ fn h5_census_trips_on_right_count_wrong_line() {
                 ],
                 loc: at(2),
             },
+        ],
+        loc: at(2),
+    }];
+    analysis::build_context(&ast);
+}
+
+// ---- H8: the elaboration boundary — unit goldens, by locality ----
+//
+// The multi-statement desugars are PURE functions (elaborate.rs);
+// these goldens pin their output shape and stamps DIRECTLY, without
+// parsing — the census (analysis.rs, every compile) stays the
+// whole-tree omniscience check on top.
+
+/// The elaborators' shapes, unit-level: the for family's six
+/// statements and the tuple family's temp-decl + stores all carry the
+/// header's stamp, and the wiring (guard against for$limit, store i
+/// reads tuple$t{i}) is exactly the census's fingerprint.
+#[test]
+fn h8_elaborator_unit_goldens_pin() {
+    use crate::ast::Loc;
+    use crate::elaborate;
+    let at = Loc { line: 7, col: 3 };
+
+    let for_stmt = elaborate::desugar_numeric_for(
+        at,
+        "i".into(),
+        Expr::Integer(0),
+        Expr::Integer(4),
+        vec![Stmt::Expr {
+            expr: Expr::Integer(1),
+            loc: Loc { line: 8, col: 1 },
+        }],
+    );
+    let Stmt::Do { body, .. } = &for_stmt else {
+        panic!("the numeric-for desugar rides a Do block");
+    };
+    assert_eq!(body.len(), 3);
+    let Stmt::While {
+        condition,
+        body: wbody,
+        ..
+    } = &body[2]
+    else {
+        panic!("the for family's third statement is the While");
+    };
+    assert!(matches!(
+        condition,
+        Expr::BinaryOp {
+            op: BinOp::LessThan,
+            ..
+        }
+    ));
+    assert_eq!(wbody.len(), 2);
+    for (what, node) in [
+        ("block Do", &for_stmt),
+        ("counter decl", (&body[0] as &Stmt)),
+        ("latch decl", &body[1]),
+        ("While", &body[2]),
+        ("inner Do", &wbody[0]),
+        ("increment", &wbody[1]),
+    ] {
+        assert_eq!(
+            node.loc(),
+            at,
+            "the for family's {what} carries the header's stamp"
+        );
+    }
+    // the user body rides its own stamp
+    let Stmt::Do { body: ubody, .. } = &wbody[0] else {
+        panic!("the While body opens with the user's inner Do");
+    };
+    assert_eq!(ubody[0].loc().line, 8);
+
+    let cells = vec![
+        (Expr::Identifier("o".into()), Expr::Integer(0)),
+        (Expr::Identifier("o".into()), Expr::Integer(1)),
+    ];
+    let values = vec![Expr::Integer(5), Expr::Integer(6)];
+    let tuple_stmt = elaborate::desugar_tuple_assign(at, cells, values);
+    let Stmt::Do { body, .. } = &tuple_stmt else {
+        panic!("the tuple desugar rides a Do block");
+    };
+    assert_eq!(body.len(), 3);
+    let Stmt::LocalDecl { names, exprs, .. } = &body[0] else {
+        panic!("the tuple family opens with the temp decl");
+    };
+    assert_eq!(names, &vec!["tuple$t0".to_string(), "tuple$t1".to_string()]);
+    assert_eq!(exprs.len(), 2);
+    for (i, stmt) in body[1..].iter().enumerate() {
+        let Stmt::IndexAssign {
+            obj, key, value, ..
+        } = stmt
+        else {
+            panic!("tuple statement {} is the cell store", i);
+        };
+        assert!(matches!(obj, Expr::Identifier(n) if n == "o"));
+        assert!(matches!(key, Expr::Integer(k) if *k == i as i64));
+        assert!(
+            matches!(value, Expr::Identifier(v) if v == &format!("tuple$t{i}")),
+            "store {i} reads temp {i}"
+        );
+        assert_eq!(
+            stmt.loc(),
+            at,
+            "the tuple family's store {i} carries the header's stamp"
+        );
+    }
+    assert_eq!(body[0].loc(), at);
+    assert_eq!(tuple_stmt.loc(), at);
+}
+
+/// The shipped path: the tuple sugar parses into the elaborated
+/// shape and the whole family reports at the statement's line (the
+/// census ran green over it inside build_context).
+#[test]
+fn h8_tuple_assign_attribution_pin() {
+    let source = "\
+local o = {0, 0}
+o[0], o[1] = o[1], o[0]
+print(o[0], o[1])
+";
+    let ast = parse_parts(source);
+    assert_eq!(ast.len(), 3);
+    let Stmt::Do { body, .. } = &ast[1] else {
+        panic!("the tuple sugar rides a Do block");
+    };
+    assert_eq!(body.len(), 3);
+    let ctx = analysis::build_context(&ast);
+    let line_of = |s: &Stmt| ctx.stmt_lines.get(&(s as *const Stmt)).copied();
+    for (what, node) in [
+        ("block Do", &ast[1] as &Stmt),
+        ("temp decl", &body[0]),
+        ("cell store 0", &body[1]),
+        ("cell store 1", &body[2]),
+    ] {
+        assert_eq!(
+            line_of(node),
+            Some(2),
+            "the {what} reports at the statement's line"
+        );
+    }
+    assert_eq!(line_of(&ast[0]), Some(1));
+    assert_eq!(line_of(&ast[2]), Some(3));
+}
+
+/// The tuple family's misattribution tripwire: a hand-built block
+/// with the unforgeable fingerprint and ONE wrong store stamp — the
+/// drift class only a hand-stamping desugar can produce, and the
+/// census's tuple arm must cry wolf by name.
+#[test]
+#[should_panic(expected = "tuple-assign attribution drift")]
+fn h8_census_trips_on_tuple_wrong_line() {
+    use crate::ast::Loc;
+    let at = |line: u32| Loc { line, col: 1 };
+    let store = |i: usize, line: u32| Stmt::IndexAssign {
+        obj: Expr::Identifier("o".into()),
+        key: Expr::Integer(i as i64),
+        value: Expr::Identifier(format!("tuple$t{i}")),
+        loc: at(line),
+    };
+    let ast = vec![Stmt::Do {
+        body: vec![
+            Stmt::LocalDecl {
+                names: vec!["tuple$t0".into(), "tuple$t1".into()],
+                exprs: vec![Expr::Integer(1), Expr::Integer(2)],
+                loc: at(2),
+            },
+            store(0, 2),
+            store(1, 9),
         ],
         loc: at(2),
     }];
