@@ -162,10 +162,11 @@ impl Stmt {
 
 /// True when a `break` belongs to THIS loop level: recurses into Do/If
 /// but not into nested While (a break there binds to the inner loop).
-/// One definition, two gates that must agree: the lowerer's fill
-/// conversion and the analyzer's Dense promotion both refuse loops whose
-/// own body carries a break — a fill loop's body must run to the guard's
-/// completion, so a break out of it invalidates the reserve. Pinned by
+/// One definition, one gate (H9 folded the lowerer's second gate into
+/// the analyzer's): the fill acceptance predicate that records the
+/// FillPlan the lowerer consumes refuses loops whose own body carries
+/// a break — a fill loop's body must run to the guard's completion, so
+/// a break out of it invalidates the reserve. Pinned by
 /// fill_break_two_gates (one loop per path in one lock: the converted
 /// twin carries the reserve, the break twin the checked stores).
 pub fn has_break(stmts: &[Stmt]) -> bool {

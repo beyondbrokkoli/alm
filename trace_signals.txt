@@ -93,10 +93,10 @@
 43  STMT_IF                analyzer  walk_stmt: if statement — arms walked scoped, exits decided per arm, then the join merges (a name the arms bind differently whose join is mixed carries the arm tag, 143)
 44  STMT_DO                analyzer  walk_stmt: do statement — one scoped walk plus the scope-exit decision
 45  STMT_PRINT             analyzer  walk_stmt: print statement — each printed expression inferred and use-checked
-46  MUT_ASSIGN             analyzer  collect_mutated_names: a directly-assigned name in the loop body — mutated names are excluded from dense-fill candidates (19); the scan sees direct assignments and one level into top-level if arms only
-47  MUT_IF                 analyzer  collect_mutated_names: a top-level if in the loop body
-48  MUT_THEN_ASSIGN        analyzer  collect_mutated_names: a direct assignment in the then arm
-49  MUT_ELSE_ASSIGN        analyzer  collect_mutated_names: a direct assignment in the else arm
+46  MUT_ASSIGN             analyzer  collect_mutated_names: a directly-assigned name in the loop body — mutated names are excluded from the fill plan's bases and the bound's stability check (19); since H9 the scan is DEEP (recurses through nested while/do/if at any depth)
+47  MUT_IF                 analyzer  collect_mutated_names: an if in the loop body (its arms recurse — the deep H9 scan)
+48  MUT_THEN_ASSIGN        analyzer  no fire site since H9 (the scan deepened; the recursion's own MUT_ASSIGN covers arm assignments — slot kept: the SSOT is slot-stable)
+49  MUT_ELSE_ASSIGN        analyzer  no fire site since H9 (the scan deepened; the recursion's own MUT_ASSIGN covers arm assignments — slot kept: the SSOT is slot-stable)
 79  STMT_IDX_NULL_ROW      analyzer  analyze tail: nested store refused — the base's cells receive no table (a thin-air row: no store ever puts one there; stores do not create rows)
 89  STMT_IDX_TBL_VALUE     analyzer  walk_stmt: a table-typed value stored into a table's cells — the value's sites (each row ghost's birth site, and the value's lineage rows) ride row_links onto the receiving side: the physical deep-free graph edge that makes the receiver's free compost the stored table
 126 STMT_IDX_STORED_CTOR   analyzer  walk_stmt: a table-valued store into a table's cells (inline ctor, moved named binding, or stored row) marks the receiving sites stored-ctor parents — the lowerer stamps TableNew's flags bit 7 (contains_tables), the deep-free ownership bit; affine makes every such store a transfer

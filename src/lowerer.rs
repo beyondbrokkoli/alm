@@ -2,7 +2,7 @@
 
 mod bridges;
 
-use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp, has_break};
+use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
 use crate::ir::{
     AnyReg, BasicBlock, BlockId, Bool, CellRepr, DbgBind, Instruction, Int, IrProgram, Ptr, Reg,
     RegId, RegKind, SourceLoc, TableKey, Terminator, repr_of,
@@ -1097,9 +1097,12 @@ impl<'a> IrLowerer<'a> {
                 let body_block = self.new_block();
                 let exit_block = self.new_block();
 
+                // the loop's phi bases (mutation + moves, the deep
+                // facts-fed scan) — the fill-conversion decision no
+                // longer rides this set (H9: the walk's recorded plan
+                // owns acceptance); the loop's phis still do
                 let mut mutated_vars = find_mutated_vars(body, self.shape);
                 mutated_vars.extend(find_moved_names(body, self.shape));
-                let stored_bases = find_stored_bases(body, self.shape);
 
                 let mut phi_order: Vec<(String, Local)> = mutated_vars
                     .iter()
@@ -1117,43 +1120,32 @@ impl<'a> IrLowerer<'a> {
                     Expr::BinaryOp {
                         op: BinOp::LessThan,
                         left,
-                        right: bound_expr,
+                        ..
                     } if as_ident(left).is_some() => {
                         let guard = as_ident(left).expect("guarded by as_ident");
-                        let stable = !has_break(body)
-                            && !free_idents(bound_expr)
-                                .iter()
-                                .any(|v| mutated_vars.contains(v) || stored_bases.contains(v));
-                        let mut fills: BTreeSet<String> = BTreeSet::new();
-                        let mut nested_fills: BTreeSet<String> = BTreeSet::new();
-                        if stable {
-                            collect_fill_stores(
-                                body,
-                                guard,
-                                &mutated_vars,
-                                &mut fills,
-                                &mut nested_fills,
-                            );
-                        }
-                        if fills.is_empty() && nested_fills.is_empty() {
-                            None
-                        } else {
-                            let depth = self.scopes.len();
-                            let mut names = Vec::new();
-                            for name in &fills {
-                                if !self.has_var(name) {
-                                    continue;
+                        // H9: acceptance was decided ONCE by the walk's
+                        // predicate (no break, guard born nonneg and only
+                        // ascending, stable bound) and recorded as the
+                        // loop's FillPlan — consumption filters stay
+                        // here: the local must be live, and the base's
+                        // dense verdict must match this lowering's depth
+                        self.shape
+                            .fill_loops
+                            .get(&(stmt as *const Stmt))
+                            .map(|plan| {
+                                let depth = self.scopes.len();
+                                let mut names = Vec::new();
+                                for name in &plan.fills {
+                                    if !self.has_var(name) {
+                                        continue;
+                                    }
+                                    if self.shape.is_dense_at_depth(name, depth) {
+                                        names.push(name.clone());
+                                    }
                                 }
-                                if self.shape.is_dense_at_depth(name, depth) {
-                                    names.push(name.clone());
-                                }
-                            }
-                            (!names.is_empty() || !nested_fills.is_empty()).then_some((
-                                guard.to_string(),
-                                names,
-                                nested_fills,
-                            ))
-                        }
+                                (guard.to_string(), names, plan.nested_fills.clone())
+                            })
+                            .filter(|(_, names, nested)| !names.is_empty() || !nested.is_empty())
                     }
                     _ => None,
                 };
@@ -2801,33 +2793,6 @@ fn find_mutated_vars(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
     mutated
 }
 
-fn find_stored_bases(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
-    let mut stored = BTreeSet::new();
-    for stmt in stmts {
-        match stmt {
-            Stmt::IndexAssign { obj, .. } => {
-                if let Some(base) = get_base_identifier(obj) {
-                    stored.insert(base.clone());
-                }
-            }
-            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
-                stored.extend(find_stored_bases(body, shape));
-            }
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                stored.extend(find_stored_bases(then_body, shape));
-                stored.extend(find_stored_bases(else_body, shape));
-            }
-            Stmt::Expr { expr, .. } => calls_touched(expr, shape, &mut stored),
-            _ => {}
-        }
-    }
-    stored
-}
-
 fn as_ident(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Identifier(name) => Some(name),
@@ -2840,87 +2805,6 @@ fn get_base_identifier(expr: &Expr) -> Option<&String> {
         Expr::Identifier(name) => Some(name),
         Expr::Index { obj, .. } => get_base_identifier(obj),
         _ => None,
-    }
-}
-
-fn free_idents(expr: &Expr) -> BTreeSet<String> {
-    fn go(e: &Expr, out: &mut BTreeSet<String>) {
-        match e {
-            Expr::Identifier(name) => {
-                out.insert(name.clone());
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                go(left, out);
-                go(right, out);
-            }
-            Expr::UnaryOp { expr, .. } => go(expr, out),
-            Expr::Index { obj, key } => {
-                go(obj, out);
-                go(key, out);
-            }
-            Expr::Call { callee, args } => {
-                go(callee, out);
-                for a in args {
-                    go(a, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = BTreeSet::new();
-    go(expr, &mut out);
-    out
-}
-
-fn collect_fill_stores(
-    stmts: &[Stmt],
-    guard: &str,
-    mutated: &BTreeSet<String>,
-    fills: &mut BTreeSet<String>,
-    nested_fills: &mut BTreeSet<String>,
-) {
-    for stmt in stmts {
-        if let Stmt::IndexAssign {
-            obj,
-            key: Expr::Identifier(key_ident),
-            ..
-        } = stmt
-        {
-            if key_ident != guard {
-                continue;
-            }
-
-            let root_name = match get_base_identifier(obj) {
-                Some(name) if !mutated.contains(name) => name,
-                _ => continue,
-            };
-
-            match obj {
-                Expr::Identifier(name) if name == root_name => {
-                    fills.insert(root_name.clone());
-                }
-                Expr::Index { .. } => {
-                    nested_fills.insert(root_name.clone());
-                }
-                _ => {}
-            }
-        }
-
-        match stmt {
-            Stmt::While { body, .. } => {
-                collect_fill_stores(body, guard, mutated, fills, nested_fills)
-            }
-            Stmt::Do { body, .. } => collect_fill_stores(body, guard, mutated, fills, nested_fills),
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                collect_fill_stores(then_body, guard, mutated, fills, nested_fills);
-                collect_fill_stores(else_body, guard, mutated, fills, nested_fills);
-            }
-            _ => {}
-        }
     }
 }
 

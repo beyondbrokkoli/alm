@@ -8,7 +8,7 @@ use super::core::{
     SPARSE_THRESHOLD, TableShape, is_ghost, is_root,
 };
 use super::facts;
-use super::facts::ShapeFacts;
+use super::facts::{FillPlan, ShapeFacts};
 use super::helpers::{const_key_value, extract_guard, merge_table_scopes};
 use super::ty::{Ty, arith_ty, contains_any, decided, join_ty, pinned_scalar, value_kind};
 use Ty::{Any, Bool, Conflict, Coro, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
@@ -169,6 +169,7 @@ struct ReadSideState {
 
 struct LayoutFactsState {
     name_dense: BTreeMap<(String, usize), bool>,
+    fill_loops: BTreeMap<*const Stmt, super::facts::FillPlan>,
     verdicts: Vec<LayoutVerdict>,
 }
 
@@ -463,6 +464,7 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
         },
         layout: LayoutFactsState {
             name_dense: BTreeMap::new(),
+            fill_loops: BTreeMap::new(),
             verdicts: vec![LayoutVerdict::Growing; n],
         },
         stmt_lines: ctx.stmt_lines.clone(),
@@ -805,6 +807,7 @@ impl Recorded {
             rebind_frees: self.own.rebind_grants,
             move_poisons: self.own.move_poisons,
             name_dense: self.layout.name_dense,
+            fill_loops: self.layout.fill_loops,
             stored_ctor_parents: self.own.stored_ctor_parents,
             substitutions,
             local_types: self.chk.local_types,

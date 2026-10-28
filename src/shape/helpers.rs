@@ -22,15 +22,19 @@ pub fn const_key_value(e: &Expr) -> Option<i64> {
     }
 }
 
-pub fn extract_guard(condition: &Expr) -> Option<&str> {
+/// The fill-loop guard face of a while condition: `guard < bound`
+/// answers both halves (H9 — the bound rides out with the guard so the
+/// ONE acceptance predicate can check the reserve's stability law at
+/// the same site the plan is recorded).
+pub fn extract_guard(condition: &Expr) -> Option<(&str, &Expr)> {
     if let Expr::BinaryOp {
         op: BinOp::LessThan,
         left,
-        ..
+        right,
     } = condition
     {
         if let Expr::Identifier(name) = left.as_ref() {
-            Some(name.as_str())
+            Some((name.as_str(), right))
         } else {
             None
         }

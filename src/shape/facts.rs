@@ -81,6 +81,19 @@ impl FnDef {
     }
 }
 
+/// The one fill-loop acceptance predicate's recorded decision (H9):
+/// which tables a `guard < bound` loop fills at the guard key, split by
+/// store depth — `fills` are direct bases (`t[i] = …`), `nested_fills`
+/// are row bases (`t[x][i] = …`). The walk's `detect_fill_loop` decides
+/// acceptance once (no break, guard born nonneg and only ascending,
+/// stable bound) and records the plan; the lowerer consumes it instead
+/// of re-deriving the decision from its own walk.
+#[derive(Clone)]
+pub struct FillPlan {
+    pub fills: BTreeSet<String>,
+    pub nested_fills: BTreeSet<String>,
+}
+
 #[derive(Clone)]
 pub struct ShapeFacts {
     pub sites: BTreeMap<*const Expr, usize>,
@@ -126,6 +139,15 @@ pub struct ShapeFacts {
     /// per-instantiation codegen at the site.)
     pub move_poisons: BTreeMap<*const Stmt, BTreeSet<String>>,
     pub name_dense: BTreeMap<(String, usize), bool>,
+    /// KEYING DISCIPLINE (H9): keyed by the While stmt node. The plan
+    /// is recorded ONCE per loop node in the walk's recorded pass —
+    /// structure is instantiation-invariant (the family argument at
+    /// `free_sites` above), so a loop inside a fn body inlined at many
+    /// call sites lowers the SAME plan at every expansion. Everything
+    /// per-instantiation (the lowerer's scope depth, `has_var`, the
+    /// depth-matched dense verdict) stays consumption-side — this map
+    /// carries only the acceptance decision and its fill bases.
+    pub fill_loops: BTreeMap<*const Stmt, FillPlan>,
     pub stored_ctor_parents: BTreeSet<usize>,
     pub substitutions: BTreeMap<usize, Ty>,
     /// KEYING DISCIPLINE (B3, fold d): keyed by the triple

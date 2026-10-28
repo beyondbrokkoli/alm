@@ -897,7 +897,23 @@ impl Analyzer {
         Ok(())
     }
 
-    pub(super) fn detect_fill_loop(&mut self, rec: Gate, guard: &str, body: &[Stmt]) {
+    /// The ONE fill-loop acceptance predicate (H9): a `guard < bound`
+    /// loop converts only when the whole loop is a dense fill — no
+    /// break out of the body, the guard is born nonnegative and only
+    /// ascends (so every store key is a valid dense slot), and the
+    /// bound is stable across the body (no name the bound mentions is
+    /// assigned or stored through inside it — the reserve is sized
+    /// once, at entry). Acceptance records the FillPlan the lowerer
+    /// consumes; the Dense promotion below is the same decision's
+    /// layout face (one gate, both faces).
+    pub(super) fn detect_fill_loop(
+        &mut self,
+        rec: Gate,
+        while_stmt: *const Stmt,
+        guard: &str,
+        bound: &Expr,
+        body: &[Stmt],
+    ) {
         if has_break(body) {
             return;
         }
@@ -909,13 +925,23 @@ impl Analyzer {
         }
 
         let mutated = self.collect_mutated_names(rec, body);
+        let stored = collect_stored_bases(body);
+        if idents_of(bound)
+            .iter()
+            .any(|v| mutated.contains(v) || stored.contains(v))
+        {
+            return;
+        }
+
         let mut fills = BTreeSet::new();
+        let mut nested_fills = BTreeSet::new();
 
         fn collect_fills(
             stmts: &[Stmt],
             guard: &str,
             mutated: &BTreeSet<String>,
             fills: &mut BTreeSet<String>,
+            nested_fills: &mut BTreeSet<String>,
         ) {
             for stmt in stmts {
                 if let Stmt::IndexAssign {
@@ -927,29 +953,53 @@ impl Analyzer {
                     && let Some(table_name) = get_base_identifier(obj)
                     && !mutated.contains(table_name)
                 {
-                    fills.insert(table_name.clone());
+                    match obj {
+                        Expr::Identifier(_) => {
+                            fills.insert(table_name.clone());
+                        }
+                        Expr::Index { .. } => {
+                            nested_fills.insert(table_name.clone());
+                        }
+                        _ => {}
+                    }
                 }
                 match stmt {
                     Stmt::While { body, .. } | Stmt::Do { body, .. } => {
-                        collect_fills(body, guard, mutated, fills)
+                        collect_fills(body, guard, mutated, fills, nested_fills)
                     }
                     Stmt::If {
                         then_body,
                         else_body,
                         ..
                     } => {
-                        collect_fills(then_body, guard, mutated, fills);
-                        collect_fills(else_body, guard, mutated, fills);
+                        collect_fills(then_body, guard, mutated, fills, nested_fills);
+                        collect_fills(else_body, guard, mutated, fills, nested_fills);
                     }
                     _ => {}
                 }
             }
         }
 
-        collect_fills(body, guard, &mutated, &mut fills);
+        collect_fills(body, guard, &mutated, &mut fills, &mut nested_fills);
 
+        if fills.is_empty() && nested_fills.is_empty() {
+            return;
+        }
+        let dense_bases: Vec<String> = fills.iter().chain(nested_fills.iter()).cloned().collect();
+        self.layout.fill_loops.insert(
+            while_stmt,
+            FillPlan {
+                fills,
+                nested_fills,
+            },
+        );
+
+        // the same decision's layout face: every filled base (direct
+        // or nested) promotes Growing → Dense and takes the depth's
+        // dense verdict — the lowerer's `is_dense_at_depth` filter
+        // reads this, so promotion and conversion cannot disagree
         let depth = self.walk.scopes.len();
-        for table_name in fills {
+        for table_name in dense_bases {
             let site_ids: BTreeSet<usize> = self
                 .walk
                 .scopes
@@ -972,6 +1022,11 @@ impl Analyzer {
         }
     }
 
+    /// The deep structural scan the ONE predicate excludes on (H9):
+    /// every name assigned anywhere in the body — through nested
+    /// While/Do/If, at any depth. The fill bases and the bound's names
+    /// are excluded against this set; the lowerer's private copy of the
+    /// scan (with its facts enrichment) died with its re-derivation.
     pub(super) fn collect_mutated_names(&self, rec: Gate, stmts: &[Stmt]) -> BTreeSet<String> {
         let mut mutated = BTreeSet::new();
         for s in stmts {
@@ -980,30 +1035,82 @@ impl Analyzer {
                     signal!(rec.on(), trace::TRACE_MUT_ASSIGN);
                     mutated.insert(name.clone());
                 }
-                Stmt::While { .. } => {}
-                Stmt::Do { .. } => {}
+                Stmt::While { body, .. } | Stmt::Do { body, .. } => {
+                    mutated.extend(self.collect_mutated_names(rec, body));
+                }
                 Stmt::If {
                     then_body,
                     else_body,
                     ..
                 } => {
                     signal!(rec.on(), trace::TRACE_MUT_IF);
-                    for ss in then_body {
-                        if let Stmt::Assignment { name, .. } = ss {
-                            signal!(rec.on(), trace::TRACE_MUT_THEN_ASSIGN);
-                            mutated.insert(name.clone());
-                        }
-                    }
-                    for ss in else_body {
-                        if let Stmt::Assignment { name, .. } = ss {
-                            signal!(rec.on(), trace::TRACE_MUT_ELSE_ASSIGN);
-                            mutated.insert(name.clone());
-                        }
-                    }
+                    mutated.extend(self.collect_mutated_names(rec, then_body));
+                    mutated.extend(self.collect_mutated_names(rec, else_body));
                 }
                 _ => {}
             }
         }
         mutated
     }
+}
+
+/// The bound's free names — the stability law's query face (H9). The
+/// recursion covers exactly the expression faces a while bound can
+/// carry; a name only matters if the body can change it.
+fn idents_of(expr: &Expr) -> BTreeSet<String> {
+    fn go(expr: &Expr, out: &mut BTreeSet<String>) {
+        match expr {
+            Expr::Identifier(name) => {
+                out.insert(name.clone());
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                go(left, out);
+                go(right, out);
+            }
+            Expr::UnaryOp { expr, .. } => go(expr, out),
+            Expr::Index { obj, key } => {
+                go(obj, out);
+                go(key, out);
+            }
+            Expr::Call { callee, args } => {
+                go(callee, out);
+                for a in args {
+                    go(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    go(expr, &mut out);
+    out
+}
+
+/// Every base identifier stored through anywhere in the body (the
+/// stability law's other half — a store through `n` can move the bound
+/// `… < n …` just an assignment can).
+fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
+    let mut stored = BTreeSet::new();
+    for stmt in stmts {
+        match stmt {
+            Stmt::IndexAssign { obj, .. } => {
+                if let Some(base) = get_base_identifier(obj) {
+                    stored.insert(base.clone());
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
+                stored.extend(collect_stored_bases(body));
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                stored.extend(collect_stored_bases(then_body));
+                stored.extend(collect_stored_bases(else_body));
+            }
+            _ => {}
+        }
+    }
+    stored
 }

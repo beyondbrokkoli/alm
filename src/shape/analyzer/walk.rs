@@ -752,10 +752,10 @@ impl Analyzer {
                 self.check_uses(rec, condition)?;
 
                 if rec.on()
-                    && let Some(guard) = extract_guard(condition)
+                    && let Some((guard, bound)) = extract_guard(condition)
                 {
                     signal!(rec.on(), trace::TRACE_STMT_WHILE_FILL);
-                    self.detect_fill_loop(rec, guard, body);
+                    self.detect_fill_loop(rec, stmt as *const Stmt, guard, bound, body);
                 }
 
                 let entry = self.walk.scopes.clone();
