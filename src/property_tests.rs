@@ -36,11 +36,10 @@
 
 use crate::analysis;
 use crate::ast::{BinOp, Expr, Stmt};
-use crate::backend;
 use crate::lexer;
-use crate::lowerer::{IrLowerer, LowerError};
+use crate::lowerer::LowerError;
 use crate::parser::Parser;
-use crate::shape;
+use crate::pipeline::{self, PipelineOpts, Stage};
 use logos::Logos;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -79,27 +78,29 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-// ---- the in-process pipeline (main.rs's phases, minus clang/host) ----
+// ---- the in-process pipeline (the ONE pipeline, H10: the harness
+// drives the same walk the driver does — src/pipeline.rs — minus
+// clang/host; only the catch_unwind wrappers and the opts live here) ---
 
-#[derive(Debug)]
-enum Stage {
-    Panicked,
-    Front,
-    Analyze,
-    Lower,
-    Backend,
+/// The harness's fixed opts: `standalone: false` keeps EntryKind at Lib
+/// (the artifact bytes are exactly the pre-fold harness's) and thereby
+/// runs the ffi gate — the surfaced drift this fold exists to name: an
+/// ffi program now rejects in-process, as it always did in the driver's
+/// .so mode. `source_file` stays "property_case.lua".
+fn property_opts(walk_pins: bool) -> PipelineOpts {
+    PipelineOpts {
+        standalone: false,
+        source_file: "property_case.lua".into(),
+        walk_pins,
+    }
 }
 
-impl Stage {
-    fn name(&self) -> &'static str {
-        match self {
-            Stage::Panicked => "panicked",
-            Stage::Front => "front (lexer/parser)",
-            Stage::Analyze => "shape analyzer + checker (one walk)",
-            Stage::Lower => "lowerer",
-            Stage::Backend => "backend",
-        }
-    }
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "unknown panic".into())
 }
 
 /// Runs the full compile pipeline on `source` and returns the `.ll`
@@ -111,51 +112,41 @@ fn compile(source: &str) -> Result<String, (Stage, Vec<String>)> {
 }
 
 /// The differential leg's entry (the pin-owed register, census §3
-/// cluster A): `walk_pins = false` routes the analyzer through
-/// `analyze_with(ctx, false)`, disarming the walk's use-site pins so
-/// only the checker's own land — the subset discipline's A/B leg.
+/// cluster A): `walk_pins = false` routes the analyzer with its
+/// use-site pins disarmed, so only the checker's own land — the subset
+/// discipline's A/B leg.
 fn compile_with(source: &str, walk_pins: bool) -> Result<String, (Stage, Vec<String>)> {
-    match std::panic::catch_unwind(AssertUnwindSafe(|| compile_inner_with(source, walk_pins))) {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        pipeline::compile(source, &property_opts(walk_pins))
+    })) {
         Ok(r) => r,
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "unknown panic".into());
-            Err((Stage::Panicked, vec![format!("panic: {msg}")]))
-        }
+        Err(payload) => Err((
+            Stage::Panicked,
+            vec![format!("panic: {}", panic_message(payload))],
+        )),
     }
 }
 
-fn compile_inner(source: &str) -> Result<String, (Stage, Vec<String>)> {
-    compile_inner_with(source, true)
-}
-
-fn compile_inner_with(source: &str, walk_pins: bool) -> Result<String, (Stage, Vec<String>)> {
-    let mut tokens = Vec::new();
-    let mut offsets = Vec::new();
-    let mut lexer = lexer::Token::lexer(source);
-    loop {
-        match lexer.next() {
-            Some(Ok(token)) => {
-                offsets.push(lexer.span().start);
-                tokens.push(token);
-            }
-            Some(Err(_)) => {
-                let line = 1 + source.as_bytes()[..lexer.span().start]
-                    .iter()
-                    .filter(|b| **b == b'\n')
-                    .count();
-                return Err((
-                    Stage::Front,
-                    vec![format!("line {line}: Syntax Error: Lexer error")],
-                ));
-            }
-            None => break,
-        }
+/// The exe-opts leg: the ffi surface is legal standalone, so probes of
+/// it reach the TYPE discipline at analysis instead of the packaging
+/// gate (their .so-opts twin rejects at `Stage::Ffi`).
+fn compile_exe(source: &str) -> Result<String, (Stage, Vec<String>)> {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        pipeline::compile(
+            source,
+            &PipelineOpts {
+                standalone: true,
+                source_file: "property_case.lua".into(),
+                walk_pins: true,
+            },
+        )
+    })) {
+        Ok(r) => r,
+        Err(payload) => Err((
+            Stage::Panicked,
+            vec![format!("panic: {}", panic_message(payload))],
+        )),
     }
-    compile_tokenized_with(source, tokens.into_iter().zip(offsets).collect(), walk_pins)
 }
 
 /// The pipeline from a pre-lexed token stream — the token-soup fuzz leg
@@ -168,50 +159,19 @@ fn compile_tokenized(
     compile_tokenized_with(source, tokens, true)
 }
 
-/// The pipeline from a pre-lexed token stream — the token-soup fuzz leg
-/// feeds mutated token vectors in here directly (offsets stay valid
-/// byte indices of the same source, so diagnostics remain sound).
 fn compile_tokenized_with(
     source: &str,
     tokens: Vec<(lexer::Token<'_>, usize)>,
     walk_pins: bool,
 ) -> Result<String, (Stage, Vec<String>)> {
-    let wrap = |r: Result<String, (Stage, Vec<String>)>| r;
     match std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut parser = Parser::new(tokens, source);
-        let ast: Vec<Stmt> = parser.parse_program();
-        let front_diagnostics = parser.diagnostics;
-        if !front_diagnostics.is_empty() {
-            return Err((Stage::Front, front_diagnostics));
-        }
-
-        let ctx = analysis::build_context(&ast);
-
-        // one walk: the analyzer's recorded pass IS the checker — its
-        // diagnostics cover both halves
-        let shape = shape::analyze_with(&ctx, walk_pins);
-        if !shape.diagnostics.is_empty() {
-            return Err((Stage::Analyze, shape.diagnostics));
-        }
-
-        let mut ir_lowerer = IrLowerer::new(&shape, ctx.stmt_locs);
-        let mut ir_program = ir_lowerer.lower_program(&ast);
-        if !ir_lowerer.diagnostics.is_empty() {
-            return Err((Stage::Lower, ir_lowerer.diagnostics));
-        }
-        ir_program.source_file = "property_case.lua".into();
-
-        backend::generate_llvm_ir(&ir_program).map_err(|d| (Stage::Backend, d))
+        pipeline::compile_parts(tokens, source, &property_opts(walk_pins))
     })) {
-        Ok(r) => wrap(r),
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "unknown panic".into());
-            Err((Stage::Panicked, vec![format!("panic: {msg}")]))
-        }
+        Ok(r) => r,
+        Err(payload) => Err((
+            Stage::Panicked,
+            vec![format!("panic: {}", panic_message(payload))],
+        )),
     }
 }
 
@@ -1361,10 +1321,12 @@ fn walk_pins_are_a_pure_subset_over_the_corpus() {
 /// register, census §3 cluster B row 19): a closure-carrying table may
 /// not cross a module boundary — the env pointer is this module's heap
 /// state. The `return` face is pinned by escape_no_crossing; the drive
-/// call and coroutine.resume faces live behind the exe-only gate in
-/// the driver (main.rs refuses the ffi surface in .so mode before
-/// analysis runs), so the in-process pipeline — which owns the TYPE
-/// discipline, not the packaging policy — is their pin home.
+/// call and coroutine.resume faces ride the ffi surface, so the ONE
+/// pipeline (H10) pins them at both of its gates: .so opts refuse the
+/// surface itself at `Stage::Ffi` (packaging policy — the drift this
+/// fold surfaced: the harness's old private walk had no such gate),
+/// and exe opts — where the surface is legal — reach analysis and
+/// reject on the TYPE discipline.
 #[test]
 fn w3a_crossing_faces_reject_on_both_drive_and_spawn() {
     let drive_face = r#"
@@ -1399,7 +1361,29 @@ fn w3a_crossing_faces_reject_on_both_drive_and_spawn() {
              cells only",
         ),
     ] {
+        // the .so-opts face: the packaging gate precedes the type
+        // discipline in the one pipeline
         match compile(source) {
+            Err((Stage::Ffi, diags)) => {
+                assert!(
+                    diags
+                        .iter()
+                        .any(|d| d.contains("ffi surface") && d.contains("--exe-only")),
+                    "the {label} face's .so-opts rejection lost the gate text: {}",
+                    diags.join("; ")
+                );
+            }
+            other => panic!(
+                "the {label} ffi face must reject at the ffi gate under .so opts: {}",
+                match other {
+                    Ok(_) => "accepted".to_string(),
+                    Err((s, d)) => format!("{}: {}", s.name(), d.join("; ")),
+                }
+            ),
+        }
+        // the exe-opts face: the surface is legal, the crossing rejects
+        // at analysis
+        match compile_exe(source) {
             Err((Stage::Analyze, diags)) => {
                 assert!(
                     diags.iter().any(|d| d.contains(needle)),
@@ -1408,7 +1392,7 @@ fn w3a_crossing_faces_reject_on_both_drive_and_spawn() {
                 );
             }
             other => panic!(
-                "the {label} crossing face did not reject at analysis: {}",
+                "the {label} crossing face did not reject at analysis under exe opts: {}",
                 match other {
                     Ok(_) => "accepted".to_string(),
                     Err((s, d)) => format!("{}: {}", s.name(), d.join("; ")),

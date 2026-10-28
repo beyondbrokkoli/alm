@@ -1,4 +1,3 @@
-use logos::Logos;
 use std::ffi::{CString, c_void};
 use std::process::Stdio;
 
@@ -10,11 +9,10 @@ mod ir;
 mod lexer;
 mod lowerer;
 mod parser;
+mod pipeline;
 #[cfg(test)]
 mod property_tests;
 mod shape;
-
-use ast::Stmt;
 
 // The boundary type, shared by construction: the same #[repr(C)] struct
 use alm_rt::rt::AlmTable;
@@ -93,104 +91,6 @@ unsafe fn resolve_symbol<T>(dylib: *mut c_void, name: &[u8]) -> Result<T, String
         return Err(format!("dlsym: '{sym_name}' not found"));
     }
     Ok(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&sym) })
-}
-
-fn references_arg(stmts: &[Stmt]) -> bool {
-    fn expr(e: &ast::Expr) -> bool {
-        match e {
-            ast::Expr::Identifier(name) => name == "arg",
-            ast::Expr::TableCtor { entries, .. } => entries
-                .iter()
-                .any(|(k, v)| matches!(k, ast::CtorKey::Expr(ke) if expr(ke)) || expr(v)),
-            ast::Expr::Index { obj, key } => expr(obj) || expr(key),
-            ast::Expr::BinaryOp { left, right, .. } => expr(left) || expr(right),
-            ast::Expr::UnaryOp { expr: inner, .. } => expr(inner),
-            ast::Expr::Call { callee, args } => expr(callee) || args.iter().any(expr),
-            ast::Expr::Function { body, .. } => go(body),
-            ast::Expr::Integer(_)
-            | ast::Expr::Float(_)
-            | ast::Expr::Boolean(_)
-            | ast::Expr::String(_)
-            | ast::Expr::Nil
-            | ast::Expr::SysAllocCount
-            | ast::Expr::SysExecCount
-            | ast::Expr::FfiModule
-            | ast::Expr::CoroModule => false,
-            ast::Expr::Field { obj, .. } => expr(obj),
-        }
-    }
-    fn go(stmts: &[Stmt]) -> bool {
-        stmts.iter().any(|s| match s {
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => exprs.iter().any(expr),
-            Stmt::Assignment { expr: value, .. } => expr(value),
-            Stmt::IndexAssign {
-                obj, key, value, ..
-            } => expr(obj) || expr(key) || expr(value),
-            Stmt::While {
-                condition, body, ..
-            } => expr(condition) || go(body),
-            Stmt::Do { body, .. } => go(body),
-            Stmt::If {
-                condition,
-                then_body,
-                else_body,
-                ..
-            } => expr(condition) || go(then_body) || go(else_body),
-            Stmt::Expr { expr: inner, .. } => expr(inner),
-            Stmt::Return { value, .. } => value.as_ref().is_some_and(expr),
-            Stmt::Break { .. } => false,
-        })
-    }
-    go(stmts)
-}
-
-fn uses_ffi(stmts: &[Stmt]) -> bool {
-    fn expr(e: &ast::Expr) -> bool {
-        match e {
-            ast::Expr::FfiModule => true,
-            ast::Expr::Field { obj, .. } => expr(obj),
-            ast::Expr::TableCtor { entries, .. } => entries
-                .iter()
-                .any(|(k, v)| matches!(k, ast::CtorKey::Expr(ke) if expr(ke)) || expr(v)),
-            ast::Expr::Index { obj, key } => expr(obj) || expr(key),
-            ast::Expr::BinaryOp { left, right, .. } => expr(left) || expr(right),
-            ast::Expr::UnaryOp { expr: inner, .. } => expr(inner),
-            ast::Expr::Call { callee, args } => expr(callee) || args.iter().any(expr),
-            ast::Expr::Function { body, .. } => go(body),
-            ast::Expr::Integer(_)
-            | ast::Expr::Float(_)
-            | ast::Expr::Boolean(_)
-            | ast::Expr::String(_)
-            | ast::Expr::Nil
-            | ast::Expr::SysAllocCount
-            | ast::Expr::SysExecCount
-            | ast::Expr::CoroModule
-            | ast::Expr::Identifier(_) => false,
-        }
-    }
-    fn go(stmts: &[Stmt]) -> bool {
-        stmts.iter().any(|s| match s {
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => exprs.iter().any(expr),
-            Stmt::Assignment { expr: value, .. } => expr(value),
-            Stmt::IndexAssign {
-                obj, key, value, ..
-            } => expr(obj) || expr(key) || expr(value),
-            Stmt::While {
-                condition, body, ..
-            } => expr(condition) || go(body),
-            Stmt::Do { body, .. } => go(body),
-            Stmt::If {
-                condition,
-                then_body,
-                else_body,
-                ..
-            } => expr(condition) || go(then_body) || go(else_body),
-            Stmt::Expr { expr: inner, .. } => expr(inner),
-            Stmt::Return { value, .. } => value.as_ref().is_some_and(expr),
-            Stmt::Break { .. } => false,
-        })
-    }
-    go(stmts)
 }
 
 unsafe fn run_boundary(words: &[String], out_path: &str) -> Result<(), String> {
@@ -444,73 +344,26 @@ it defaults to libalm_out.so (or alm_out for --exe).";
         std::process::exit(1);
     });
 
-    let mut tokens = Vec::new();
-    let mut offsets = Vec::new();
-    let mut front_diagnostics = Vec::new();
-    let mut lexer = lexer::Token::lexer(&source);
-    loop {
-        match lexer.next() {
-            Some(Ok(token)) => {
-                offsets.push(lexer.span().start);
-                tokens.push(token);
-            }
-            Some(Err(_)) => {
-                let line = 1 + source.as_bytes()[..lexer.span().start]
-                    .iter()
-                    .filter(|b| **b == b'\n')
-                    .count();
-                front_diagnostics.push(format!("line {line}: Syntax Error: Lexer error"));
-                break;
-            }
-            None => break,
-        }
-    }
-
-    let mut parser = parser::Parser::new(tokens.into_iter().zip(offsets).collect(), &source);
-    let ast = parser.parse_program();
-    front_diagnostics.extend(parser.diagnostics);
-
-    if !front_diagnostics.is_empty() {
-        fail_build(&front_diagnostics);
-    }
-
-    if uses_ffi(&ast) && !standalone {
-        eprintln!(
-            "alm compiler error: the ffi surface (require(\"ffi\") / ffi.load / lib.sym) is \
-             --exe-only — rebuild with --exe; a shared object loading shared objects is not \
-             acyclic destiny"
-        );
-        std::process::exit(1);
-    }
-
-    let ctx = analysis::build_context(&ast);
-
-    // one walk: the shape analyzer's recorded pass IS the checker (the
-    // fold) — analyze returns the complete fact set plus diagnostics
-    let shape = shape::analyze(&ctx);
-
-    if !shape.diagnostics.is_empty() {
-        fail_build(&shape.diagnostics);
-    }
-
-    let mut ir_lowerer = lowerer::IrLowerer::new(&shape, ctx.stmt_locs);
-    let mut ir_program = ir_lowerer.lower_program(&ast);
-
-    if !ir_lowerer.diagnostics.is_empty() {
-        fail_build(&ir_lowerer.diagnostics);
-    }
-
-    ir_program.source_file =
-        std::fs::canonicalize(source_path).unwrap_or_else(|_| source_path.into());
-
-    let arg_used = references_arg(&ast);
-    if standalone {
-        ir_program.entry = ir::EntryKind::Exe { args: arg_used };
-    }
-
-    let llvm_ir = match backend::generate_llvm_ir(&ir_program) {
+    // the one pipeline (H10): every phase from source to .ll text lives
+    // in src/pipeline.rs — the property harness drives the same walk
+    let llvm_ir = match pipeline::compile(
+        &source,
+        &pipeline::PipelineOpts {
+            standalone,
+            source_file: std::fs::canonicalize(source_path).unwrap_or_else(|_| source_path.into()),
+            walk_pins: true,
+        },
+    ) {
         Ok(ir) => ir,
-        Err(diagnostics) => fail_build(&diagnostics),
+        // the ffi refusal keeps its bespoke exit — the message alone,
+        // no build-fail trace poke — byte-for-byte the pre-fold driver
+        Err((pipeline::Stage::Ffi, diags)) => {
+            for d in &diags {
+                eprintln!("{d}");
+            }
+            std::process::exit(1);
+        }
+        Err((_, diags)) => fail_build(&diags),
     };
     let out_dir = std::path::Path::new(&output_file)
         .parent()

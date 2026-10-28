@@ -383,16 +383,14 @@ struct Analyzer {
     loop_scope_entries: Vec<usize>,
 }
 
-pub fn analyze(ctx: &AnalysisContext<'_>) -> ShapeFacts {
-    analyze_with(ctx, true)
-}
-
-/// The differential leg's lever (the pin-owed register, census §3
-/// cluster A row 3): the walk's use-site pins are a documented SUBSET
-/// of the checker's own — with the lever off, the checker's pins
-/// alone must land the identical constraint store, hence the
-/// identical facts, hence the identical pipeline output. The property
-/// harness asserts exactly that over the whole corpus and the
+/// `walk_pins` arms the walk's use-site pins. The one pipeline (H10) is
+/// the only caller: the shipped path (main.rs's driver) always passes
+/// `true`; `false` is the differential leg's lever (the pin-owed
+/// register, census §3 cluster A row 3): the walk's use-site pins are
+/// a documented SUBSET of the checker's own — with the lever off, the
+/// checker's pins alone must land the identical constraint store,
+/// hence the identical facts, hence the identical pipeline output. The
+/// property harness asserts exactly that over the whole corpus and the
 /// generated programs (`walk_pins_are_a_pure_subset_over_the_corpus`).
 pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
     let n = ctx.sites.len();
