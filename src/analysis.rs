@@ -10,79 +10,39 @@ pub struct AnalysisContext<'a> {
     pub ctor_lines: Vec<usize>,
 }
 
-pub fn build_context<'a>(
-    ast: &'a [Stmt],
-    stmt_line_seq: &[usize],
-    stmt_col_seq: &[usize],
-    ctor_line_seq: Vec<usize>,
-) -> AnalysisContext<'a> {
+pub fn build_context<'a>(ast: &'a [Stmt]) -> AnalysisContext<'a> {
     let mut sites = BTreeMap::new();
     number_sites(ast, &mut sites);
-    assert_eq!(
-        sites.len(),
-        ctor_line_seq.len(),
-        "ctor line sequence out of step with the site walk"
-    );
-    assert_eq!(
-        stmt_line_seq.len(),
-        stmt_col_seq.len(),
-        "stmt column sequence out of step with the line sequence"
-    );
-    // The SHADOW (H5 sessions 2–3): the parser's parallel attribution
-    // arrays, consumed pre-order. The count asserts around this walk
-    // stay — under-run, over-run — until session 4 deletes the arrays
-    // and this whole half with them.
-    let mut seq_lines = BTreeMap::new();
-    let mut seq_locs = BTreeMap::new();
-    let mut i = 0;
-    record_stmt_lines(
-        ast,
-        &mut seq_lines,
-        &mut seq_locs,
-        stmt_line_seq,
-        stmt_col_seq,
-        &mut i,
-    );
-    assert_eq!(
-        i,
-        stmt_line_seq.len(),
-        "stmt line sequence out of step with the AST walk (over-run: {} fabricated entries \
-         were never consumed by {} statements — a desugar minted seq entries without \
-         minting statements)",
-        stmt_line_seq.len(),
-        i
-    );
-    // The TRUTH (H5 session 2): attribution derived from the nodes' own
-    // loc stamps — the returned maps come from HERE, so session 4's
-    // deletion removes a shadow, not a load-bearing path. The dual-run
-    // assert below pins the two derivations together in the meantime.
+    // THE attribution derivation (H5 sessions 2–4): read off the
+    // nodes' own `loc` stamps. The parser's parallel seq arrays are
+    // deleted — there is no second representation to drift, no
+    // counter to miscount. Statements live in fn-literal bodies
+    // inside exprs, so the walk recurses through every expression
+    // face.
     let mut stmt_lines = BTreeMap::new();
     let mut stmt_locs = BTreeMap::new();
-    let mut kinds = BTreeMap::new();
-    derive_from_locs(ast, &mut stmt_lines, &mut stmt_locs, &mut kinds);
-    assert_dual_run(
-        &seq_lines,
-        &seq_locs,
-        &stmt_lines,
-        &stmt_locs,
-        &kinds,
-        stmt_line_seq.len(),
-    );
-    // H5's misattribution half: the count asserts prove totals in both
-    // directions; they cannot prove a fabricated entry points at the
-    // RIGHT line. The census pins the one multi-statement desugar's
-    // attribution discipline on every compile — now over the loc-derived
-    // map (identical to the shadow's by the assert above).
+    derive_from_locs(ast, &mut stmt_lines, &mut stmt_locs);
+    // H5's misattribution half: counts are structural now (a stamped
+    // node cannot be un-counted), but a stamp can still be minted
+    // wrong — and the one multi-statement desugar (the for loop, R7)
+    // is the only place that stamps by hand-copy. The census pins its
+    // discipline on every compile, over the loc-derived map.
     census_for_desugar(ast, &stmt_lines);
-    // The TRUTH (H5 session 3), ctor half: lines derived from the
-    // nodes' own stamps, collected in number_sites' pre-order — index
-    // i IS site i. Returned from HERE, so session 4's deletion of
-    // ctor_line_seq removes a shadow, not a load-bearing path; the
-    // dual-run assert below pins the two orders together in the
-    // meantime (parse push order == output-tree pre-order is exactly
-    // the hand-simulated discipline H5 kills).
+    // The ctor half (H5 session 3): lines read off the nodes' own
+    // stamps, collected in the same pre-order number_sites walks —
+    // index i IS site i, and the vec drops into every `ctor_lines[id]`
+    // consumer unchanged. The count pin holds the two walks' face
+    // sets together: a face added to one walk and not the other cries
+    // wolf here, before it can shift a site's line.
     let ctor_lines = derive_ctor_lines(ast);
-    assert_dual_run_ctors(&ctor_line_seq, &ctor_lines);
+    assert_eq!(
+        ctor_lines.len(),
+        sites.len(),
+        "ctor line derivation walks {} sites but the site walk numbered {} — the two \
+         pre-order walks' faces diverged (H5)",
+        ctor_lines.len(),
+        sites.len()
+    );
 
     AnalysisContext {
         sites,
@@ -93,73 +53,16 @@ pub fn build_context<'a>(
     }
 }
 
-fn record_stmt_lines(
-    stmts: &[Stmt],
-    map: &mut BTreeMap<*const Stmt, usize>,
-    locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-    seq: &[usize],
-    cols: &[usize],
-    i: &mut usize,
-) {
-    for s in stmts {
-        // H5's loud under-count: build_context only ever sees fully
-        // parsed programs (both call sites gate on empty front
-        // diagnostics), so a missing entry here is a desugar that
-        // minted statements without minting their seq entries. The
-        // old silent early-return masked exactly this bug class —
-        // trailing statements went line-less and the final count
-        // assert still passed. It cries wolf now.
-        let (line, col) = match (seq.get(*i), cols.get(*i)) {
-            (Some(&l), Some(&c)) => (l, c),
-            _ => panic!(
-                "stmt line sequence under-runs the AST walk: statement #{} ({}) has no \
-                 fabricated entry — a desugar minted statements without minting seq \
-                 entries (H5)",
-                *i,
-                stmt_kind(s)
-            ),
-        };
-        map.insert(s as *const Stmt, line);
-        locs.insert(
-            s as *const Stmt,
-            SourceLoc {
-                line: line as u32,
-                col: col as u32,
-            },
-        );
-        *i += 1;
-        record_stmt_exprs(s, map, locs, seq, cols, i);
-    }
-}
-
-/// The statement's kind name for tripwire prose: H5's panics name the
-/// construct that ran out of entries (or the entry that ran out of
-/// construct).
-fn stmt_kind(s: &Stmt) -> &'static str {
-    match s {
-        Stmt::LocalDecl { .. } => "LocalDecl",
-        Stmt::Assignment { .. } => "Assignment",
-        Stmt::IndexAssign { .. } => "IndexAssign",
-        Stmt::While { .. } => "While",
-        Stmt::Do { .. } => "Do",
-        Stmt::If { .. } => "If",
-        Stmt::Print { .. } => "Print",
-        Stmt::Expr { .. } => "Expr",
-        Stmt::Return { .. } => "Return",
-        Stmt::Break { .. } => "Break",
-    }
-}
-
-/// H5 session 2's truth half: attribution derived from the nodes' own
-/// `loc` stamps. Statements live in fn-literal bodies inside exprs, so
-/// the recursion mirrors record_stmt_lines exactly — same walk, no
-/// counter, nothing to miscount. `kinds` rides along so the dual-run
-/// assert can name the diverging construct when it cries wolf.
+/// THE attribution derivation (H5): read off the nodes' own `loc`
+/// stamps — there is no other representation. Statements live in
+/// fn-literal bodies inside exprs, so the recursion covers every
+/// expression face; the golden pins in property_tests.rs hold its
+/// values (desugar families at the header, everything else at its own
+/// leading token).
 fn derive_from_locs(
     stmts: &[Stmt],
     lines: &mut BTreeMap<*const Stmt, usize>,
     locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-    kinds: &mut BTreeMap<*const Stmt, &'static str>,
 ) {
     for s in stmts {
         let stamp = s.loc();
@@ -171,8 +74,7 @@ fn derive_from_locs(
                 col: stamp.col,
             },
         );
-        kinds.insert(s as *const Stmt, stmt_kind(s));
-        derive_stmt_exprs(s, lines, locs, kinds);
+        derive_stmt_exprs(s, lines, locs);
     }
 }
 
@@ -182,50 +84,41 @@ fn derive_stmt_exprs(
     stmt: &Stmt,
     lines: &mut BTreeMap<*const Stmt, usize>,
     locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-    kinds: &mut BTreeMap<*const Stmt, &'static str>,
 ) {
-    let expr = |e: &Expr,
-                lines: &mut BTreeMap<*const Stmt, usize>,
-                locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-                kinds: &mut BTreeMap<*const Stmt, &'static str>| {
-        derive_expr(e, lines, locs, kinds)
-    };
     match stmt {
         Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
             for e in exprs {
-                expr(e, lines, locs, kinds);
+                derive_expr(e, lines, locs);
             }
         }
-        Stmt::Assignment { expr: ev, .. } | Stmt::Expr { expr: ev, .. } => {
-            expr(ev, lines, locs, kinds)
-        }
+        Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => derive_expr(expr, lines, locs),
         Stmt::IndexAssign {
             obj, key, value, ..
         } => {
-            expr(obj, lines, locs, kinds);
-            expr(key, lines, locs, kinds);
-            expr(value, lines, locs, kinds);
+            derive_expr(obj, lines, locs);
+            derive_expr(key, lines, locs);
+            derive_expr(value, lines, locs);
         }
         Stmt::While {
             condition, body, ..
         } => {
-            expr(condition, lines, locs, kinds);
-            derive_from_locs(body, lines, locs, kinds);
+            derive_expr(condition, lines, locs);
+            derive_from_locs(body, lines, locs);
         }
-        Stmt::Do { body, .. } => derive_from_locs(body, lines, locs, kinds),
+        Stmt::Do { body, .. } => derive_from_locs(body, lines, locs),
         Stmt::If {
             condition,
             then_body,
             else_body,
             ..
         } => {
-            expr(condition, lines, locs, kinds);
-            derive_from_locs(then_body, lines, locs, kinds);
-            derive_from_locs(else_body, lines, locs, kinds);
+            derive_expr(condition, lines, locs);
+            derive_from_locs(then_body, lines, locs);
+            derive_from_locs(else_body, lines, locs);
         }
         Stmt::Return { value, .. } => {
             if let Some(e) = value {
-                expr(e, lines, locs, kinds);
+                derive_expr(e, lines, locs);
             }
         }
         Stmt::Break { .. } => {}
@@ -236,82 +129,42 @@ fn derive_expr(
     e: &Expr,
     lines: &mut BTreeMap<*const Stmt, usize>,
     locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-    kinds: &mut BTreeMap<*const Stmt, &'static str>,
 ) {
     match e {
-        Expr::Function { body, .. } => derive_from_locs(body, lines, locs, kinds),
+        Expr::Function { body, .. } => derive_from_locs(body, lines, locs),
         Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
-                    derive_expr(ke, lines, locs, kinds);
+                    derive_expr(ke, lines, locs);
                 }
-                derive_expr(v, lines, locs, kinds);
+                derive_expr(v, lines, locs);
             }
         }
         Expr::Index { obj, key } => {
-            derive_expr(obj, lines, locs, kinds);
-            derive_expr(key, lines, locs, kinds);
+            derive_expr(obj, lines, locs);
+            derive_expr(key, lines, locs);
         }
         Expr::BinaryOp { left, right, .. } => {
-            derive_expr(left, lines, locs, kinds);
-            derive_expr(right, lines, locs, kinds);
+            derive_expr(left, lines, locs);
+            derive_expr(right, lines, locs);
         }
-        Expr::UnaryOp { expr, .. } => derive_expr(expr, lines, locs, kinds),
+        Expr::UnaryOp { expr, .. } => derive_expr(expr, lines, locs),
         Expr::Call { callee, args } => {
-            derive_expr(callee, lines, locs, kinds);
+            derive_expr(callee, lines, locs);
             for a in args {
-                derive_expr(a, lines, locs, kinds);
+                derive_expr(a, lines, locs);
             }
         }
         _ => {}
     }
 }
 
-/// THE H5 DUAL-RUN ASSERT (sessions 2–3 scaffolding): the loc-stamped
-/// truth and the seq-derived shadow must agree on every statement —
-/// same pointers, same line, same col. Any drift means a stamp was
-/// minted wrong (fix the STAMP, never this assert). Session 4 deletes
-/// the shadow half; this assert goes with it.
-fn assert_dual_run(
-    seq_lines: &BTreeMap<*const Stmt, usize>,
-    seq_locs: &BTreeMap<*const Stmt, SourceLoc>,
-    loc_lines: &BTreeMap<*const Stmt, usize>,
-    loc_locs: &BTreeMap<*const Stmt, SourceLoc>,
-    kinds: &BTreeMap<*const Stmt, &'static str>,
-    seq_len: usize,
-) {
-    if seq_lines == loc_lines && seq_locs == loc_locs {
-        return;
-    }
-    let mut keys: Vec<*const Stmt> = seq_lines.keys().copied().collect();
-    keys.extend(loc_lines.keys().copied());
-    keys.sort_unstable();
-    keys.dedup();
-    let bad = keys
-        .into_iter()
-        .find(|&k| seq_lines.get(&k) != loc_lines.get(&k) || seq_locs.get(&k) != loc_locs.get(&k))
-        .expect("maps differ but no key diverges");
-    panic!(
-        "H5 dual-run: loc-stamped attribution disagrees with the seq derivation at a {} \
-         statement ({:p}) — the loc stamp says {:?}, the seq entry says {:?} ({} seq entries \
-         total); fix the stamp, not the assert",
-        kinds
-            .get(&bad)
-            .copied()
-            .unwrap_or("<statement the loc walk missed>"),
-        bad,
-        loc_locs.get(&bad),
-        seq_locs.get(&bad),
-        seq_len
-    );
-}
-
-/// H5 session 3's truth half for ctors: lines read off the nodes' own
-/// `line` stamps, collected in the same pre-order `number_sites`
+/// The ctor attribution derivation (H5): lines read off the nodes'
+/// own `line` stamps, collected in the same pre-order number_sites
 /// walks — so index i IS site i and the vec drops into every
 /// `ctor_lines[id]` consumer unchanged. The recursion mirrors
-/// number_stmt/number_expr exactly (same faces, same order); a face
-/// missed here is a count the dual-run assert below catches.
+/// number_stmt/number_expr exactly (same faces, same order); the
+/// count assert in build_context holds the two face sets together.
 fn derive_ctor_lines(stmts: &[Stmt]) -> Vec<usize> {
     let mut lines = Vec::new();
     derive_ctor_lines_into(stmts, &mut lines);
@@ -399,44 +252,16 @@ fn derive_ctor_line_expr(expr: &Expr, lines: &mut Vec<usize>) {
     }
 }
 
-/// THE H5 DUAL-RUN ASSERT, ctor half (session 3 scaffolding): the
-/// node-stamped lines (truth, site-ordered) and the parser's
-/// parse-order pushes (shadow) must agree element for element — same
-/// count, same line at every site. Any drift means a stamp was minted
-/// wrong or the derivation walks a different face set than
-/// number_sites (fix the STAMP or the WALK, never this assert).
-/// Session 4 deletes the shadow half; this assert goes with it.
-fn assert_dual_run_ctors(seq: &[usize], from_stamps: &[usize]) {
-    if seq == from_stamps {
-        return;
-    }
-    let at = seq
-        .iter()
-        .zip(from_stamps.iter())
-        .position(|(a, b)| a != b)
-        .unwrap_or_else(|| seq.len().min(from_stamps.len()));
-    panic!(
-        "H5 ctor dual-run: the node-stamped line disagrees with the seq push at site {at} — the \
-         stamp says {:?}, the seq push says {:?} ({} seq entries vs {} node-stamped ctors); fix \
-         the stamp, not the assert",
-        from_stamps.get(at),
-        seq.get(at),
-        seq.len(),
-        from_stamps.len()
-    );
-}
-
-/// THE DESUGAR ATTRIBUTION CENSUS (H5). The count asserts above are
-/// symmetric — under-run and over-run both cry wolf — but a right-COUNT
-/// wrong-LINE fabrication slips through them silently: only the one
-/// multi-statement desugar (the for loop, R7) fabricates entries by
-/// hand (four pre-pushes before the body parses, one post-push after),
-/// so only it can drift. This census walks the finished tree and pins
-/// the discipline: the block Do, the counter decl, the for$limit latch
-/// decl, the While, the body's inner Do, and the synthetic increment
-/// ALL report the for header's one line — any drift fails loudly at
-/// attribution time instead of whispering wrong line prefixes into
-/// diagnostics.
+/// THE DESUGAR ATTRIBUTION CENSUS (H5). Attribution rides the AST
+/// node, so counts are structural — but a stamp can still be minted
+/// wrong, and the one multi-statement desugar (the for loop, R7) is
+/// the only construct that stamps by hand-copy: its six statements
+/// must all carry the for header's stamp. This census walks the
+/// finished tree and pins the discipline: the block Do, the counter
+/// decl, the for$limit latch decl, the While, the body's inner Do,
+/// and the synthetic increment ALL report the for header's one line —
+/// any drift fails loudly at attribution time instead of whispering
+/// wrong line prefixes into diagnostics.
 ///
 /// `for$limit` is unspellable (identifiers are [a-zA-Z_][a-zA-Z0-9_]*,
 /// lexer.rs), so the latch decl is an unforgeable fingerprint of the
@@ -460,8 +285,8 @@ fn census_for_desugar(stmts: &[Stmt], lines: &BTreeMap<*const Stmt, usize>) {
                 Some(&l) if l == *header => {}
                 Some(&l) => panic!(
                     "for-desugar attribution drift: the {what} reports line {l} but the for \
-                     header reports line {header} — every fabricated entry must point at the \
-                     header (R7's law, H5's census)"
+                     header reports line {header} — every desugared statement must carry the \
+                     header's stamp (R7's law, H5's census)"
                 ),
                 None => panic!("for-desugar census: the {what} is unmapped (H5)"),
             };
@@ -557,95 +382,6 @@ fn census_expr(e: &Expr, lines: &BTreeMap<*const Stmt, usize>) {
             census_expr(callee, lines);
             for a in args {
                 census_expr(a, lines);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn record_stmt_exprs(
-    stmt: &Stmt,
-    map: &mut BTreeMap<*const Stmt, usize>,
-    locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-    seq: &[usize],
-    cols: &[usize],
-    i: &mut usize,
-) {
-    let expr = |e: &Expr,
-                map: &mut BTreeMap<*const Stmt, usize>,
-                locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-                i: &mut usize| { record_expr_lines(e, map, locs, seq, cols, i) };
-    match stmt {
-        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
-            for e in exprs {
-                expr(e, map, locs, i);
-            }
-        }
-        Stmt::Assignment { expr: ev, .. } | Stmt::Expr { expr: ev, .. } => expr(ev, map, locs, i),
-        Stmt::IndexAssign {
-            obj, key, value, ..
-        } => {
-            expr(obj, map, locs, i);
-            expr(key, map, locs, i);
-            expr(value, map, locs, i);
-        }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            expr(condition, map, locs, i);
-            record_stmt_lines(body, map, locs, seq, cols, i);
-        }
-        Stmt::Do { body, .. } => record_stmt_lines(body, map, locs, seq, cols, i),
-        Stmt::If {
-            condition,
-            then_body,
-            else_body,
-            ..
-        } => {
-            expr(condition, map, locs, i);
-            record_stmt_lines(then_body, map, locs, seq, cols, i);
-            record_stmt_lines(else_body, map, locs, seq, cols, i);
-        }
-        Stmt::Return { value, .. } => {
-            if let Some(e) = value {
-                expr(e, map, locs, i);
-            }
-        }
-        Stmt::Break { .. } => {}
-    }
-}
-
-fn record_expr_lines(
-    e: &Expr,
-    map: &mut BTreeMap<*const Stmt, usize>,
-    locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-    seq: &[usize],
-    cols: &[usize],
-    i: &mut usize,
-) {
-    match e {
-        Expr::Function { body, .. } => record_stmt_lines(body, map, locs, seq, cols, i),
-        Expr::TableCtor { entries, .. } => {
-            for (k, v) in entries {
-                if let CtorKey::Expr(ke) = k {
-                    record_expr_lines(ke, map, locs, seq, cols, i);
-                }
-                record_expr_lines(v, map, locs, seq, cols, i);
-            }
-        }
-        Expr::Index { obj, key } => {
-            record_expr_lines(obj, map, locs, seq, cols, i);
-            record_expr_lines(key, map, locs, seq, cols, i);
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            record_expr_lines(left, map, locs, seq, cols, i);
-            record_expr_lines(right, map, locs, seq, cols, i);
-        }
-        Expr::UnaryOp { expr, .. } => record_expr_lines(expr, map, locs, seq, cols, i),
-        Expr::Call { callee, args } => {
-            record_expr_lines(callee, map, locs, seq, cols, i);
-            for a in args {
-                record_expr_lines(a, map, locs, seq, cols, i);
             }
         }
         _ => {}

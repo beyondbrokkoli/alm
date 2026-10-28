@@ -42,9 +42,8 @@ pub enum Expr {
     TableCtor {
         entries: Vec<(CtorKey, Expr)>,
         /// The ctor's birth line — its `{`, stamped at construction
-        /// (H5 session 3): attribution rides the node, so the parser's
-        /// parse-order `ctor_line_seq` pushes become the asserted
-        /// shadow and die in session 4. Line only: ctor cols are
+        /// (H5): attribution rides the node; there is no parallel
+        /// push order to keep in step. Line only: ctor cols are
         /// unused today and stay that way.
         line: u32,
     },

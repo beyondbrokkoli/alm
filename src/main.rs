@@ -483,12 +483,7 @@ it defaults to libalm_out.so (or alm_out for --exe).";
         std::process::exit(1);
     }
 
-    let ctx = analysis::build_context(
-        &ast,
-        &parser.stmt_line_seq,
-        &parser.stmt_col_seq,
-        parser.ctor_line_seq.clone(),
-    );
+    let ctx = analysis::build_context(&ast);
 
     // one walk: the shape analyzer's recorded pass IS the checker (the
     // fold) — analyze returns the complete fact set plus diagnostics

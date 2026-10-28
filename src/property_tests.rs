@@ -185,12 +185,7 @@ fn compile_tokenized_with(
             return Err((Stage::Front, front_diagnostics));
         }
 
-        let ctx = analysis::build_context(
-            &ast,
-            &parser.stmt_line_seq,
-            &parser.stmt_col_seq,
-            parser.ctor_line_seq.clone(),
-        );
+        let ctx = analysis::build_context(&ast);
 
         // one walk: the analyzer's recorded pass IS the checker — its
         // diagnostics cover both halves
@@ -1433,17 +1428,19 @@ fn indent(source: &str) -> String {
 
 // ---- H5: the attribution census — desugaring omniscience ----
 //
-// The parser fabricates seq entries for statements that were never
-// parsed (the for-desugar's four pre-pushes and one post-push). These
-// pins hold the whole discipline: count symmetry fails loudly in BOTH
-// directions (under-run and over-run), and the one fabricating desugar
-// attributes its whole family at the header's line. The census itself
-// runs on every compile (analysis.rs); these tests are its golden
-// register and its tripwire proofs.
+// Attribution rides the AST node (`loc` stamps minted at
+// construction); the parser's parallel arrays and their pre-push
+// discipline are gone, so the count-misfit class they made possible
+// is unrepresentable and its two tripwire pins died with them
+// (session 4). What remains: the one multi-statement desugar (the for
+// loop) stamps its whole family at the header — the census runs on
+// every compile (analysis.rs) and these tests are its golden register
+// and its tripwire proof.
 
-/// Parse-only parts for the H5 pins: the AST plus the parser's three
-/// parallel attribution arrays, ungated by analysis.
-fn parse_parts(source: &str) -> (Vec<Stmt>, Vec<usize>, Vec<usize>, Vec<usize>) {
+/// Parse-only parts for the H5 pins: the AST, gated on clean front
+/// diagnostics. Attribution rides the nodes — there are no parallel
+/// arrays to hand through (they died in session 4).
+fn parse_parts(source: &str) -> Vec<Stmt> {
     let mut tokens = Vec::new();
     let mut offsets = Vec::new();
     let mut lex = lexer::Token::lexer(source);
@@ -1464,12 +1461,7 @@ fn parse_parts(source: &str) -> (Vec<Stmt>, Vec<usize>, Vec<usize>, Vec<usize>) 
         "H5 pin source failed to parse: {:?}",
         parser.diagnostics
     );
-    (
-        ast,
-        parser.stmt_line_seq,
-        parser.stmt_col_seq,
-        parser.ctor_line_seq,
-    )
+    ast
 }
 
 /// R7's law as a golden register: the for-desugar's six statements
@@ -1479,8 +1471,8 @@ fn parse_parts(source: &str) -> (Vec<Stmt>, Vec<usize>, Vec<usize>, Vec<usize>) 
 #[test]
 fn h5_for_desugar_reports_at_the_header_pin() {
     let source = "local t = {}\nfor i = 0, 4 do\n    t[i] = i * 2\nend\nprint(t[2])\n";
-    let (ast, lines, cols, ctor) = parse_parts(source);
-    let ctx = analysis::build_context(&ast, &lines, &cols, ctor);
+    let ast = parse_parts(source);
+    let ctx = analysis::build_context(&ast);
     assert_eq!(ast.len(), 3);
     let Stmt::Do { body, .. } = &ast[1] else {
         panic!("the for-desugar rides a Do block");
@@ -1537,8 +1529,8 @@ else
     print(3)
 end
 ";
-    let (ast, lines, cols, ctor) = parse_parts(source);
-    let ctx = analysis::build_context(&ast, &lines, &cols, ctor);
+    let ast = parse_parts(source);
+    let ctx = analysis::build_context(&ast);
     let line_of = |s: &Stmt| ctx.stmt_lines.get(&(s as *const Stmt)).copied();
     // D4: `function f(a) … end` is ONE Assignment at line 1; its body's
     // return reports the body's own line 2
@@ -1587,37 +1579,12 @@ end
     assert_eq!(line_of(&inner_else[0]), Some(13));
 }
 
-/// The under-count direction: a seq shorter than the statement count
-/// used to return silently (trailing statements went line-less and the
-/// final count assert still passed). It must cry wolf now.
-#[test]
-#[should_panic(expected = "under-runs the AST walk")]
-fn h5_undercount_fails_loudly() {
-    let (ast, lines, cols, ctor) = parse_parts("print(1)\nprint(2)\n");
-    analysis::build_context(&ast, &lines[..1], &cols[..1], ctor);
-}
-
-/// The over-count direction: fabricated entries that no statement
-/// consumes trip the final count assert.
-#[test]
-#[should_panic(expected = "out of step with the AST walk")]
-fn h5_overcount_fails_loudly() {
-    let (ast, lines, cols, ctor) = parse_parts("print(1)\nprint(2)\n");
-    let mut l2 = lines.clone();
-    let mut c2 = cols.clone();
-    l2.push(99);
-    c2.push(1);
-    analysis::build_context(&ast, &l2, &c2, ctor);
-}
-
-/// The misattribution direction: a desugar-shaped block whose entries
+/// The misattribution direction: a desugar-shaped block whose stamps
 /// are count-exact but line-wrong (the increment reports 9 while the
-/// header family reports 2). The count asserts pass; the census must
-/// cry wolf. This is the drift class only a FABRICATING desugar can
-/// produce — hand-built here because a correct parser cannot. Since
-/// session 2 the drift is fabricated on BOTH sides consistently (the
-/// increment's `loc` stamp AND the seq entry both say 9): the dual-run
-/// assert must stay quiet, the census must not.
+/// header family reports 2). Counts are structural since session 4,
+/// so only a wrong stamp can drift — and the census must cry wolf.
+/// This is the drift class only a hand-stamping desugar can produce —
+/// hand-built here because a correct parser cannot.
 #[test]
 #[should_panic(expected = "attribution drift")]
 fn h5_census_trips_on_right_count_wrong_line() {
@@ -1660,7 +1627,5 @@ fn h5_census_trips_on_right_count_wrong_line() {
         ],
         loc: at(2),
     }];
-    let lines = vec![2, 2, 2, 2, 2, 9];
-    let cols = vec![1, 1, 1, 1, 1, 1];
-    analysis::build_context(&ast, &lines, &cols, vec![]);
+    analysis::build_context(&ast);
 }

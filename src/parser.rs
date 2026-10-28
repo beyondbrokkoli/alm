@@ -33,9 +33,6 @@ pub struct Parser<'a> {
     pub diagnostics: Vec<String>,
     depth: usize,
     newlines: Vec<usize>,
-    pub stmt_line_seq: Vec<usize>,
-    pub stmt_col_seq: Vec<usize>,
-    pub ctor_line_seq: Vec<usize>,
 }
 
 impl<'a> Parser<'a> {
@@ -53,9 +50,6 @@ impl<'a> Parser<'a> {
                 .filter(|(_, b)| *b == b'\n')
                 .map(|(i, _)| i)
                 .collect(),
-            stmt_line_seq: Vec::new(),
-            stmt_col_seq: Vec::new(),
-            ctor_line_seq: Vec::new(),
         }
     }
 
@@ -110,17 +104,13 @@ impl<'a> Parser<'a> {
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
         let off = self.tokens.peek_off().unwrap_or(self.tokens.last_off);
-        let line = self.line_of(off);
-        let col = self.col_of(off);
-        self.stmt_line_seq.push(line);
-        self.stmt_col_seq.push(col);
-        // H5: the stamp rides the node from birth — the same (line, col)
-        // the seq pushes carry, captured once and handed to whatever
-        // Stmt this parse mints (desugars included: they copy the stamp
-        // instead of pre-pushing counter entries).
+        // The stamp rides the node from birth (H5): captured once,
+        // handed to whatever Stmt this parse mints — desugars copy it
+        // instead of re-deriving anything. There is no second
+        // representation to keep in step.
         let at = Loc {
-            line: line as u32,
-            col: col as u32,
+            line: self.line_of(off) as u32,
+            col: self.col_of(off) as u32,
         };
         self.parse_stmt_inner(at)
     }
@@ -209,27 +199,13 @@ impl<'a> Parser<'a> {
                 })
             }
             Some(Token::For) => {
-                // parse_stmt pushed one seq entry (and stamped `at`) for
-                // the desugared Stmt::Do. record_stmt_lines consumes
-                // entries in AST pre-order, so the synthesized LocalDecls
-                // (counter, limit latch), While, and inner-body Do need
-                // their own entries BEFORE the body parses, and the
-                // synthetic i = i + 1 one after — all pointing at the for
-                // header, desugared code reports there. H5: the six
-                // statements carry the same law as their `loc` stamps
-                // (`at`, the header); the seq pushes remain as the
-                // dual-run shadow until session 4 deletes them.
-                let for_line = *self.stmt_line_seq.last().unwrap_or(&1);
-                let for_col = *self.stmt_col_seq.last().unwrap_or(&1);
-                self.stmt_line_seq.push(for_line);
-                self.stmt_line_seq.push(for_line);
-                self.stmt_line_seq.push(for_line);
-                self.stmt_line_seq.push(for_line);
-                self.stmt_col_seq.push(for_col);
-                self.stmt_col_seq.push(for_col);
-                self.stmt_col_seq.push(for_col);
-                self.stmt_col_seq.push(for_col);
-
+                // R7's law, structural since H5: the desugar's six
+                // statements (block Do, counter decl, for$limit latch
+                // decl, While, inner-body Do, synthetic increment) all
+                // carry `at` — the for header's stamp — so desugared
+                // code reports there. The census (analysis.rs) pins
+                // this on every compile; the counter bookkeeping that
+                // used to live here is gone by construction.
                 self.tokens.next();
                 let var = match self.tokens.next() {
                     Some(Token::Identifier(n)) => n.to_string(),
@@ -265,9 +241,6 @@ impl<'a> Parser<'a> {
                     body.push(self.parse_stmt()?);
                 }
                 self.expect(Token::End)?;
-
-                self.stmt_line_seq.push(for_line);
-                self.stmt_col_seq.push(for_col);
 
                 if Self::body_assigns_to(&body, &var) {
                     return Err(ParseError(format!(
@@ -421,8 +394,8 @@ impl<'a> Parser<'a> {
                 // redeclares. The dotted name rides as ONE string key
                 // (the fn maps are String-keyed); deeper chains `A.B.c`
                 // fall out the same way. The desugar is 1 AST stmt per
-                // parse_stmt call stamped with the same `at` the push
-                // used (H5).
+                // parse_stmt call, stamped `at` like every 1:1 sugar
+                // (H5).
                 self.tokens.next();
                 let name = self.parse_fn_stmt_name()?;
                 let expr = self.parse_fn_literal()?;
@@ -582,15 +555,10 @@ impl<'a> Parser<'a> {
 
     fn parse_elseif_chain(&mut self) -> Result<Stmt, ParseError> {
         let off = self.tokens.peek_off().unwrap_or(self.tokens.last_off);
-        let line = self.line_of(off);
-        let col = self.col_of(off);
-        self.stmt_line_seq.push(line);
-        self.stmt_col_seq.push(col);
-        // H5: the elseif's nested If is stamped at its own leading
-        // token — the same (line, col) the push above carries.
+        // The elseif's nested If is stamped at its own leading token.
         let at = Loc {
-            line: line as u32,
-            col: col as u32,
+            line: self.line_of(off) as u32,
+            col: self.col_of(off) as u32,
         };
         self.expect(Token::ElseIf)?;
         let condition = self.parse_expr()?;
@@ -942,12 +910,10 @@ impl<'a> Parser<'a> {
 
     fn parse_table_ctor(&mut self) -> Result<Expr, ParseError> {
         // The ctor's birth line: the `{` is the last consumed token, so
-        // last_off IS the `{`. Captured once at entry — the seq push
-        // and the node stamp below are the same value by construction
-        // (the push is the shadow H5 session 4 deletes; the stamp is
-        // the law).
+        // last_off IS the `{` — captured once at entry and stamped on
+        // the node (H5: attribution rides the node; there is no
+        // parallel push to keep in step).
         let line = self.line_of(self.tokens.last_off);
-        self.ctor_line_seq.push(line);
         if matches!(self.tokens.peek(), Some(Token::RightBrace)) {
             self.tokens.next();
             alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_TBL_EMPTY);
