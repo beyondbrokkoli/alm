@@ -149,7 +149,7 @@ impl Analyzer {
                         self.collect_entry_moves(rec, expr, &mut moved_srcs)?;
                         if value_kind(&bind.ty) {
                             signal!(rec.on(), trace::TRACE_BIND_SCALAR);
-                        } else if matches!(expr, Expr::TableCtor(_)) {
+                        } else if matches!(expr, Expr::TableCtor { .. }) {
                             signal!(rec.on(), trace::TRACE_BIND_HEAP);
                         }
                         sets.push(bind);
@@ -253,7 +253,7 @@ impl Analyzer {
                 }
                 if value_kind(&bind.ty) {
                     signal!(rec.on(), trace::TRACE_BIND_SCALAR);
-                } else if matches!(expr, Expr::TableCtor(_)) {
+                } else if matches!(expr, Expr::TableCtor { .. }) {
                     signal!(rec.on(), trace::TRACE_BIND_HEAP);
                 }
 
@@ -591,7 +591,7 @@ impl Analyzer {
 
                 let mut cyclic_sites: BTreeSet<usize> = BTreeSet::new();
                 let mut cyc_sources: BTreeSet<usize> = value_sites.clone();
-                if matches!(value, Expr::TableCtor(_)) {
+                if matches!(value, Expr::TableCtor { .. }) {
                     self.expr_named_sites(rec, value, &mut cyc_sources);
                 }
                 if matches!(vt, Tbl(_)) {
@@ -606,7 +606,7 @@ impl Analyzer {
                         .iter()
                         .any(|(&origin, (_, d))| origin == *s && (nested || *d >= 2))
                 };
-                if matches!(vt, Tbl(_)) && !matches!(value, Expr::TableCtor(_)) {
+                if matches!(vt, Tbl(_)) && !matches!(value, Expr::TableCtor { .. }) {
                     let value_name = match value {
                         Expr::Identifier(n) => n.clone(),
                         _ => "<row>".to_string(),
@@ -661,7 +661,7 @@ impl Analyzer {
                     if matches!(vt, Tbl(_)) {
                         moved_srcs.push((d, src.clone()));
                     }
-                } else if let Expr::TableCtor(_) = value {
+                } else if let Expr::TableCtor { .. } = value {
                     self.collect_entry_moves(rec, value, &mut moved_srcs)?;
                 }
                 for (d, src) in &moved_srcs {
@@ -1029,7 +1029,7 @@ impl Analyzer {
                     out.extend(b.aliases.iter().copied().filter(|&s| !is_root(&s)));
                 }
             }
-            Expr::TableCtor(entries) => {
+            Expr::TableCtor { entries, .. } => {
                 for (_, e) in entries {
                     self.expr_named_sites(rec, e, out);
                 }

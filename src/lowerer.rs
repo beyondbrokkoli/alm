@@ -1067,7 +1067,7 @@ impl<'a> IrLowerer<'a> {
                     self.table_set(t_reg, key, v_reg, &store_elem)?;
                 }
 
-                if matches!(value, Expr::TableCtor(_))
+                if matches!(value, Expr::TableCtor { .. })
                     && let Some(name) = base_name
                 {
                     let bound_reg = self.fills.loop_ctxs.iter().rev().find_map(|ctx| {
@@ -1623,7 +1623,7 @@ impl<'a> IrLowerer<'a> {
 
     fn lookup_layout_for(&self, expr: &Expr) -> Result<LayoutVerdict, LowerError> {
         match expr {
-            Expr::TableCtor(_) => {
+            Expr::TableCtor { .. } => {
                 if let Some(&site_id) = self.shape.sites.get(&(expr as *const Expr)) {
                     Ok(self.shape.layouts[site_id])
                 } else {
@@ -2221,7 +2221,7 @@ impl<'a> IrLowerer<'a> {
                     ty: call_ret,
                 })
             }
-            Expr::TableCtor(entries) => {
+            Expr::TableCtor { entries, .. } => {
                 let elem = self.shape.elem_of(expr);
                 let ctor_site = self.shape.sites.get(&(expr as *const Expr)).copied();
 
@@ -2247,7 +2247,7 @@ impl<'a> IrLowerer<'a> {
 
                 let mut has_inline_tables = false;
                 for (_, e) in entries {
-                    if matches!(e, Expr::TableCtor(_)) {
+                    if matches!(e, Expr::TableCtor { .. }) {
                         has_inline_tables = true;
                     }
                 }
@@ -2761,7 +2761,7 @@ fn calls_touched(expr: &Expr, shape: &ShapeFacts, out: &mut BTreeSet<String>) {
             calls_touched(obj, shape, out);
             calls_touched(key, shape, out);
         }
-        Expr::TableCtor(entries) => {
+        Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
                     calls_touched(ke, shape, out);

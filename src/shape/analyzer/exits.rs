@@ -528,7 +528,7 @@ impl Analyzer {
                 self.plan_arm_temp_frees_in_expr(left);
                 self.plan_arm_temp_frees_in_expr(right);
             }
-            Expr::TableCtor(entries) => {
+            Expr::TableCtor { entries, .. } => {
                 for (k, v) in entries {
                     if let CtorKey::Expr(ke) = k {
                         self.plan_arm_temp_frees_in_expr(ke);
@@ -557,7 +557,7 @@ impl Analyzer {
 
     pub(super) fn collect_temp_sites(&self, e: &Expr, fate: Fate, out: &mut Vec<usize>) {
         match e {
-            Expr::TableCtor(entries) => {
+            Expr::TableCtor { entries, .. } => {
                 if fate == Fate::Dies
                     && let Some(&site) = self.lattice.sites.get(&(e as *const Expr))
                 {
@@ -671,7 +671,7 @@ impl Analyzer {
     pub(super) fn plan_fn_bodies_in_expr(&mut self, e: &Expr) {
         match e {
             Expr::Function { body, .. } => self.plan_stmt_temp_frees(body),
-            Expr::TableCtor(entries) => {
+            Expr::TableCtor { entries, .. } => {
                 for (k, v) in entries {
                     if let CtorKey::Expr(ke) = k {
                         self.plan_fn_bodies_in_expr(ke);

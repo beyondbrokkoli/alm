@@ -941,11 +941,20 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_table_ctor(&mut self) -> Result<Expr, ParseError> {
-        self.ctor_line_seq.push(self.line_of(self.tokens.last_off));
+        // The ctor's birth line: the `{` is the last consumed token, so
+        // last_off IS the `{`. Captured once at entry — the seq push
+        // and the node stamp below are the same value by construction
+        // (the push is the shadow H5 session 4 deletes; the stamp is
+        // the law).
+        let line = self.line_of(self.tokens.last_off);
+        self.ctor_line_seq.push(line);
         if matches!(self.tokens.peek(), Some(Token::RightBrace)) {
             self.tokens.next();
             alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_TBL_EMPTY);
-            return Ok(Expr::TableCtor(Vec::new()));
+            return Ok(Expr::TableCtor {
+                entries: Vec::new(),
+                line: line as u32,
+            });
         }
 
         let mut entries: Vec<(CtorKey, Expr)> = Vec::new();
@@ -1009,7 +1018,10 @@ impl<'a> Parser<'a> {
         }
         self.expect(Token::RightBrace)?;
         alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_TBL_CTOR);
-        Ok(Expr::TableCtor(entries))
+        Ok(Expr::TableCtor {
+            entries,
+            line: line as u32,
+        })
     }
 
     fn parse_ctor_entry(&mut self, next_pos: &mut i64) -> Result<(CtorKey, Expr), ParseError> {

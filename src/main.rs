@@ -99,7 +99,7 @@ fn references_arg(stmts: &[Stmt]) -> bool {
     fn expr(e: &ast::Expr) -> bool {
         match e {
             ast::Expr::Identifier(name) => name == "arg",
-            ast::Expr::TableCtor(entries) => entries
+            ast::Expr::TableCtor { entries, .. } => entries
                 .iter()
                 .any(|(k, v)| matches!(k, ast::CtorKey::Expr(ke) if expr(ke)) || expr(v)),
             ast::Expr::Index { obj, key } => expr(obj) || expr(key),
@@ -149,7 +149,7 @@ fn uses_ffi(stmts: &[Stmt]) -> bool {
         match e {
             ast::Expr::FfiModule => true,
             ast::Expr::Field { obj, .. } => expr(obj),
-            ast::Expr::TableCtor(entries) => entries
+            ast::Expr::TableCtor { entries, .. } => entries
                 .iter()
                 .any(|(k, v)| matches!(k, ast::CtorKey::Expr(ke) if expr(ke)) || expr(v)),
             ast::Expr::Index { obj, key } => expr(obj) || expr(key),

@@ -1688,7 +1688,7 @@ impl Checker {
                         .to_string(),
                 )
             }
-            Expr::TableCtor(entries) => {
+            Expr::TableCtor { entries, .. } => {
                 let elem = self.elem_of(lat, expr);
                 // The parser rejects what it can see statically (named keys
                 // and literal-string expr keys vs positional slots, either

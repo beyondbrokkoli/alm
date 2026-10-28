@@ -14,13 +14,13 @@ pub fn build_context<'a>(
     ast: &'a [Stmt],
     stmt_line_seq: &[usize],
     stmt_col_seq: &[usize],
-    ctor_lines: Vec<usize>,
+    ctor_line_seq: Vec<usize>,
 ) -> AnalysisContext<'a> {
     let mut sites = BTreeMap::new();
     number_sites(ast, &mut sites);
     assert_eq!(
         sites.len(),
-        ctor_lines.len(),
+        ctor_line_seq.len(),
         "ctor line sequence out of step with the site walk"
     );
     assert_eq!(
@@ -74,6 +74,15 @@ pub fn build_context<'a>(
     // attribution discipline on every compile — now over the loc-derived
     // map (identical to the shadow's by the assert above).
     census_for_desugar(ast, &stmt_lines);
+    // The TRUTH (H5 session 3), ctor half: lines derived from the
+    // nodes' own stamps, collected in number_sites' pre-order — index
+    // i IS site i. Returned from HERE, so session 4's deletion of
+    // ctor_line_seq removes a shadow, not a load-bearing path; the
+    // dual-run assert below pins the two orders together in the
+    // meantime (parse push order == output-tree pre-order is exactly
+    // the hand-simulated discipline H5 kills).
+    let ctor_lines = derive_ctor_lines(ast);
+    assert_dual_run_ctors(&ctor_line_seq, &ctor_lines);
 
     AnalysisContext {
         sites,
@@ -231,7 +240,7 @@ fn derive_expr(
 ) {
     match e {
         Expr::Function { body, .. } => derive_from_locs(body, lines, locs, kinds),
-        Expr::TableCtor(entries) => {
+        Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
                     derive_expr(ke, lines, locs, kinds);
@@ -294,6 +303,126 @@ fn assert_dual_run(
         loc_locs.get(&bad),
         seq_locs.get(&bad),
         seq_len
+    );
+}
+
+/// H5 session 3's truth half for ctors: lines read off the nodes' own
+/// `line` stamps, collected in the same pre-order `number_sites`
+/// walks — so index i IS site i and the vec drops into every
+/// `ctor_lines[id]` consumer unchanged. The recursion mirrors
+/// number_stmt/number_expr exactly (same faces, same order); a face
+/// missed here is a count the dual-run assert below catches.
+fn derive_ctor_lines(stmts: &[Stmt]) -> Vec<usize> {
+    let mut lines = Vec::new();
+    derive_ctor_lines_into(stmts, &mut lines);
+    lines
+}
+
+fn derive_ctor_lines_into(stmts: &[Stmt], lines: &mut Vec<usize>) {
+    for s in stmts {
+        derive_ctor_lines_stmt(s, lines);
+    }
+}
+
+fn derive_ctor_lines_stmt(stmt: &Stmt, lines: &mut Vec<usize>) {
+    match stmt {
+        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
+            for e in exprs {
+                derive_ctor_line_expr(e, lines);
+            }
+        }
+        Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => {
+            derive_ctor_line_expr(expr, lines)
+        }
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => {
+            derive_ctor_line_expr(obj, lines);
+            derive_ctor_line_expr(key, lines);
+            derive_ctor_line_expr(value, lines);
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            derive_ctor_line_expr(condition, lines);
+            derive_ctor_lines_into(body, lines);
+        }
+        Stmt::Do { body, .. } => derive_ctor_lines_into(body, lines),
+        Stmt::If {
+            condition,
+            then_body,
+            else_body,
+            ..
+        } => {
+            derive_ctor_line_expr(condition, lines);
+            derive_ctor_lines_into(then_body, lines);
+            derive_ctor_lines_into(else_body, lines);
+        }
+        Stmt::Return { value, .. } => {
+            if let Some(e) = value {
+                derive_ctor_line_expr(e, lines);
+            }
+        }
+        Stmt::Break { .. } => {}
+    }
+}
+
+fn derive_ctor_line_expr(expr: &Expr, lines: &mut Vec<usize>) {
+    match expr {
+        Expr::TableCtor { entries, line } => {
+            lines.push(*line as usize);
+            for (key, val) in entries {
+                if let CtorKey::Expr(ke) = key {
+                    derive_ctor_line_expr(ke, lines);
+                }
+                derive_ctor_line_expr(val, lines);
+            }
+        }
+        Expr::Field { obj, .. } => derive_ctor_line_expr(obj, lines),
+        Expr::Index { obj, key } => {
+            derive_ctor_line_expr(obj, lines);
+            derive_ctor_line_expr(key, lines);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            derive_ctor_line_expr(left, lines);
+            derive_ctor_line_expr(right, lines);
+        }
+        Expr::UnaryOp { expr, .. } => derive_ctor_line_expr(expr, lines),
+        Expr::Call { callee, args } => {
+            derive_ctor_line_expr(callee, lines);
+            for a in args {
+                derive_ctor_line_expr(a, lines);
+            }
+        }
+        Expr::Function { body, .. } => derive_ctor_lines_into(body, lines),
+        _ => {}
+    }
+}
+
+/// THE H5 DUAL-RUN ASSERT, ctor half (session 3 scaffolding): the
+/// node-stamped lines (truth, site-ordered) and the parser's
+/// parse-order pushes (shadow) must agree element for element — same
+/// count, same line at every site. Any drift means a stamp was minted
+/// wrong or the derivation walks a different face set than
+/// number_sites (fix the STAMP or the WALK, never this assert).
+/// Session 4 deletes the shadow half; this assert goes with it.
+fn assert_dual_run_ctors(seq: &[usize], from_stamps: &[usize]) {
+    if seq == from_stamps {
+        return;
+    }
+    let at = seq
+        .iter()
+        .zip(from_stamps.iter())
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| seq.len().min(from_stamps.len()));
+    panic!(
+        "H5 ctor dual-run: the node-stamped line disagrees with the seq push at site {at} — the \
+         stamp says {:?}, the seq push says {:?} ({} seq entries vs {} node-stamped ctors); fix \
+         the stamp, not the assert",
+        from_stamps.get(at),
+        seq.get(at),
+        seq.len(),
+        from_stamps.len()
     );
 }
 
@@ -407,7 +536,7 @@ fn census_for_desugar_in_exprs(stmt: &Stmt, lines: &BTreeMap<*const Stmt, usize>
 fn census_expr(e: &Expr, lines: &BTreeMap<*const Stmt, usize>) {
     match e {
         Expr::Function { body, .. } => census_for_desugar(body, lines),
-        Expr::TableCtor(entries) => {
+        Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
                     census_expr(ke, lines);
@@ -496,7 +625,7 @@ fn record_expr_lines(
 ) {
     match e {
         Expr::Function { body, .. } => record_stmt_lines(body, map, locs, seq, cols, i),
-        Expr::TableCtor(entries) => {
+        Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
                     record_expr_lines(ke, map, locs, seq, cols, i);
@@ -580,7 +709,7 @@ fn number_stmt(stmt: &Stmt, sites: &mut BTreeMap<*const Expr, usize>) {
 
 fn number_expr(expr: &Expr, sites: &mut BTreeMap<*const Expr, usize>) {
     match expr {
-        Expr::TableCtor(entries) => {
+        Expr::TableCtor { entries, .. } => {
             let id = sites.len();
             sites.insert(expr as *const Expr, id);
             for (key, val) in entries {
@@ -762,7 +891,7 @@ fn scan_expr(
             scan_expr(right, scopes, current_fn.as_deref_mut(), touched);
         }
         Expr::UnaryOp { expr, .. } => scan_expr(expr, scopes, current_fn.as_deref_mut(), touched),
-        Expr::TableCtor(entries) => {
+        Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
                     scan_expr(ke, scopes, current_fn.as_deref_mut(), touched);

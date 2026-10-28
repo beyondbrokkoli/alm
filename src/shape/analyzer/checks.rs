@@ -60,7 +60,7 @@ impl Analyzer {
                     )));
                 }
             }
-            Expr::TableCtor(entries) => {
+            Expr::TableCtor { entries, .. } => {
                 signal!(rec.on(), trace::TRACE_CHK_USE_TBL);
                 for (key, val) in entries {
                     if let CtorKey::Expr(ke) = key {

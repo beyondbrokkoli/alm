@@ -220,7 +220,7 @@ fn collect_body_sites(
             out.insert(id);
         }
         match e {
-            Expr::TableCtor(entries) => {
+            Expr::TableCtor { entries, .. } => {
                 for (k, v) in entries {
                     if let CtorKey::Expr(ke) = k {
                         walk_expr(ke, sites, out);
@@ -298,7 +298,7 @@ fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
     }
     fn walk_expr(e: &Expr, out: &mut BTreeSet<String>) {
         match e {
-            Expr::TableCtor(entries) => {
+            Expr::TableCtor { entries, .. } => {
                 for (k, v) in entries {
                     if let CtorKey::Expr(ke) = k {
                         walk_expr(ke, out);

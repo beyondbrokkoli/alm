@@ -62,7 +62,7 @@ fn collect_creation_reads_stmt(stmt: &Stmt, out: &mut Vec<String>) {
 fn collect_creation_reads_expr(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Identifier(n) => out.push(n.clone()),
-        Expr::TableCtor(entries) => {
+        Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
                     collect_creation_reads_expr(ke, out);
@@ -192,7 +192,7 @@ fn free_of_expr(expr: &Expr, bound: &BTreeSet<String>, out: &mut BTreeSet<String
             }
         }
         Expr::Integer(_) | Expr::Float(_) | Expr::Boolean(_) | Expr::String(_) | Expr::Nil => {}
-        Expr::TableCtor(entries) => {
+        Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
                     free_of_expr(ke, bound, out);
@@ -494,7 +494,7 @@ impl Analyzer {
     pub(super) fn ret_base_temp_sites(&self, e: &Expr, out: &mut Vec<usize>) {
         if let Expr::Index { obj, .. } = e {
             match obj.as_ref() {
-                Expr::TableCtor(_) => {
+                Expr::TableCtor { .. } => {
                     if let Some(&site) = self.lattice.sites.get(&(obj.as_ref() as *const Expr)) {
                         out.push(site);
                     }

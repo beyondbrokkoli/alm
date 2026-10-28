@@ -140,7 +140,7 @@ impl Analyzer {
         expr: &Expr,
         out: &mut Vec<(usize, String)>,
     ) -> Result<(), ShapeError> {
-        if let Expr::TableCtor(entries) = expr {
+        if let Expr::TableCtor { entries, .. } = expr {
             for (_, e) in entries {
                 if let Expr::Identifier(n) = e {
                     let (d, bind) = self.resolve(rec, n)?;
@@ -243,14 +243,14 @@ impl Analyzer {
                 signal!(rec.on(), trace::TRACE_INFER_NIL);
                 Ok((Conflict, BTreeSet::new(), BTreeMap::new()))
             }
-            Expr::TableCtor(entries) => {
+            Expr::TableCtor { entries, .. } => {
                 let id = self.lattice.sites[&(expr as *const Expr)];
                 let mut first_elem_ty: Option<Ty> = None;
                 let mut row_sites: Vec<usize> = Vec::new();
                 for (ei, (k, e)) in entries.iter().enumerate() {
                     if let CtorKey::Const(c) = k
                         && let Some(&child) = self.lattice.sites.get(&(e as *const Expr))
-                        && matches!(e, Expr::TableCtor(_))
+                        && matches!(e, Expr::TableCtor { .. })
                     {
                         self.lattice
                             .site_slots
@@ -299,7 +299,7 @@ impl Analyzer {
                                 .or_default()
                                 .insert(child_site);
                         }
-                        if !matches!(e, Expr::TableCtor(_)) {
+                        if !matches!(e, Expr::TableCtor { .. }) {
                             let entry_ghosts: Vec<usize> =
                                 esites.iter().copied().filter(is_ghost).collect();
                             if !entry_ghosts.is_empty() {
