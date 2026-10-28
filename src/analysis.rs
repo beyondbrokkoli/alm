@@ -42,8 +42,17 @@ pub fn build_context<'a>(
     assert_eq!(
         i,
         stmt_line_seq.len(),
-        "stmt line sequence out of step with the AST walk"
+        "stmt line sequence out of step with the AST walk (over-run: {} fabricated entries \
+         were never consumed by {} statements — a desugar minted seq entries without \
+         minting statements)",
+        stmt_line_seq.len(),
+        i
     );
+    // H5's misattribution half: the count asserts prove totals in both
+    // directions; they cannot prove a fabricated entry points at the
+    // RIGHT line. The census pins the one multi-statement desugar's
+    // attribution discipline on every compile.
+    census_for_desugar(ast, &stmt_lines);
 
     AnalysisContext {
         sites,
@@ -63,19 +72,186 @@ fn record_stmt_lines(
     i: &mut usize,
 ) {
     for s in stmts {
-        if *i >= seq.len() {
-            return;
-        }
-        map.insert(s as *const Stmt, seq[*i]);
+        // H5's loud under-count: build_context only ever sees fully
+        // parsed programs (both call sites gate on empty front
+        // diagnostics), so a missing entry here is a desugar that
+        // minted statements without minting their seq entries. The
+        // old silent early-return masked exactly this bug class —
+        // trailing statements went line-less and the final count
+        // assert still passed. It cries wolf now.
+        let (line, col) = match (seq.get(*i), cols.get(*i)) {
+            (Some(&l), Some(&c)) => (l, c),
+            _ => panic!(
+                "stmt line sequence under-runs the AST walk: statement #{} ({}) has no \
+                 fabricated entry — a desugar minted statements without minting seq \
+                 entries (H5)",
+                *i,
+                stmt_kind(s)
+            ),
+        };
+        map.insert(s as *const Stmt, line);
         locs.insert(
             s as *const Stmt,
             SourceLoc {
-                line: seq[*i] as u32,
-                col: cols[*i] as u32,
+                line: line as u32,
+                col: col as u32,
             },
         );
         *i += 1;
         record_stmt_exprs(s, map, locs, seq, cols, i);
+    }
+}
+
+/// The statement's kind name for tripwire prose: H5's panics name the
+/// construct that ran out of entries (or the entry that ran out of
+/// construct).
+fn stmt_kind(s: &Stmt) -> &'static str {
+    match s {
+        Stmt::LocalDecl { .. } => "LocalDecl",
+        Stmt::Assignment { .. } => "Assignment",
+        Stmt::IndexAssign { .. } => "IndexAssign",
+        Stmt::While { .. } => "While",
+        Stmt::Do { .. } => "Do",
+        Stmt::If { .. } => "If",
+        Stmt::Print { .. } => "Print",
+        Stmt::Expr { .. } => "Expr",
+        Stmt::Return { .. } => "Return",
+        Stmt::Break => "Break",
+    }
+}
+
+/// THE DESUGAR ATTRIBUTION CENSUS (H5). The count asserts above are
+/// symmetric — under-run and over-run both cry wolf — but a right-COUNT
+/// wrong-LINE fabrication slips through them silently: only the one
+/// multi-statement desugar (the for loop, R7) fabricates entries by
+/// hand (four pre-pushes before the body parses, one post-push after),
+/// so only it can drift. This census walks the finished tree and pins
+/// the discipline: the block Do, the counter decl, the for$limit latch
+/// decl, the While, the body's inner Do, and the synthetic increment
+/// ALL report the for header's one line — any drift fails loudly at
+/// attribution time instead of whispering wrong line prefixes into
+/// diagnostics.
+///
+/// `for$limit` is unspellable (identifiers are [a-zA-Z_][a-zA-Z0-9_]*,
+/// lexer.rs), so the latch decl is an unforgeable fingerprint of the
+/// desugar: no user-shaped program can reach these panics. If the
+/// desugar's output shape itself changes, the census says so by name —
+/// it must be updated together with the desugar, on purpose, in the
+/// open (omniscience, not convention).
+fn census_for_desugar(stmts: &[Stmt], lines: &BTreeMap<*const Stmt, usize>) {
+    for s in stmts {
+        if let Stmt::Do { body } = s
+            && matches!(
+                body.get(1),
+                Some(Stmt::LocalDecl { names, .. })
+                    if names.len() == 1 && names[0] == "for$limit"
+            )
+        {
+            let header = lines
+                .get(&(s as *const Stmt))
+                .expect("for-desugar census: the block Do is unmapped (H5)");
+            let check = |what: &str, node: &Stmt| match lines.get(&(node as *const Stmt)) {
+                Some(&l) if l == *header => {}
+                Some(&l) => panic!(
+                    "for-desugar attribution drift: the {what} reports line {l} but the for \
+                     header reports line {header} — every fabricated entry must point at the \
+                     header (R7's law, H5's census)"
+                ),
+                None => panic!("for-desugar census: the {what} is unmapped (H5)"),
+            };
+            check("counter decl", &body[0]);
+            check("for$limit latch decl", &body[1]);
+            let Stmt::While { body: wbody, .. } = &body[2] else {
+                panic!(
+                    "for-desugar census: the block's third statement is not the While — the \
+                     desugar shape changed; update the census with it (H5)"
+                );
+            };
+            check("While", &body[2]);
+            match (wbody.first(), wbody.last()) {
+                (Some(inner), Some(inc)) if wbody.len() == 2 => {
+                    check("body's inner Do", inner);
+                    check("synthetic increment", inc);
+                }
+                _ => panic!(
+                    "for-desugar census: the While body is not [inner Do, increment] — the \
+                     desugar shape changed; update the census with it (H5)"
+                ),
+            }
+        }
+        // recurse through every statement list, including fn-literal
+        // bodies riding inside expressions (a for can hide in any of
+        // them)
+        match s {
+            Stmt::While { body, .. } | Stmt::Do { body } => census_for_desugar(body, lines),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                census_for_desugar(then_body, lines);
+                census_for_desugar(else_body, lines);
+            }
+            _ => {}
+        }
+        census_for_desugar_in_exprs(s, lines);
+    }
+}
+
+/// The expression half of the census recursion: statements hide inside
+/// fn-literal bodies, which ride inside every expression position.
+fn census_for_desugar_in_exprs(stmt: &Stmt, lines: &BTreeMap<*const Stmt, usize>) {
+    let walk = |e: &Expr| census_expr(e, lines);
+    match stmt {
+        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs } => {
+            for e in exprs {
+                walk(e);
+            }
+        }
+        Stmt::Assignment { expr, .. } | Stmt::Expr { expr } => walk(expr),
+        Stmt::IndexAssign { obj, key, value } => {
+            walk(obj);
+            walk(key);
+            walk(value);
+        }
+        Stmt::While { condition, .. } => walk(condition),
+        Stmt::If { condition, .. } => walk(condition),
+        Stmt::Return { value } => {
+            if let Some(e) = value {
+                walk(e);
+            }
+        }
+        Stmt::Break | Stmt::Do { .. } => {}
+    }
+}
+
+fn census_expr(e: &Expr, lines: &BTreeMap<*const Stmt, usize>) {
+    match e {
+        Expr::Function { body, .. } => census_for_desugar(body, lines),
+        Expr::TableCtor(entries) => {
+            for (k, v) in entries {
+                if let CtorKey::Expr(ke) = k {
+                    census_expr(ke, lines);
+                }
+                census_expr(v, lines);
+            }
+        }
+        Expr::Index { obj, key } => {
+            census_expr(obj, lines);
+            census_expr(key, lines);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            census_expr(left, lines);
+            census_expr(right, lines);
+        }
+        Expr::UnaryOp { expr, .. } => census_expr(expr, lines),
+        Expr::Call { callee, args } => {
+            census_expr(callee, lines);
+            for a in args {
+                census_expr(a, lines);
+            }
+        }
+        _ => {}
     }
 }
 

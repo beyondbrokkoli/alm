@@ -35,7 +35,7 @@
 //! oracle: the only `alm_tbl_new` calls are that name's ctors.
 
 use crate::analysis;
-use crate::ast::Stmt;
+use crate::ast::{BinOp, Expr, Stmt};
 use crate::backend;
 use crate::lexer;
 use crate::lowerer::{IrLowerer, LowerError};
@@ -1429,4 +1429,226 @@ fn indent(source: &str) -> String {
         .map(|l| format!("  {l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// ---- H5: the attribution census — desugaring omniscience ----
+//
+// The parser fabricates seq entries for statements that were never
+// parsed (the for-desugar's four pre-pushes and one post-push). These
+// pins hold the whole discipline: count symmetry fails loudly in BOTH
+// directions (under-run and over-run), and the one fabricating desugar
+// attributes its whole family at the header's line. The census itself
+// runs on every compile (analysis.rs); these tests are its golden
+// register and its tripwire proofs.
+
+/// Parse-only parts for the H5 pins: the AST plus the parser's three
+/// parallel attribution arrays, ungated by analysis.
+fn parse_parts(source: &str) -> (Vec<Stmt>, Vec<usize>, Vec<usize>, Vec<usize>) {
+    let mut tokens = Vec::new();
+    let mut offsets = Vec::new();
+    let mut lex = lexer::Token::lexer(source);
+    loop {
+        match lex.next() {
+            Some(Ok(token)) => {
+                offsets.push(lex.span().start);
+                tokens.push(token);
+            }
+            Some(Err(_)) => panic!("H5 pin source failed to lex"),
+            None => break,
+        }
+    }
+    let mut parser = Parser::new(tokens.into_iter().zip(offsets).collect(), source);
+    let ast = parser.parse_program();
+    assert!(
+        parser.diagnostics.is_empty(),
+        "H5 pin source failed to parse: {:?}",
+        parser.diagnostics
+    );
+    (
+        ast,
+        parser.stmt_line_seq,
+        parser.stmt_col_seq,
+        parser.ctor_line_seq,
+    )
+}
+
+/// R7's law as a golden register: the for-desugar's six statements
+/// (block Do, counter decl, for$limit latch decl, While, inner Do,
+/// synthetic increment) ALL report the header's line; the user body and
+/// every non-desugar statement report their own.
+#[test]
+fn h5_for_desugar_reports_at_the_header_pin() {
+    let source = "local t = {}\nfor i = 0, 4 do\n    t[i] = i * 2\nend\nprint(t[2])\n";
+    let (ast, lines, cols, ctor) = parse_parts(source);
+    let ctx = analysis::build_context(&ast, &lines, &cols, ctor);
+    assert_eq!(ast.len(), 3);
+    let Stmt::Do { body } = &ast[1] else {
+        panic!("the for-desugar rides a Do block");
+    };
+    let Stmt::While { body: wbody, .. } = &body[2] else {
+        panic!("desugar shape: the block's third statement is the While");
+    };
+    let line_of = |s: &Stmt| ctx.stmt_lines.get(&(s as *const Stmt)).copied();
+    for (what, node) in [
+        ("block Do", &ast[1] as &Stmt),
+        ("counter decl", &body[0]),
+        ("for$limit latch decl", &body[1]),
+        ("While", &body[2]),
+        ("body's inner Do", &wbody[0]),
+        ("synthetic increment", &wbody[1]),
+    ] {
+        assert_eq!(
+            line_of(node),
+            Some(2),
+            "the {what} must report the for header's line"
+        );
+    }
+    let Stmt::Do { body: ubody } = &wbody[0] else {
+        panic!("desugar shape: the While body opens with the user's inner Do");
+    };
+    assert_eq!(
+        line_of(&ubody[0]),
+        Some(3),
+        "the user body reports its own line, not the header's"
+    );
+    assert_eq!(line_of(&ast[0]), Some(1));
+    assert_eq!(line_of(&ast[2]), Some(5));
+}
+
+/// The 1:1 sugars (D4 `function f`, `local function`, dot-assign) and
+/// the elseif chain attribute one entry per emitted statement at the
+/// statement's own leading token — the golden register for every
+/// non-fabricating desugar.
+#[test]
+fn h5_one_to_one_sugars_and_elseif_attribution_pin() {
+    let source = "\
+function f(a)
+    return a + 1
+end
+local function g(b)
+    return b
+end
+t.cursor = 5
+if a then
+    print(1)
+elseif b then
+    print(2)
+else
+    print(3)
+end
+";
+    let (ast, lines, cols, ctor) = parse_parts(source);
+    let ctx = analysis::build_context(&ast, &lines, &cols, ctor);
+    let line_of = |s: &Stmt| ctx.stmt_lines.get(&(s as *const Stmt)).copied();
+    // D4: `function f(a) … end` is ONE Assignment at line 1; its body's
+    // return reports the body's own line 2
+    let Stmt::Assignment { expr, .. } = &ast[0] else {
+        panic!("D4 desugars to an Assignment");
+    };
+    assert_eq!(line_of(&ast[0]), Some(1));
+    let Expr::Function { body, .. } = expr else {
+        panic!("D4's RHS is the fn literal");
+    };
+    assert_eq!(line_of(&body[0]), Some(2));
+    // `local function g(b)` is ONE LocalDecl at line 4, body at 5
+    let Stmt::LocalDecl { exprs, .. } = &ast[1] else {
+        panic!("local-function desugars to a LocalDecl");
+    };
+    assert_eq!(line_of(&ast[1]), Some(4));
+    let Expr::Function { body, .. } = &exprs[0] else {
+        panic!("local-function's RHS is the fn literal");
+    };
+    assert_eq!(line_of(&body[0]), Some(5));
+    // dot-assign is ONE IndexAssign at line 7
+    assert!(matches!(&ast[2], Stmt::IndexAssign { .. }));
+    assert_eq!(line_of(&ast[2]), Some(7));
+    // the if at 8, its then-arm print at 9, the elseif's nested If at
+    // 10, its print at 11, the else print at 13
+    let Stmt::If {
+        then_body,
+        else_body,
+        ..
+    } = &ast[3]
+    else {
+        panic!("the source's fourth statement is the if");
+    };
+    assert_eq!(line_of(&ast[3]), Some(8));
+    assert_eq!(line_of(&then_body[0]), Some(9));
+    let Stmt::If {
+        then_body: inner_then,
+        else_body: inner_else,
+        ..
+    } = &else_body[0]
+    else {
+        panic!("the elseif desugars to a nested If");
+    };
+    assert_eq!(line_of(&else_body[0]), Some(10));
+    assert_eq!(line_of(&inner_then[0]), Some(11));
+    assert_eq!(line_of(&inner_else[0]), Some(13));
+}
+
+/// The under-count direction: a seq shorter than the statement count
+/// used to return silently (trailing statements went line-less and the
+/// final count assert still passed). It must cry wolf now.
+#[test]
+#[should_panic(expected = "under-runs the AST walk")]
+fn h5_undercount_fails_loudly() {
+    let (ast, lines, cols, ctor) = parse_parts("print(1)\nprint(2)\n");
+    analysis::build_context(&ast, &lines[..1], &cols[..1], ctor);
+}
+
+/// The over-count direction: fabricated entries that no statement
+/// consumes trip the final count assert.
+#[test]
+#[should_panic(expected = "out of step with the AST walk")]
+fn h5_overcount_fails_loudly() {
+    let (ast, lines, cols, ctor) = parse_parts("print(1)\nprint(2)\n");
+    let mut l2 = lines.clone();
+    let mut c2 = cols.clone();
+    l2.push(99);
+    c2.push(1);
+    analysis::build_context(&ast, &l2, &c2, ctor);
+}
+
+/// The misattribution direction: a desugar-shaped block whose entries
+/// are count-exact but line-wrong (the increment reports 9 while the
+/// header family reports 2). The count asserts pass; the census must
+/// cry wolf. This is the drift class only a FABRICATING desugar can
+/// produce — hand-built here because a correct parser cannot.
+#[test]
+#[should_panic(expected = "attribution drift")]
+fn h5_census_trips_on_right_count_wrong_line() {
+    let ast = vec![Stmt::Do {
+        body: vec![
+            Stmt::LocalDecl {
+                names: vec!["i".into()],
+                exprs: vec![Expr::Integer(0)],
+            },
+            Stmt::LocalDecl {
+                names: vec!["for$limit".into()],
+                exprs: vec![Expr::Integer(4)],
+            },
+            Stmt::While {
+                condition: Expr::BinaryOp {
+                    op: BinOp::LessThan,
+                    left: Box::new(Expr::Identifier("i".into())),
+                    right: Box::new(Expr::Identifier("for$limit".into())),
+                },
+                body: vec![
+                    Stmt::Do { body: vec![] },
+                    Stmt::Assignment {
+                        name: "i".into(),
+                        expr: Expr::BinaryOp {
+                            op: BinOp::Add,
+                            left: Box::new(Expr::Identifier("i".into())),
+                            right: Box::new(Expr::Integer(1)),
+                        },
+                    },
+                ],
+            },
+        ],
+    }];
+    let lines = vec![2, 2, 2, 2, 2, 9];
+    let cols = vec![1, 1, 1, 1, 1, 1];
+    analysis::build_context(&ast, &lines, &cols, vec![]);
 }
