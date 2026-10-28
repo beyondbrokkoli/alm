@@ -8,248 +8,273 @@ pub struct AnalysisContext<'a> {
     pub stmt_lines: BTreeMap<*const Stmt, usize>,
     pub stmt_locs: BTreeMap<*const Stmt, SourceLoc>,
     pub ctor_lines: Vec<usize>,
+    /// The fn-touched map (H7): per fn-literal expr, the OUTER names
+    /// its body assigns or stores through — the bindings a closure
+    /// reaches past its own scopes. Minted by the one derivation pass
+    /// below; the analyzer hands it to the facts (mod.rs) and the
+    /// lowerer consumes it for closure captures.
+    pub fn_touched: BTreeMap<*const Expr, BTreeSet<String>>,
 }
 
 pub fn build_context<'a>(ast: &'a [Stmt]) -> AnalysisContext<'a> {
-    let mut sites = BTreeMap::new();
-    number_sites(ast, &mut sites);
-    // THE attribution derivation (H5 sessions 2–4): read off the
-    // nodes' own `loc` stamps. The parser's parallel seq arrays are
-    // deleted — there is no second representation to drift, no
-    // counter to miscount. Statements live in fn-literal bodies
-    // inside exprs, so the walk recurses through every expression
-    // face.
-    let mut stmt_lines = BTreeMap::new();
-    let mut stmt_locs = BTreeMap::new();
-    derive_from_locs(ast, &mut stmt_lines, &mut stmt_locs);
-    // H5's misattribution half: counts are structural now (a stamped
-    // node cannot be un-counted), but a stamp can still be minted
-    // wrong — and the multi-statement desugars (the for loop, R7;
-    // the tuple assignment, H8) are the places that stamp by
-    // hand-copy. The census pins their discipline on every compile,
-    // over the loc-derived map.
-    census_for_desugar(ast, &stmt_lines);
-    // The ctor half (H5 session 3): lines read off the nodes' own
-    // stamps, collected in the same pre-order number_sites walks —
-    // index i IS site i, and the vec drops into every `ctor_lines[id]`
-    // consumer unchanged. The count pin holds the two walks' face
-    // sets together: a face added to one walk and not the other cries
-    // wolf here, before it can shift a site's line.
-    let ctor_lines = derive_ctor_lines(ast);
-    assert_eq!(
-        ctor_lines.len(),
-        sites.len(),
-        "ctor line derivation walks {} sites but the site walk numbered {} — the two \
-         pre-order walks' faces diverged (H5)",
-        ctor_lines.len(),
-        sites.len()
-    );
+    // ONE derivation pass (H7): one walk mints every map — site ids,
+    // ctor lines, statement lines/locs, fn-touched. The ctor line and
+    // the site id land at the SAME arm of the SAME walk, so
+    // `ctor_lines[id]` is the ctor's own `{` line by construction;
+    // H5's count assert (two walks' face sets held together by hand)
+    // died with the second walk — same walk, same faces is structural
+    // now.
+    let mut pass = Derivation::new();
+    pass.run(ast);
+    // THE DESUGAR ATTRIBUTION CENSUS (H5/H8) stays the every-compile
+    // omniscience check: it walks the FINISHED tree reading the
+    // pass's line map — a check on top of the derivation, not a
+    // second derivation. Counts are structural (a stamped node
+    // cannot be un-counted), but a stamp can still be minted wrong,
+    // and the multi-statement desugars (the for loop, R7; the tuple
+    // assignment, H8) are the places that stamp by hand-copy.
+    census_for_desugar(ast, &pass.stmt_lines);
 
     AnalysisContext {
-        sites,
+        sites: pass.sites,
         ast,
-        stmt_lines,
-        stmt_locs,
-        ctor_lines,
+        stmt_lines: pass.stmt_lines,
+        stmt_locs: pass.stmt_locs,
+        ctor_lines: pass.ctor_lines,
+        fn_touched: pass.fn_touched,
     }
 }
 
-/// THE attribution derivation (H5): read off the nodes' own `loc`
-/// stamps — there is no other representation. Statements live in
-/// fn-literal bodies inside exprs, so the recursion covers every
-/// expression face; the golden pins in property_tests.rs hold its
-/// values (desugar families at the header, everything else at its own
-/// leading token).
-fn derive_from_locs(
-    stmts: &[Stmt],
-    lines: &mut BTreeMap<*const Stmt, usize>,
-    locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-) {
-    for s in stmts {
-        let stamp = s.loc();
-        lines.insert(s as *const Stmt, stamp.line as usize);
-        locs.insert(
-            s as *const Stmt,
+/// THE ONE DERIVATION PASS (H7): analysis.rs walked the tree five
+/// times — the site numbering, the loc derivation, the census, the
+/// ctor-line collection, the fn-touched scan — and the walks' face
+/// sets were held together by hand: an assert compared two counts,
+/// and the loc/census/scan walks quietly skipped the Field face the
+/// site/ctor walks visited. The fold: ONE walk, ONE face set, every
+/// map minted in place —
+///
+/// - the TableCtor arm numbers the site AND pushes its line at the
+///   same pre-order index (index i IS site i, structurally — there is
+///   no second count to assert against);
+/// - every statement, including those hiding in fn-literal bodies
+///   under any expression face, is stamped off its own `loc` (H5:
+///   attribution rides the node — there is no other representation);
+/// - the fn-touched scan rides along (scope stack + per-fn
+///   accumulators): purely syntactic, no walk result feeds it, so its
+///   old late call site (analyze_with, after the walk) bought nothing
+///   — the map now rides the context and the analyzer copies it into
+///   the facts;
+/// - the FACE SET is the union the old walks already disagreed on:
+///   Field objs recurse (the site/ctor walks' face — the checker
+///   infers through Field, so sites must cover it), which closes the
+///   loc/scan walks' old Field blind spot: a fn body under a Field
+///   obj carries stamps and a touched set like any other fn body.
+///
+/// A face added here is added to every map at once — there is no
+/// second walk whose faces can drift. The census below is the one
+/// remaining deliberate second walk: a CHECK over the finished tree,
+/// recursing the same faces by law (its pins hold it).
+struct Derivation {
+    sites: BTreeMap<*const Expr, usize>,
+    ctor_lines: Vec<usize>,
+    stmt_lines: BTreeMap<*const Stmt, usize>,
+    stmt_locs: BTreeMap<*const Stmt, SourceLoc>,
+    fn_touched: BTreeMap<*const Expr, BTreeSet<String>>,
+    /// the fn-touched scan's scope stack: names declared at each
+    /// depth. A body-touched name is an OUTER one — not declared in
+    /// any scope at or below the fn's entry depth.
+    scopes: Vec<BTreeSet<String>>,
+}
+
+/// A fn literal's touched-name accumulator (the scan half of the
+/// pass): names the body assigns or stores through that no scope at
+/// or below its entry depth declares.
+struct FnScan {
+    entry_depth: usize,
+    touched: BTreeSet<String>,
+}
+
+impl Derivation {
+    fn new() -> Self {
+        Derivation {
+            sites: BTreeMap::new(),
+            ctor_lines: Vec::new(),
+            stmt_lines: BTreeMap::new(),
+            stmt_locs: BTreeMap::new(),
+            fn_touched: BTreeMap::new(),
+            scopes: vec![BTreeSet::new()],
+        }
+    }
+
+    fn run(&mut self, stmts: &[Stmt]) {
+        for s in stmts {
+            self.visit_stmt(s, None);
+        }
+    }
+
+    fn visit_stmts(&mut self, stmts: &[Stmt], mut current_fn: Option<&mut FnScan>) {
+        for s in stmts {
+            self.visit_stmt(s, current_fn.as_deref_mut());
+        }
+    }
+
+    /// One statement, every map at once: the stamp lands first (a
+    /// parent precedes its children in the map), then the arm's
+    /// children in the ONE visit order — the pre-order byte-identical
+    /// to the walks this pass replaced (site ids and ctor line
+    /// indexes included).
+    fn visit_stmt(&mut self, stmt: &Stmt, mut current_fn: Option<&mut FnScan>) {
+        let stamp = stmt.loc();
+        self.stmt_lines
+            .insert(stmt as *const Stmt, stamp.line as usize);
+        self.stmt_locs.insert(
+            stmt as *const Stmt,
             SourceLoc {
                 line: stamp.line,
                 col: stamp.col,
             },
         );
-        derive_stmt_exprs(s, lines, locs);
-    }
-}
-
-/// The loc-derivation's expression half — the statement lists hiding in
-/// fn-literal bodies inside every expression position.
-fn derive_stmt_exprs(
-    stmt: &Stmt,
-    lines: &mut BTreeMap<*const Stmt, usize>,
-    locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-) {
-    match stmt {
-        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
-            for e in exprs {
-                derive_expr(e, lines, locs);
-            }
-        }
-        Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => derive_expr(expr, lines, locs),
-        Stmt::IndexAssign {
-            obj, key, value, ..
-        } => {
-            derive_expr(obj, lines, locs);
-            derive_expr(key, lines, locs);
-            derive_expr(value, lines, locs);
-        }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            derive_expr(condition, lines, locs);
-            derive_from_locs(body, lines, locs);
-        }
-        Stmt::Do { body, .. } => derive_from_locs(body, lines, locs),
-        Stmt::If {
-            condition,
-            then_body,
-            else_body,
-            ..
-        } => {
-            derive_expr(condition, lines, locs);
-            derive_from_locs(then_body, lines, locs);
-            derive_from_locs(else_body, lines, locs);
-        }
-        Stmt::Return { value, .. } => {
-            if let Some(e) = value {
-                derive_expr(e, lines, locs);
-            }
-        }
-        Stmt::Break { .. } => {}
-    }
-}
-
-fn derive_expr(
-    e: &Expr,
-    lines: &mut BTreeMap<*const Stmt, usize>,
-    locs: &mut BTreeMap<*const Stmt, SourceLoc>,
-) {
-    match e {
-        Expr::Function { body, .. } => derive_from_locs(body, lines, locs),
-        Expr::TableCtor { entries, .. } => {
-            for (k, v) in entries {
-                if let CtorKey::Expr(ke) = k {
-                    derive_expr(ke, lines, locs);
+        match stmt {
+            Stmt::LocalDecl { names, exprs, .. } => {
+                for e in exprs {
+                    self.visit_expr(e, current_fn.as_deref_mut());
                 }
-                derive_expr(v, lines, locs);
+                // the scan half: initializers cannot see the names
+                // they declare — scope-extend AFTER the exprs
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .extend(names.iter().cloned());
             }
-        }
-        Expr::Index { obj, key } => {
-            derive_expr(obj, lines, locs);
-            derive_expr(key, lines, locs);
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            derive_expr(left, lines, locs);
-            derive_expr(right, lines, locs);
-        }
-        Expr::UnaryOp { expr, .. } => derive_expr(expr, lines, locs),
-        Expr::Call { callee, args } => {
-            derive_expr(callee, lines, locs);
-            for a in args {
-                derive_expr(a, lines, locs);
+            Stmt::Assignment { name, expr, .. } => {
+                record_touched(current_fn.as_deref_mut(), &self.scopes, name);
+                self.visit_expr(expr, current_fn);
             }
+            Stmt::IndexAssign {
+                obj, key, value, ..
+            } => {
+                if let Some(base) = base_identifier(obj) {
+                    record_touched(current_fn.as_deref_mut(), &self.scopes, base);
+                }
+                self.visit_expr(obj, current_fn.as_deref_mut());
+                self.visit_expr(key, current_fn.as_deref_mut());
+                self.visit_expr(value, current_fn);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                self.visit_expr(condition, current_fn.as_deref_mut());
+                self.scopes.push(Default::default());
+                self.visit_stmts(body, current_fn);
+                self.scopes.pop();
+            }
+            Stmt::Do { body, .. } => {
+                self.scopes.push(Default::default());
+                self.visit_stmts(body, current_fn);
+                self.scopes.pop();
+            }
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                self.visit_expr(condition, current_fn.as_deref_mut());
+                self.scopes.push(Default::default());
+                self.visit_stmts(then_body, current_fn.as_deref_mut());
+                self.scopes.pop();
+                self.scopes.push(Default::default());
+                self.visit_stmts(else_body, current_fn);
+                self.scopes.pop();
+            }
+            Stmt::Print { exprs, .. } => {
+                for e in exprs {
+                    self.visit_expr(e, current_fn.as_deref_mut());
+                }
+            }
+            Stmt::Expr { expr, .. } => self.visit_expr(expr, current_fn),
+            Stmt::Return { value, .. } => {
+                if let Some(e) = value {
+                    self.visit_expr(e, current_fn);
+                }
+            }
+            Stmt::Break { .. } => {}
         }
-        _ => {}
+    }
+
+    /// One expression: the ctor's two mints, the fn literal's scope
+    /// and touched set, and the one recursion shared by every face.
+    fn visit_expr(&mut self, expr: &Expr, mut current_fn: Option<&mut FnScan>) {
+        match expr {
+            Expr::TableCtor { entries, line } => {
+                // ONE arm, TWO mints: the site id and the ctor line
+                // land at the same pre-order index — `ctor_lines[id]`
+                // is this ctor's `{` line by construction. The pair
+                // cannot disagree; H5's count assert died here.
+                self.sites.insert(expr as *const Expr, self.sites.len());
+                self.ctor_lines.push(*line as usize);
+                for (k, v) in entries {
+                    if let CtorKey::Expr(ke) = k {
+                        self.visit_expr(ke, current_fn.as_deref_mut());
+                    }
+                    self.visit_expr(v, current_fn.as_deref_mut());
+                }
+            }
+            Expr::Field { obj, .. } => {
+                self.visit_expr(obj, current_fn);
+            }
+            Expr::Index { obj, key } => {
+                self.visit_expr(obj, current_fn.as_deref_mut());
+                self.visit_expr(key, current_fn);
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.visit_expr(left, current_fn.as_deref_mut());
+                self.visit_expr(right, current_fn);
+            }
+            Expr::UnaryOp { expr, .. } => self.visit_expr(expr, current_fn),
+            Expr::Call { callee, args } => {
+                self.visit_expr(callee, current_fn.as_deref_mut());
+                for a in args {
+                    self.visit_expr(a, current_fn.as_deref_mut());
+                }
+            }
+            Expr::Function { params, body } => {
+                let entry_depth = self.scopes.len();
+                self.scopes.push(params.iter().cloned().collect());
+                let mut inner = FnScan {
+                    entry_depth,
+                    touched: BTreeSet::new(),
+                };
+                self.visit_stmts(body, Some(&mut inner));
+                self.scopes.pop();
+                // a nested fn's outer touches are the parent's too
+                if let Some(outer) = current_fn {
+                    outer.touched.extend(inner.touched.iter().cloned());
+                }
+                self.fn_touched.insert(expr as *const Expr, inner.touched);
+            }
+            _ => {}
+        }
     }
 }
 
-/// The ctor attribution derivation (H5): lines read off the nodes'
-/// own `line` stamps, collected in the same pre-order number_sites
-/// walks — so index i IS site i and the vec drops into every
-/// `ctor_lines[id]` consumer unchanged. The recursion mirrors
-/// number_stmt/number_expr exactly (same faces, same order); the
-/// count assert in build_context holds the two face sets together.
-fn derive_ctor_lines(stmts: &[Stmt]) -> Vec<usize> {
-    let mut lines = Vec::new();
-    derive_ctor_lines_into(stmts, &mut lines);
-    lines
-}
-
-fn derive_ctor_lines_into(stmts: &[Stmt], lines: &mut Vec<usize>) {
-    for s in stmts {
-        derive_ctor_lines_stmt(s, lines);
+/// The scan's one law: a name a fn body assigns or stores through is
+/// TOUCHED iff no scope at or below the fn's entry depth declares it.
+fn record_touched(current_fn: Option<&mut FnScan>, scopes: &[BTreeSet<String>], name: &str) {
+    if let Some(scan) = current_fn
+        && !scopes[scan.entry_depth..].iter().any(|s| s.contains(name))
+    {
+        scan.touched.insert(name.to_string());
     }
 }
 
-fn derive_ctor_lines_stmt(stmt: &Stmt, lines: &mut Vec<usize>) {
-    match stmt {
-        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
-            for e in exprs {
-                derive_ctor_line_expr(e, lines);
-            }
-        }
-        Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => {
-            derive_ctor_line_expr(expr, lines)
-        }
-        Stmt::IndexAssign {
-            obj, key, value, ..
-        } => {
-            derive_ctor_line_expr(obj, lines);
-            derive_ctor_line_expr(key, lines);
-            derive_ctor_line_expr(value, lines);
-        }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            derive_ctor_line_expr(condition, lines);
-            derive_ctor_lines_into(body, lines);
-        }
-        Stmt::Do { body, .. } => derive_ctor_lines_into(body, lines),
-        Stmt::If {
-            condition,
-            then_body,
-            else_body,
-            ..
-        } => {
-            derive_ctor_line_expr(condition, lines);
-            derive_ctor_lines_into(then_body, lines);
-            derive_ctor_lines_into(else_body, lines);
-        }
-        Stmt::Return { value, .. } => {
-            if let Some(e) = value {
-                derive_ctor_line_expr(e, lines);
-            }
-        }
-        Stmt::Break { .. } => {}
-    }
-}
-
-fn derive_ctor_line_expr(expr: &Expr, lines: &mut Vec<usize>) {
+/// The base name a store writes through (`t` in `t[x][i] = v`), if
+/// the obj face is a plain chain of indexes off a name.
+fn base_identifier(expr: &Expr) -> Option<&String> {
     match expr {
-        Expr::TableCtor { entries, line } => {
-            lines.push(*line as usize);
-            for (key, val) in entries {
-                if let CtorKey::Expr(ke) = key {
-                    derive_ctor_line_expr(ke, lines);
-                }
-                derive_ctor_line_expr(val, lines);
-            }
-        }
-        Expr::Field { obj, .. } => derive_ctor_line_expr(obj, lines),
-        Expr::Index { obj, key } => {
-            derive_ctor_line_expr(obj, lines);
-            derive_ctor_line_expr(key, lines);
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            derive_ctor_line_expr(left, lines);
-            derive_ctor_line_expr(right, lines);
-        }
-        Expr::UnaryOp { expr, .. } => derive_ctor_line_expr(expr, lines),
-        Expr::Call { callee, args } => {
-            derive_ctor_line_expr(callee, lines);
-            for a in args {
-                derive_ctor_line_expr(a, lines);
-            }
-        }
-        Expr::Function { body, .. } => derive_ctor_lines_into(body, lines),
-        _ => {}
+        Expr::Identifier(name) => Some(name),
+        Expr::Index { obj, .. } => base_identifier(obj),
+        _ => None,
     }
 }
 
@@ -258,9 +283,11 @@ fn derive_ctor_line_expr(expr: &Expr, lines: &mut Vec<usize>) {
 /// wrong, and the multi-statement desugars (the for loop, R7; the
 /// tuple assignment, H8/row 3) are the only constructs that stamp by
 /// hand-copy: their synthetic statements must all carry the sugar
-/// header's stamp. This census walks the finished tree and pins the
-/// discipline; any drift fails loudly at attribution time instead of
-/// whispering wrong line prefixes into diagnostics.
+/// header's stamp. This census walks the finished tree — reading the
+/// ONE derivation pass's line map (H7), recursing the pass's faces by
+/// law, Field included — and pins the discipline; any drift fails
+/// loudly at attribution time instead of whispering wrong line
+/// prefixes into diagnostics.
 ///
 /// `for$limit` and `tuple$tN` are unspellable (identifiers are
 /// [a-zA-Z_][a-zA-Z0-9_]*, lexer.rs), so both latch decls are
@@ -429,6 +456,10 @@ fn census_expr(e: &Expr, lines: &BTreeMap<*const Stmt, usize>) {
                 census_expr(v, lines);
             }
         }
+        // the pass's Field face (H7): the census recurses every face
+        // the derivation pass recurses — a desugar hiding under a
+        // Field obj is censused like any other
+        Expr::Field { obj, .. } => census_expr(obj, lines),
         Expr::Index { obj, key } => {
             census_expr(obj, lines);
             census_expr(key, lines);
@@ -442,257 +473,6 @@ fn census_expr(e: &Expr, lines: &BTreeMap<*const Stmt, usize>) {
             census_expr(callee, lines);
             for a in args {
                 census_expr(a, lines);
-            }
-        }
-        _ => {}
-    }
-}
-
-pub fn number_sites(stmts: &[Stmt], sites: &mut BTreeMap<*const Expr, usize>) {
-    for s in stmts {
-        number_stmt(s, sites);
-    }
-}
-
-fn number_stmt(stmt: &Stmt, sites: &mut BTreeMap<*const Expr, usize>) {
-    match stmt {
-        Stmt::LocalDecl { exprs, .. } => {
-            for e in exprs {
-                number_expr(e, sites);
-            }
-        }
-        Stmt::Assignment { expr, .. } => number_expr(expr, sites),
-        Stmt::IndexAssign {
-            obj, key, value, ..
-        } => {
-            number_expr(obj, sites);
-            number_expr(key, sites);
-            number_expr(value, sites);
-        }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            number_expr(condition, sites);
-            number_sites(body, sites);
-        }
-        Stmt::Do { body, .. } => {
-            number_sites(body, sites);
-        }
-        Stmt::If {
-            condition,
-            then_body,
-            else_body,
-            ..
-        } => {
-            number_expr(condition, sites);
-            number_sites(then_body, sites);
-            number_sites(else_body, sites);
-        }
-        Stmt::Print { exprs, .. } => {
-            for e in exprs {
-                number_expr(e, sites);
-            }
-        }
-        Stmt::Expr { expr, .. } => number_expr(expr, sites),
-        Stmt::Return { value, .. } => {
-            if let Some(e) = value {
-                number_expr(e, sites);
-            }
-        }
-        Stmt::Break { .. } => {}
-    }
-}
-
-fn number_expr(expr: &Expr, sites: &mut BTreeMap<*const Expr, usize>) {
-    match expr {
-        Expr::TableCtor { entries, .. } => {
-            let id = sites.len();
-            sites.insert(expr as *const Expr, id);
-            for (key, val) in entries {
-                if let CtorKey::Expr(ke) = key {
-                    number_expr(ke, sites);
-                }
-                number_expr(val, sites);
-            }
-        }
-        Expr::SysAllocCount => {}
-        Expr::SysExecCount => {}
-        Expr::FfiModule => {}
-        Expr::CoroModule => {}
-        Expr::Field { obj, .. } => {
-            number_expr(obj, sites);
-        }
-        Expr::Index { obj, key } => {
-            number_expr(obj, sites);
-            number_expr(key, sites);
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            number_expr(left, sites);
-            number_expr(right, sites);
-        }
-        Expr::UnaryOp { expr, .. } => number_expr(expr, sites),
-        Expr::Call { callee, args } => {
-            number_expr(callee, sites);
-            for a in args {
-                number_expr(a, sites);
-            }
-        }
-        Expr::Function { body, .. } => {
-            number_sites(body, sites);
-        }
-        _ => {}
-    }
-}
-
-pub fn scan_fn_touched(stmts: &[Stmt]) -> BTreeMap<*const Expr, BTreeSet<String>> {
-    let mut touched = BTreeMap::new();
-    let mut scopes = vec![BTreeSet::new()];
-    scan_stmts(stmts, &mut scopes, None, &mut touched);
-    touched
-}
-
-struct FnScan {
-    entry_depth: usize,
-    touched: BTreeSet<String>,
-}
-
-fn scan_stmts(
-    stmts: &[Stmt],
-    scopes: &mut Vec<BTreeSet<String>>,
-    mut current_fn: Option<&mut FnScan>,
-    touched: &mut BTreeMap<*const Expr, BTreeSet<String>>,
-) {
-    for s in stmts {
-        scan_stmt(s, scopes, current_fn.as_deref_mut(), touched);
-    }
-}
-
-fn base_identifier(expr: &Expr) -> Option<&String> {
-    match expr {
-        Expr::Identifier(name) => Some(name),
-        Expr::Index { obj, .. } => base_identifier(obj),
-        _ => None,
-    }
-}
-
-fn scan_stmt(
-    stmt: &Stmt,
-    scopes: &mut Vec<BTreeSet<String>>,
-    mut current_fn: Option<&mut FnScan>,
-    touched: &mut BTreeMap<*const Expr, BTreeSet<String>>,
-) {
-    fn record(current_fn: Option<&mut FnScan>, scopes: &[BTreeSet<String>], name: &str) {
-        if let Some(scan) = current_fn
-            && !scopes[scan.entry_depth..].iter().any(|s| s.contains(name))
-        {
-            scan.touched.insert(name.to_string());
-        }
-    }
-    match stmt {
-        Stmt::LocalDecl { names, exprs, .. } => {
-            for e in exprs {
-                scan_expr(e, scopes, current_fn.as_deref_mut(), touched);
-            }
-            scopes.last_mut().unwrap().extend(names.iter().cloned());
-        }
-        Stmt::Assignment { name, expr, .. } => {
-            record(current_fn.as_deref_mut(), scopes, name);
-            scan_expr(expr, scopes, current_fn.as_deref_mut(), touched);
-        }
-        Stmt::IndexAssign {
-            obj, key, value, ..
-        } => {
-            if let Some(base) = base_identifier(obj) {
-                record(current_fn.as_deref_mut(), scopes, base);
-            }
-            scan_expr(obj, scopes, current_fn.as_deref_mut(), touched);
-            scan_expr(key, scopes, current_fn.as_deref_mut(), touched);
-            scan_expr(value, scopes, current_fn.as_deref_mut(), touched);
-        }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            scan_expr(condition, scopes, current_fn.as_deref_mut(), touched);
-            scopes.push(Default::default());
-            scan_stmts(body, scopes, current_fn.as_deref_mut(), touched);
-            scopes.pop();
-        }
-        Stmt::Do { body, .. } => {
-            scopes.push(Default::default());
-            scan_stmts(body, scopes, current_fn.as_deref_mut(), touched);
-            scopes.pop();
-        }
-        Stmt::If {
-            condition,
-            then_body,
-            else_body,
-            ..
-        } => {
-            scan_expr(condition, scopes, current_fn.as_deref_mut(), touched);
-            scopes.push(Default::default());
-            scan_stmts(then_body, scopes, current_fn.as_deref_mut(), touched);
-            scopes.pop();
-            scopes.push(Default::default());
-            scan_stmts(else_body, scopes, current_fn.as_deref_mut(), touched);
-            scopes.pop();
-        }
-        Stmt::Print { exprs, .. } => {
-            for e in exprs {
-                scan_expr(e, scopes, current_fn.as_deref_mut(), touched);
-            }
-        }
-        Stmt::Expr { expr, .. } => scan_expr(expr, scopes, current_fn.as_deref_mut(), touched),
-        Stmt::Return { value, .. } => {
-            if let Some(e) = value {
-                scan_expr(e, scopes, current_fn, touched);
-            }
-        }
-        Stmt::Break { .. } => {}
-    }
-}
-
-fn scan_expr(
-    expr: &Expr,
-    scopes: &mut Vec<BTreeSet<String>>,
-    mut current_fn: Option<&mut FnScan>,
-    touched: &mut BTreeMap<*const Expr, BTreeSet<String>>,
-) {
-    match expr {
-        Expr::Function { params, body } => {
-            let entry_depth = scopes.len();
-            scopes.push(params.iter().cloned().collect());
-            let mut inner = FnScan {
-                entry_depth,
-                touched: BTreeSet::new(),
-            };
-            scan_stmts(body, scopes, Some(&mut inner), touched);
-            scopes.pop();
-            if let Some(outer) = current_fn.as_deref_mut() {
-                outer.touched.extend(inner.touched.iter().cloned());
-            }
-            touched.insert(expr as *const Expr, inner.touched);
-        }
-        Expr::Call { callee, args } => {
-            scan_expr(callee, scopes, current_fn.as_deref_mut(), touched);
-            for a in args {
-                scan_expr(a, scopes, current_fn.as_deref_mut(), touched);
-            }
-        }
-        Expr::Index { obj, key } => {
-            scan_expr(obj, scopes, current_fn.as_deref_mut(), touched);
-            scan_expr(key, scopes, current_fn.as_deref_mut(), touched);
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            scan_expr(left, scopes, current_fn.as_deref_mut(), touched);
-            scan_expr(right, scopes, current_fn.as_deref_mut(), touched);
-        }
-        Expr::UnaryOp { expr, .. } => scan_expr(expr, scopes, current_fn.as_deref_mut(), touched),
-        Expr::TableCtor { entries, .. } => {
-            for (k, v) in entries {
-                if let CtorKey::Expr(ke) = k {
-                    scan_expr(ke, scopes, current_fn.as_deref_mut(), touched);
-                }
-                scan_expr(v, scopes, current_fn.as_deref_mut(), touched);
             }
         }
         _ => {}

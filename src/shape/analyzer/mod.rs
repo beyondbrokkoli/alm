@@ -656,7 +656,10 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
     let mut facts = a
         .into_recorded(adopt_lines, static_elems, elems_diags, chk_facts)
         .into_facts();
-    facts.fn_touched = crate::analysis::scan_fn_touched(ctx.ast);
+    // the fn-touched map rides the context (H7: the scan folded into
+    // the one derivation pass — purely syntactic, nothing walk-side
+    // feeds it, so the old post-walk call site bought nothing)
+    facts.fn_touched = ctx.fn_touched.clone();
     // the row-read discipline is the analysis's final acceptance gate
     facts.check_row_reads();
     facts
