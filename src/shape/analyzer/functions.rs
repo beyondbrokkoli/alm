@@ -454,10 +454,10 @@ impl Analyzer {
         src: &str,
     ) -> Result<(), ShapeError> {
         if bind.aliases.contains(&BOUNDARY_ROOT) {
-            return Err(ShapeError(format!(
-                "Lifetime Error: the boundary table '{src}' is pinned — the host owns \
+            return Err(ShapeError(Diagnostic::lifetime(format!(
+                "the boundary table '{src}' is pinned — the host owns \
                  its header; read its cells ('{src}[i]') instead of moving the table"
-            )));
+            ))));
         }
         Ok(())
     }

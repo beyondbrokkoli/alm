@@ -3,6 +3,7 @@
 mod bridges;
 
 use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
+use crate::diag::Diagnostic;
 use crate::ir::{
     AnyReg, BasicBlock, BlockId, Bool, CellRepr, DbgBind, Instruction, Int, IrProgram, Ptr, Reg,
     RegId, RegKind, SourceLoc, TableKey, Terminator, repr_of,
@@ -17,11 +18,13 @@ use bridges::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub struct LowerError(pub String);
+/// A lowering rejection — minted typed (H11); the desync protocol is
+/// the `Desync` variant on the payload, no longer the message bytes.
+pub struct LowerError(pub Diagnostic);
 
 impl LowerError {
     pub fn is_desync(&self) -> bool {
-        self.0.contains("disagree")
+        self.0.is_desync()
     }
 }
 
@@ -100,7 +103,7 @@ struct FillCtxs {
 
 pub struct IrLowerer<'a> {
     pub blocks: Vec<BasicBlock>,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
     current_block: BlockId,
     free_reg: RegId,
     scopes: Vec<BTreeMap<String, Local>>,
@@ -287,20 +290,19 @@ impl<'a> IrLowerer<'a> {
                 Keep::Name(n) => {
                     let local = self.read_var(n)?;
                     let reg = ptr_of(local.reg).map_err(|_| {
-                        LowerError(format!(
+                        LowerError(Diagnostic::desync(format!(
                             "Lower Error: borrower '{n}' planned as a keep holds a \
                              non-pointer register — the analyzer and the lowerer disagree"
-                        ))
+                        )))
                     })?;
                     regs.push(reg);
                 }
                 Keep::Ghost(g) => {
                     let &r = self.ghost_keeps.get(g).ok_or_else(|| {
-                        LowerError(
+                        LowerError(Diagnostic::desync(
                             "Lower Error: a housed row's keep register was never \
-                             captured — the analyzer and the lowerer disagree"
-                                .into(),
-                        )
+                             captured — the analyzer and the lowerer disagree",
+                        ))
                     })?;
                     regs.push(r);
                 }
@@ -317,11 +319,10 @@ impl<'a> IrLowerer<'a> {
             TagSrc::Call(expr) => self.call_tag_regs.get(&expr).copied(),
         }
         .ok_or_else(|| {
-            LowerError(
+            LowerError(Diagnostic::desync(
                 "Lower Error: a mixed join's tag phi never lowered — \
-                 the analyzer and the lowerer disagree"
-                    .into(),
-            )
+                 the analyzer and the lowerer disagree",
+            ))
         })?;
         let carrier = self.read_var(&e.carrier)?;
         let table = ptr_of(carrier.reg)?;
@@ -374,11 +375,11 @@ impl<'a> IrLowerer<'a> {
             // reject; freeing the view would fire an untracked second
             // free on a live env.
             if matches!(carrier.ty, Ty::Closure(_)) {
-                return Err(LowerError(format!(
+                return Err(LowerError(Diagnostic::desync(format!(
                     "a closure value's env has one owner (its mint) — '{}' carries a \
                      face; the checker and the lowerer disagree",
                     f.carrier
-                )));
+                ))));
             }
             let table = ptr_of(carrier.reg)?;
             signal!(trace::TRACE_DO_EXIT_FREE_PHI);
@@ -421,10 +422,10 @@ impl<'a> IrLowerer<'a> {
                 if let Keep::Name(n) = k {
                     let local = self.read_var(n)?;
                     let reg = ptr_of(local.reg).map_err(|_| {
-                        LowerError(format!(
+                        LowerError(Diagnostic::desync(format!(
                             "Lower Error: borrower '{n}' planned as a keep holds a \
                              non-pointer register — the analyzer and the lowerer disagree"
-                        ))
+                        )))
                     })?;
                     debug_assert!(
                         !self.env_regs.iter().any(|e| e.id == reg.id),
@@ -515,7 +516,7 @@ impl<'a> IrLowerer<'a> {
                 return Ok(());
             }
         }
-        Err(LowerError("Lower Error: Undeclared variable".into()))
+        Err(LowerError(Diagnostic::lower("Undeclared variable")))
     }
 
     fn read_var(&self, name: &str) -> Result<Local, LowerError> {
@@ -524,7 +525,7 @@ impl<'a> IrLowerer<'a> {
                 return Ok(local.clone());
             }
         }
-        Err(LowerError("Lower Error: Undeclared variable".into()))
+        Err(LowerError(Diagnostic::lower("Undeclared variable")))
     }
 
     fn has_var(&self, name: &str) -> bool {
@@ -590,11 +591,11 @@ impl<'a> IrLowerer<'a> {
                 Ok(_) => {}
                 Err(e) => {
                     let desync = e.is_desync();
-                    let line = self.shape.stmt_lines.get(&(stmt as *const Stmt)).copied();
-                    self.diagnostics.push(match line {
-                        Some(l) => format!("line {l}: {}", e.0),
-                        None => e.0,
-                    });
+                    // the site-stamp: the stmt's own line from the
+                    // loc-derived map (H5's dividend), one formatter
+                    self.diagnostics.push(
+                        e.0.with_site(self.shape.stmt_lines.get(&(stmt as *const Stmt)).copied()),
+                    );
                     signal!(trace::TRACE_GHOST_BAIL_LOWERER);
                     if desync {
                         signal!(trace::TRACE_ENG_DESYNC);
@@ -754,11 +755,10 @@ impl<'a> IrLowerer<'a> {
             .index_key_lanes
             .get(&(key as *const Expr, self.fact_site(key as *const Expr)))
             .ok_or_else(|| {
-                LowerError(
+                LowerError(Diagnostic::desync(
                     "Lower Error: an index key carries no recorded lane — \
-                     the checker and the lowerer disagree"
-                        .into(),
-                )
+                     the checker and the lowerer disagree",
+                ))
             })?;
         let TypedReg { reg, .. } = self.lower_expr(key, None)?;
         match lane {
@@ -794,11 +794,10 @@ impl<'a> IrLowerer<'a> {
             .get(&(obj as *const Expr, self.fact_site(obj as *const Expr)))
             .cloned()
             .ok_or_else(|| {
-                LowerError(
+                LowerError(Diagnostic::desync(
                     "Lower Error: a table access carries no recorded elem face — \
-                     the checker and the lowerer disagree"
-                        .into(),
-                )
+                     the checker and the lowerer disagree",
+                ))
             })?;
         signal!(trace::TRACE_LOWER_ELEM_FACE);
         Ok(elem)
@@ -831,11 +830,10 @@ impl<'a> IrLowerer<'a> {
                         ))
                         .cloned()
                         .ok_or_else(|| {
-                            LowerError(
+                            LowerError(Diagnostic::desync(
                                 "Lower Error: a bare declaration carries no resolved type — \
-                                 the checker and the lowerer disagree"
-                                    .into(),
-                            )
+                                 the checker and the lowerer disagree",
+                            ))
                         })?;
                     let reg_id = self.next_reg();
                     let reg = match &ty {
@@ -1344,21 +1342,19 @@ impl<'a> IrLowerer<'a> {
                 if let Some(&base) = self.expansion_break_bases.last()
                     && self.break_ctxs.len() <= base
                 {
-                    return Err(LowerError(
+                    return Err(LowerError(Diagnostic::desync(
                         "Lower Error: 'break' crossing an expansion boundary — \
-                         the checker and the lowerer disagree"
-                            .into(),
-                    ));
+                         the checker and the lowerer disagree",
+                    )));
                 }
                 let phi_vars = self
                     .break_ctxs
                     .last()
                     .ok_or_else(|| {
-                        LowerError(
+                        LowerError(Diagnostic::desync(
                             "Lower Error: 'break' outside of loop — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        )
+                             the checker and the lowerer disagree",
+                        ))
                     })?
                     .phi_vars
                     .clone();
@@ -1405,11 +1401,10 @@ impl<'a> IrLowerer<'a> {
                             self.lower_expr(expr, None)?.reg
                         }
                         _ => {
-                            return Err(LowerError(
+                            return Err(LowerError(Diagnostic::desync(
                                 "Lower Error: an internal 'return' carries a value — \
-                                 the checker and the lowerer disagree"
-                                    .into(),
-                            ));
+                                 the checker and the lowerer disagree",
+                            )));
                         }
                     }
                 };
@@ -1647,11 +1642,10 @@ impl<'a> IrLowerer<'a> {
             .get(&(call as *const Expr))
             .cloned()
             .ok_or_else(|| {
-                LowerError(
+                LowerError(Diagnostic::desync(
                     "Lower Error: a dotted call site carries no resolved verb — \
-                     the checker and the lowerer disagree"
-                        .into(),
-                )
+                     the checker and the lowerer disagree",
+                ))
             })?;
         signal!(trace::TRACE_LOWER_FFI_VERB);
         match verb {
@@ -1783,7 +1777,7 @@ impl<'a> IrLowerer<'a> {
             self.shape.env_faces.get(&ptr).cloned().unwrap_or_default();
         let stmt = self
             .cur_stmt
-            .ok_or_else(|| LowerError("Lower Error: an env mint outside a statement".into()))?;
+            .ok_or_else(|| LowerError(Diagnostic::lower("an env mint outside a statement")))?;
         if let Some(memo) = self.take_env_memo_for(stmt) {
             let reg = memo.reg;
             let stored = memo.stored;
@@ -2058,11 +2052,10 @@ impl<'a> IrLowerer<'a> {
                     .get(&(call_ptr, site))
                     .copied()
                     .ok_or_else(|| {
-                        LowerError(
+                        LowerError(Diagnostic::desync(
                             "Lower Error: a call site with no resolved function — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        )
+                             the checker and the lowerer disagree",
+                        ))
                     })?;
                 // W3a's dispatch, lower half: a call-through reads the
                 // closure VALUE's register — the env pointer. An
@@ -2097,18 +2090,16 @@ impl<'a> IrLowerer<'a> {
                     _ => None,
                 };
                 if self.inline_stack.contains(&fn_ptr) {
-                    return Err(LowerError(
+                    return Err(LowerError(Diagnostic::desync(
                         "Lower Error: recursive inlining — \
-                         the checker and the lowerer disagree"
-                            .into(),
-                    ));
+                         the checker and the lowerer disagree",
+                    )));
                 }
                 let def = self.shape.fn_defs.get(&fn_ptr).cloned().ok_or_else(|| {
-                    LowerError(
+                    LowerError(Diagnostic::desync(
                         "Lower Error: a call site names a function with no body — \
-                         the checker and the lowerer disagree"
-                            .into(),
-                    )
+                         the checker and the lowerer disagree",
+                    ))
                 })?;
                 let call_ret = self
                     .shape
@@ -2116,11 +2107,10 @@ impl<'a> IrLowerer<'a> {
                     .get(&(call_ptr, site))
                     .cloned()
                     .ok_or_else(|| {
-                        LowerError(
+                        LowerError(Diagnostic::desync(
                             "Lower Error: a call site with no resolved return — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        )
+                             the checker and the lowerer disagree",
+                        ))
                     })?;
                 let scope_key = self.shape.fn_scope_keys.get(&fn_ptr).copied();
                 let body = unsafe { def.body() };
@@ -2161,11 +2151,10 @@ impl<'a> IrLowerer<'a> {
                     }
                 })?;
                 let result = self.finalize_return_ctx()?.ok_or_else(|| {
-                    LowerError(
+                    LowerError(Diagnostic::desync(
                         "Lower Error: an inline call produced no value — \
-                         the checker and the lowerer disagree"
-                            .into(),
-                    )
+                         the checker and the lowerer disagree",
+                    ))
                 })?;
                 if let Some(classes) = self.shape.call_tags.get(&(expr as *const Expr)).cloned() {
                     let exit = self.current_block;
@@ -2178,11 +2167,10 @@ impl<'a> IrLowerer<'a> {
                         })
                         .unwrap_or_default();
                     if edge_blocks.len() < classes.len() {
-                        return Err(LowerError(
+                        return Err(LowerError(Diagnostic::desync(
                             "Lower Error: a tagged call's return edges went missing — \
-                             the analyzer and the lowerer disagree"
-                                .into(),
-                        ));
+                             the analyzer and the lowerer disagree",
+                        )));
                     }
                     let mut tag_args: Vec<(BlockId, AnyReg)> = Vec::new();
                     for (i, &b) in edge_blocks.iter().enumerate() {
@@ -2509,11 +2497,10 @@ impl<'a> IrLowerer<'a> {
                         OrdPair::SS(a, b) => self.cmp3(Instruction::Less, reg, a, b),
                         OrdPair::PP(a, b) => self.cmp3(Instruction::Less, reg, a, b),
                         OrdPair::AA(..) => {
-                            return Err(LowerError(
+                            return Err(LowerError(Diagnostic::desync(
                                 "Lower Error: an ordering comparison on Any boundary cells — \
-                                 the checker and the lowerer disagree"
-                                    .into(),
-                            ));
+                                 the checker and the lowerer disagree",
+                            )));
                         }
                     },
                     BinOp::GreaterThan => match ord_pair(l_any, r_any)? {
@@ -2523,11 +2510,10 @@ impl<'a> IrLowerer<'a> {
                         OrdPair::SS(a, b) => self.cmp3(Instruction::Less, reg, b, a),
                         OrdPair::PP(a, b) => self.cmp3(Instruction::Less, reg, b, a),
                         OrdPair::AA(..) => {
-                            return Err(LowerError(
+                            return Err(LowerError(Diagnostic::desync(
                                 "Lower Error: an ordering comparison on Any boundary cells — \
-                                 the checker and the lowerer disagree"
-                                    .into(),
-                            ));
+                                 the checker and the lowerer disagree",
+                            )));
                         }
                     },
                     BinOp::LessEq => match ord_pair(l_any, r_any)? {
@@ -2537,11 +2523,10 @@ impl<'a> IrLowerer<'a> {
                         OrdPair::SS(a, b) => self.cmp3(Instruction::Leq, reg, a, b),
                         OrdPair::PP(a, b) => self.cmp3(Instruction::Leq, reg, a, b),
                         OrdPair::AA(..) => {
-                            return Err(LowerError(
+                            return Err(LowerError(Diagnostic::desync(
                                 "Lower Error: an ordering comparison on Any boundary cells — \
-                                 the checker and the lowerer disagree"
-                                    .into(),
-                            ));
+                                 the checker and the lowerer disagree",
+                            )));
                         }
                     },
                     BinOp::GreaterEq => match ord_pair(l_any, r_any)? {
@@ -2551,11 +2536,10 @@ impl<'a> IrLowerer<'a> {
                         OrdPair::SS(a, b) => self.cmp3(Instruction::Geq, reg, a, b),
                         OrdPair::PP(a, b) => self.cmp3(Instruction::Geq, reg, a, b),
                         OrdPair::AA(..) => {
-                            return Err(LowerError(
+                            return Err(LowerError(Diagnostic::desync(
                                 "Lower Error: an ordering comparison on Any boundary cells — \
-                                 the checker and the lowerer disagree"
-                                    .into(),
-                            ));
+                                 the checker and the lowerer disagree",
+                            )));
                         }
                     },
                     BinOp::Equal => match ord_pair(l_any, r_any)? {
@@ -2679,11 +2663,10 @@ impl<'a> IrLowerer<'a> {
                                 ty: Ty::Int,
                             })
                         }
-                        _ => Err(LowerError(
+                        _ => Err(LowerError(Diagnostic::desync(
                             "Lower Error: '#' requires a String, table, or Any operand — \
-                             the checker and the lowerer disagree"
-                                .into(),
-                        )),
+                             the checker and the lowerer disagree",
+                        ))),
                     }
                 }
             },
@@ -2808,41 +2791,71 @@ fn get_base_identifier(expr: &Expr) -> Option<&String> {
     }
 }
 
+/// H11: the desync protocol is a VARIANT — `Diagnostic::desync` mints
+/// it, `is_desync` matches the kind, and the rendered tail ("… — the
+/// halves disagree") stays the protocol's observable face (H12's 7c
+/// deletes both with the class). These tests are the substring era's
+/// successor: the old `contains("disagree")` classifier pinned the
+/// TEXT; the variant pins the MINT.
 #[cfg(test)]
 mod desync_class_tests {
     use super::LowerError;
+    use crate::diag::Diagnostic;
 
+    /// The real desync message texts, minted as the protocol demands —
+    /// each classifies structurally, and each still renders its tail
+    /// (the disagreeing halves are message content, not format).
     #[test]
-    fn disagree_messages_classify_as_desync() {
+    fn desync_mints_classify_and_render_the_tail() {
         for msg in [
-            "Lower Error: a table operand position received a non-table — \
+            Diagnostic::desync(
+                "Lower Error: a table operand position received a non-table — \
              the checker and the lowerer disagree",
-            "Lower Error: a housed row's keep register was never \
+            ),
+            Diagnostic::desync(
+                "Lower Error: a housed row's keep register was never \
              captured — the analyzer and the lowerer disagree",
-            "Lower Error: IR emitter label desync: a br/phi names block 'b3', \
+            ),
+            Diagnostic::desync(
+                "Lower Error: IR emitter label desync: a br/phi names block 'b3', \
              which the module never emits — the emitters and the block \
              model disagree (see SeamPlan in backend.rs)",
-            "Lower Error: a dotted call site carries no resolved verb — \
+            ),
+            Diagnostic::desync(
+                "Lower Error: a dotted call site carries no resolved verb — \
              the checker and the lowerer disagree",
-            "Lower Error: an index key carries no recorded lane — \
+            ),
+            Diagnostic::desync(
+                "Lower Error: an index key carries no recorded lane — \
              the checker and the lowerer disagree",
-            "Lower Error: a table access carries no recorded elem face — \
+            ),
+            Diagnostic::desync(
+                "Lower Error: a table access carries no recorded elem face — \
              the checker and the lowerer disagree",
-            "Lower Error: a string operand position received a different repr — \
+            ),
+            Diagnostic::desync(
+                "Lower Error: a string operand position received a different repr — \
              the checker and the lowerer disagree",
+            ),
         ] {
-            assert!(LowerError(msg.to_string()).is_desync(), "{msg}");
+            assert!(LowerError(msg.clone()).is_desync(), "{msg}");
+            assert!(msg.render().contains("disagree"), "{msg}");
         }
     }
 
+    /// The substring era's false-positive class is unrepresentable: a
+    /// message whose TEXT merely contains "disagree" is not a desync
+    /// unless minted as one — script errors never are.
     #[test]
-    fn script_errors_never_classify_as_desync() {
+    fn desync_is_the_mint_not_the_bytes() {
         for msg in [
-            "Lower Error: Undeclared variable",
-            "Type Error: '+' requires numeric operands",
+            Diagnostic::lower("Undeclared variable"),
+            Diagnostic::lower("the operands disagree with the repr table"),
         ] {
-            assert!(!LowerError(msg.to_string()).is_desync(), "{msg}");
+            assert!(!LowerError(msg.clone()).is_desync(), "{msg}");
         }
+        assert!(!LowerError(Diagnostic::lower("plain")).is_desync());
+        assert!(LowerError(Diagnostic::desync("any bespoke bug text")).is_desync());
     }
 }
 

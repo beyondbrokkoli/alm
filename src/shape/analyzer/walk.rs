@@ -41,11 +41,10 @@ impl Analyzer {
         for s in stmts {
             if let Err(err) = self.walk_stmt(rec, s) {
                 signal!(rec.on(), trace::TRACE_GHOST_BAIL);
-                let line = self.stmt_lines.get(&(s as *const Stmt)).copied();
-                self.ledger.diagnostics.push(match line {
-                    Some(l) => format!("line {l}: {}", err.0),
-                    None => err.0,
-                });
+                self.ledger.diagnostics.push(
+                    err.0
+                        .with_site(self.stmt_lines.get(&(s as *const Stmt)).copied()),
+                );
                 return;
             }
         }
@@ -92,10 +91,10 @@ impl Analyzer {
                     an.check_boundary_pin(&bind, src)?;
                     if matches!(bind.ty, Tbl(_)) {
                         if moved.iter().any(|(_, m)| m == src) {
-                            return Err(ShapeError(format!(
-                                "Lifetime Error: '{src}' is moved more than once — one table \
+                            return Err(ShapeError(Diagnostic::lifetime(format!(
+                                "'{src}' is moved more than once — one table \
                                  value has exactly one receiving binding"
-                            )));
+                            ))));
                         }
                         moved.push((d, src.to_string()));
                     }
@@ -402,10 +401,10 @@ impl Analyzer {
                     self.walk.prov[depth].insert(name.clone(), None);
                     return Ok(());
                 }
-                return Err(ShapeError(format!(
-                    "Scope Error: assignment to undeclared variable '{}'",
+                return Err(ShapeError(Diagnostic::scope(format!(
+                    "assignment to undeclared variable '{}'",
                     name
-                )));
+                ))));
             }
 
             Stmt::IndexAssign {
@@ -446,33 +445,30 @@ impl Analyzer {
                             .collect();
                         if targets.is_empty() {
                             signal!(rec.on(), trace::TRACE_FAIL_ROW_STORE);
-                            return Err(ShapeError(
-                                "Lifetime Error: a row read cannot be stored into an \
+                            return Err(ShapeError(Diagnostic::lifetime(
+                                "a row read cannot be stored into an \
                                  unresolved or host-owned table — cells can only house \
-                                 rows whose base the lattice can see"
-                                    .to_string(),
-                            ));
+                                 rows whose base the lattice can see",
+                            )));
                         }
                         for &g in &value_ghosts {
                             let Some(&birth) = self.lattice.ghost_site.get(&g) else {
                                 signal!(rec.on(), trace::TRACE_FAIL_ROW_STORE);
-                                return Err(ShapeError(
-                                    "Lifetime Error: a row read with a dynamic or unproven \
+                                return Err(ShapeError(Diagnostic::lifetime(
+                                    "a row read with a dynamic or unproven \
                                      key cannot be stored — its birth site is not visible \
                                      to the lattice; store a row read through a literal \
-                                     key instead"
-                                        .to_string(),
-                                ));
+                                     key instead",
+                                )));
                             };
                             for &s in &targets {
                                 if s == birth || self.birth_closure(s).contains(&birth) {
                                     signal!(rec.on(), trace::TRACE_FAIL_ROW_STORE);
-                                    return Err(ShapeError(
-                                        "Lifetime Error: cyclic row store — the row read \
+                                    return Err(ShapeError(Diagnostic::lifetime(
+                                        "cyclic row store — the row read \
                                          would be stored into a table that already contains \
-                                         it (alm's element types are finite)"
-                                            .to_string(),
-                                    ));
+                                         it (alm's element types are finite)",
+                                    )));
                                 }
                             }
                             self.check_row_housing(g, value)?;
@@ -486,22 +482,20 @@ impl Analyzer {
                                     && !value_ghosts.iter().any(|&vg| self.same_row(vg, existing))
                                 {
                                     signal!(rec.on(), trace::TRACE_FAIL_ROW_STORE);
-                                    return Err(ShapeError(
-                                        "Lifetime Error: the destination cell already houses \
+                                    return Err(ShapeError(Diagnostic::lifetime(
+                                        "the destination cell already houses \
                                          a row — free it through its housing before storing \
-                                         another (the displaced row would leak unnamed)"
-                                            .to_string(),
-                                    ));
+                                         another (the displaced row would leak unnamed)",
+                                    )));
                                 }
                             }
                         }
                     } else if vsites.iter().all(is_root) && !vlineage.is_empty() {
                         signal!(rec.on(), trace::TRACE_FAIL_BORROW_ESCAPE);
-                        return Err(ShapeError(
-                            "Lifetime Error: a row read cannot be stored — borrows hold no \
-                             ownership, and cells own exactly the headers they are given"
-                                .to_string(),
-                        ));
+                        return Err(ShapeError(Diagnostic::lifetime(
+                            "a row read cannot be stored — borrows hold no \
+                             ownership, and cells own exactly the headers they are given",
+                        )));
                     }
                 }
 
@@ -887,11 +881,10 @@ impl Analyzer {
                         .last()
                         .is_some_and(|&loop_entry| loop_entry > fn_entry)
                 {
-                    return Err(ShapeError(
-                        "Type Error: 'break' cannot leave an expansion — \
-                         write the break inside a loop of the same body"
-                            .into(),
-                    ));
+                    return Err(ShapeError(Diagnostic::ty(
+                        "'break' cannot leave an expansion — \
+                         write the break inside a loop of the same body",
+                    )));
                 }
                 if rec.on() {
                     self.plan_break_exits(stmt as *const Stmt);
@@ -992,10 +985,10 @@ impl Analyzer {
                 return Ok((depth, bind.clone()));
             }
         }
-        Err(ShapeError(format!(
-            "Scope Error: reference to undeclared variable '{}'",
+        Err(ShapeError(Diagnostic::scope(format!(
+            "reference to undeclared variable '{}'",
             name
-        )))
+        ))))
     }
 
     pub(super) fn resolve_aliases(

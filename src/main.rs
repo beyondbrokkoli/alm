@@ -5,6 +5,7 @@ mod analysis;
 mod ast;
 mod backend;
 mod debug;
+mod diag;
 mod elaborate;
 mod ir;
 mod lexer;
@@ -32,9 +33,11 @@ fn poke_build_fail() {
     eprintln!("ALM_TRACE: slot 1 — build failed");
 }
 
-fn fail_build(diags: &[String]) -> ! {
+/// The one renderer's driver face (H11): diagnostics ride typed to
+/// here; the bytes are the format law's — `line N: Kind: text`.
+fn fail_build(diags: &[diag::Diagnostic]) -> ! {
     for d in diags {
-        eprintln!("{d}");
+        eprintln!("{}", d.render());
     }
     poke_build_fail();
     std::process::exit(1)
@@ -360,7 +363,7 @@ it defaults to libalm_out.so (or alm_out for --exe).";
         // no build-fail trace poke — byte-for-byte the pre-fold driver
         Err((pipeline::Stage::Ffi, diags)) => {
             for d in &diags {
-                eprintln!("{d}");
+                eprintln!("{}", d.render());
             }
             std::process::exit(1);
         }

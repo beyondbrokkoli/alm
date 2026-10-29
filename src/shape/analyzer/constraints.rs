@@ -25,6 +25,7 @@
 
 use super::checker::type_name;
 use crate::ast::Expr;
+use crate::diag::Diagnostic;
 use crate::shape::Ty;
 use alm_rt::{signal, trace};
 use std::collections::BTreeMap;
@@ -148,19 +149,20 @@ impl UnknownStore {
         }
     }
 
-    pub(super) fn bind(&mut self, id: usize, ty: Ty) -> Result<(), String> {
+    pub(super) fn bind(&mut self, id: usize, ty: Ty) -> Result<(), Diagnostic> {
         if self.occurs(id, &ty) {
             signal!(trace::TRACE_FAIL_OCCURS_CHECK);
-            return Err("Type Error: cyclic table type — a table's element type \
-                 may not contain the table itself (alm's element types are finite)"
-                .to_string());
+            return Err(Diagnostic::ty(
+                "cyclic table type — a table's element type \
+                 may not contain the table itself (alm's element types are finite)",
+            ));
         }
         signal!(trace::TRACE_CHK_UNIFY);
         self.subs.insert(id, ty);
         Ok(())
     }
 
-    pub(super) fn unify(&mut self, expected: &Ty, actual: &Ty) -> Result<(), String> {
+    pub(super) fn unify(&mut self, expected: &Ty, actual: &Ty) -> Result<(), Diagnostic> {
         let expected = self.resolve(expected);
         let actual = self.resolve(actual);
         match (&expected, &actual) {
@@ -185,15 +187,15 @@ impl UnknownStore {
             // never join — static monomorphic dispatch needs the
             // singleton id held through the dataflow; a join of two
             // ids at one site is L2 (the fat cell), which is parked.
-            (Ty::Closure(a), Ty::Closure(b)) if a != b => {
-                Err("Type Error: divergent expansions cannot meet at one call".to_string())
-            }
+            (Ty::Closure(a), Ty::Closure(b)) if a != b => Err(Diagnostic::ty(
+                "divergent expansions cannot meet at one call",
+            )),
 
-            _ => Err(format!(
-                "Type Error: type conflict — {} vs {}",
+            _ => Err(Diagnostic::ty(format!(
+                "type conflict — {} vs {}",
                 type_name(&expected),
                 type_name(&actual)
-            )),
+            ))),
         }
     }
 }

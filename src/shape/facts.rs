@@ -1,5 +1,6 @@
 use super::core::LayoutVerdict;
 use crate::ast::{Expr, Stmt};
+use crate::diag::Diagnostic;
 use crate::shape::Ty;
 use alm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
@@ -286,7 +287,7 @@ pub struct ShapeFacts {
     pub ctor_lines: Vec<usize>,
     #[allow(dead_code)]
     pub adopt_lines: BTreeMap<String, usize>,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl ShapeFacts {
@@ -338,10 +339,13 @@ impl ShapeFacts {
                     {
                         signal!(trace::TRACE_ANALYZE_MISSING_VALUE);
                         let line = self.ctor_lines[row];
-                        self.diagnostics.push(format!(
-                            "line {line}: Type Error: a row of '{name}' is read before it is \
-                             ever given a value (table site #{row})"
-                        ));
+                        self.diagnostics.push(
+                            Diagnostic::ty(format!(
+                                "a row of '{name}' is read before it is \
+                                 ever given a value (table site #{row})"
+                            ))
+                            .with_site(Some(line)),
+                        );
                     }
                     if let Some(kids) = self.cell_children.get(&row) {
                         next.extend(kids.iter().copied());

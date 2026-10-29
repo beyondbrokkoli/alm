@@ -1,5 +1,6 @@
 use crate::shape::Ty;
 
+use crate::diag::Diagnostic;
 use crate::ir::{
     BlockId, Bool, CellGet, CellSet, CellSetFast, CmpRegs, DbgBind, EntryKind, Instruction, Int,
     IrProgram, MoveRegs, NumRegs, NumRegsRhs, PackRegs, PhiRegs, Ptr, Reg, RegKind, Repr,
@@ -307,7 +308,7 @@ fn scan_label_refs<'a>(line: &'a str, out: &mut Vec<&'a str>) {
     }
 }
 
-pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
+pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> {
     let mut globals = String::new();
     let mut dbg = DebugMeta::new(&program.source_file);
     let mut needs_dbg_value_decl = false;
@@ -771,21 +772,17 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<String>> {
                                 ));
                             }
                             Ty::Tbl(_) => {
-                                return Err(vec![
-                                    "Type Error: tables cannot be printed".to_string(),
-                                ]);
+                                return Err(vec![Diagnostic::ty("tables cannot be printed")]);
                             }
                             Ty::Ffi | Ty::FfiLib | Ty::Coro => {
-                                return Err(vec![
-                                    "Type Error: the module surfaces cannot be printed".to_string(),
-                                ]);
+                                return Err(vec![Diagnostic::ty(
+                                    "the module surfaces cannot be printed",
+                                )]);
                             }
                             // the checker's print reject owns closures —
                             // one never rides a print operand here
                             Ty::Closure(_) => {
-                                return Err(vec![
-                                    "Type Error: closures cannot be printed".to_string(),
-                                ]);
+                                return Err(vec![Diagnostic::ty("closures cannot be printed")]);
                             }
                             Ty::Unknown(_) => code.push_str("  call void @alm_print_int(i64 0)\n"),
                             // print operands carry resolved lowerer types —

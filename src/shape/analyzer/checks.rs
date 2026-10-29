@@ -6,17 +6,17 @@ impl Analyzer {
             let (_, bind) = self.resolve(rec, name)?;
             if bind.aliases.contains(&NULL_ROOT) && rec.on() {
                 signal!(rec.on(), trace::TRACE_CHK_TBL_NIL);
-                return Err(ShapeError(format!(
-                    "Lifetime Error: '{name}' may be nil here — table reads and \
+                return Err(ShapeError(Diagnostic::lifetime(format!(
+                    "'{name}' may be nil here — table reads and \
                      stores through a possibly-nil name are rejected at compile time"
-                )));
+                ))));
             }
             if bind.aliases.contains(&MOVED_ROOT) && rec.on() {
                 signal!(rec.on(), trace::TRACE_CHK_TBL_NIL);
-                return Err(ShapeError(format!(
-                    "Lifetime Error: '{name}' may be moved here — table reads and \
+                return Err(ShapeError(Diagnostic::lifetime(format!(
+                    "'{name}' may be moved here — table reads and \
                      stores through a possibly-moved name are rejected at compile time"
-                )));
+                ))));
             }
         }
         Ok(())
@@ -29,10 +29,10 @@ impl Analyzer {
                 return Ok(());
             }
             if pinned_scalar(&bind.ty) && !matches!(bind.ty, Pending) {
-                return Err(ShapeError(format!(
-                    "Type Error: '#' requires a Table, String, or Any operand — '{name}' is a \
+                return Err(ShapeError(Diagnostic::ty(format!(
+                    "'#' requires a Table, String, or Any operand — '{name}' is a \
                      scalar"
-                )));
+                ))));
             }
         }
         Ok(())
@@ -45,19 +45,19 @@ impl Analyzer {
                     && bind.aliases.contains(&NULL_ROOT)
                 {
                     signal!(rec.on(), trace::TRACE_CHK_TBL_NIL);
-                    return Err(ShapeError(format!(
-                        "Lifetime Error: '{name}' may be nil here — reads through a \
+                    return Err(ShapeError(Diagnostic::lifetime(format!(
+                        "'{name}' may be nil here — reads through a \
                          possibly-nil name are rejected at compile time"
-                    )));
+                    ))));
                 }
                 if let Ok((_, bind)) = self.resolve(rec, name)
                     && bind.aliases.contains(&MOVED_ROOT)
                 {
                     signal!(rec.on(), trace::TRACE_CHK_TBL_NIL);
-                    return Err(ShapeError(format!(
-                        "Lifetime Error: '{name}' may be moved here — reads through a \
+                    return Err(ShapeError(Diagnostic::lifetime(format!(
+                        "'{name}' may be moved here — reads through a \
                          possibly-moved name are rejected at compile time"
-                    )));
+                    ))));
                 }
             }
             Expr::TableCtor { entries, .. } => {

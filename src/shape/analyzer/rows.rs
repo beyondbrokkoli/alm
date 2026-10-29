@@ -317,11 +317,11 @@ impl Analyzer {
                         .iter()
                         .any(|&g| is_ghost(&g) && self.same_row(old, g))
                     {
-                        return Err(ShapeError(format!(
-                            "Lifetime Error: the row read into '{name}' is already owned by \
+                        return Err(ShapeError(Diagnostic::lifetime(format!(
+                            "the row read into '{name}' is already owned by \
                              '{n}' — one row has exactly one owning binding; read it through \
                              '{n}' instead"
-                        )));
+                        ))));
                     }
                 }
             }
@@ -341,21 +341,20 @@ impl Analyzer {
                 }
                 for &og in ts.aliases.iter().filter(|s| is_ghost(s)) {
                     if self.same_row(g, og) {
-                        return Err(ShapeError(format!(
-                            "Lifetime Error: the row read is already owned by '{n}' — one \
+                        return Err(ShapeError(Diagnostic::lifetime(format!(
+                            "the row read is already owned by '{n}' — one \
                              row has exactly one housing; store it through '{n}' instead"
-                        )));
+                        ))));
                     }
                 }
             }
         }
         for &h in &self.lattice.housed_ghosts {
             if h != g && self.same_row(g, h) {
-                return Err(ShapeError(
-                    "Lifetime Error: the row read is already housed in another cell — \
-                     one row has exactly one housing"
-                        .to_string(),
-                ));
+                return Err(ShapeError(Diagnostic::lifetime(
+                    "the row read is already housed in another cell — \
+                     one row has exactly one housing",
+                )));
             }
         }
         Ok(())

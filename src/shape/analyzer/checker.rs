@@ -34,6 +34,7 @@ use super::WalkState;
 use super::constraints::UnknownStore;
 use super::{calls_through_fn_var_msg, dotted_callee, value_call_msg};
 use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
+use crate::diag::Diagnostic;
 use crate::shape::ty::Ty;
 use alm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
@@ -119,7 +120,7 @@ pub(super) struct CheckFacts {
     pub index_key_lanes: BTreeMap<(*const Expr, *const Expr), KeyLane>,
     pub access_elems: BTreeMap<(*const Expr, *const Expr), Ty>,
     pub boundary_elem: Option<Ty>,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 pub(super) struct Checker {
@@ -207,7 +208,7 @@ pub(super) struct Checker {
     /// through the final store into `local_types` under the same key.
     bare_sites: BTreeMap<(*const Stmt, Option<*const Expr>, String), usize>,
     boundary_elem: Option<Ty>,
-    diagnostics: Vec<String>,
+    diagnostics: Vec<Diagnostic>,
     /// R15 (owner ruling 2026-10-26): true only while checking the
     /// DIRECT call expression of a `Stmt::Expr` — the procedure form,
     /// the one position where a valueless expansion may sit. The Call
@@ -481,14 +482,13 @@ impl Checker {
                     signal!(trace::TRACE_CHK_ANY_LEN);
                 }
                 other => {
-                    let msg = format!(
-                        "Type Error: '#' requires a Table, String, or Any operand, got {}",
-                        type_name(&other)
+                    self.diagnostics.push(
+                        Diagnostic::ty(format!(
+                            "'#' requires a Table, String, or Any operand, got {}",
+                            type_name(&other)
+                        ))
+                        .with_site(line),
                     );
-                    self.diagnostics.push(match line {
-                        Some(l) => format!("line {l}: {msg}"),
-                        None => msg,
-                    });
                 }
             }
         }
@@ -508,11 +508,10 @@ impl Checker {
                 return;
             }
             Ty::Tbl(_) => {
-                self.diagnostics.push(
-                    "Type Error: the boundary 'arg' table's cells hold scalars — \
-                     a table element cannot be inferred from 'arg[i]' usage"
-                        .to_string(),
-                );
+                self.diagnostics.push(Diagnostic::ty(
+                    "the boundary 'arg' table's cells hold scalars — \
+                     a table element cannot be inferred from 'arg[i]' usage",
+                ));
                 return;
             }
             Ty::Any => {
@@ -593,13 +592,13 @@ impl Checker {
     /// is held ONLY when the lattice view cannot reproduce it (e.g. a
     /// scalar derived from unresolved operands, whose walk binding stays
     /// Pending); everything else resolves through the view.
-    fn declare_var(&mut self, lat: &UnknownStore, name: String, ty: Ty) -> Result<(), String> {
+    fn declare_var(&mut self, lat: &UnknownStore, name: String, ty: Ty) -> Result<(), Diagnostic> {
         if let Some(frame) = self.frames.last_mut() {
             if frame.types.contains_key(&name) {
-                return Err(format!(
-                    "Scope Error: variable '{}' already declared in this scope",
+                return Err(Diagnostic::scope(format!(
+                    "variable '{}' already declared in this scope",
                     name
-                ));
+                )));
             }
             frame.types.insert(name, ty);
             return Ok(());
@@ -612,10 +611,10 @@ impl Checker {
                 || self.top.contains_key(&name)
                 || self.cur_decls.contains(&name))
         {
-            return Err(format!(
-                "Scope Error: variable '{}' already declared in this scope",
+            return Err(Diagnostic::scope(format!(
+                "variable '{}' already declared in this scope",
                 name
-            ));
+            )));
         }
         self.cur_decls.insert(name.clone());
         let (view, _) = self.view_type(lat, &name, &self.decl_snap);
@@ -677,7 +676,7 @@ impl Checker {
     /// captured names (override first — write-through); the top-level
     /// sequential delta shadows the view; everything else is the pure
     /// view over the walk's pre-statement state.
-    fn var_type(&mut self, lat: &mut UnknownStore, name: &str) -> Result<Ty, String> {
+    fn var_type(&mut self, lat: &mut UnknownStore, name: &str) -> Result<Ty, Diagnostic> {
         if let Some(ty) = self.frames_resolve(name) {
             return Ok(lat.resolve(&ty));
         }
@@ -694,7 +693,9 @@ impl Checker {
         if seed_read {
             self.seed_read = true;
         }
-        view.ok_or_else(|| format!("Scope Error: reference to undeclared variable '{}'", name))
+        view.ok_or_else(|| {
+            Diagnostic::scope(format!("reference to undeclared variable '{}'", name))
+        })
     }
 
     /// The quiet twin of `var_type` for call-dispatch attempts: a name
@@ -833,7 +834,11 @@ impl Checker {
         }
     }
 
-    pub(super) fn check_stmt(&mut self, lat: &mut UnknownStore, stmt: &Stmt) -> Result<(), String> {
+    pub(super) fn check_stmt(
+        &mut self,
+        lat: &mut UnknownStore,
+        stmt: &Stmt,
+    ) -> Result<(), Diagnostic> {
         self.cur_stmt = Some(stmt as *const Stmt);
         // the presence window for top-level declarations (frames cover
         // every nested call)
@@ -928,20 +933,20 @@ impl Checker {
                     // must be below top level — top-level names stay
                     // late reads, P3, and rebind freely).
                     if matches!(expected, Ty::Tbl(_)) {
-                        return Err(format!(
-                            "Type Error: '{name}' is a captured table — it cannot be \
+                        return Err(Diagnostic::ty(format!(
+                            "'{name}' is a captured table — it cannot be \
                              rebound inside its closure (mutate its cells, or rebind in \
                              the defining scope)"
-                        ));
+                        )));
                     }
                 }
                 if matches!(expr, Expr::Nil) {
                     if !matches!(expected, Ty::Tbl(_) | Ty::Unknown(_)) {
-                        return Err(format!(
-                            "Type Error: 'nil' releases tables — '{}' is of type {}",
+                        return Err(Diagnostic::ty(format!(
+                            "'nil' releases tables — '{}' is of type {}",
                             name,
                             type_name(&expected)
-                        ));
+                        )));
                     }
                     // the nil law: the name's type slot survives — hold
                     // the entry so later rebinds adopt against the
@@ -978,11 +983,10 @@ impl Checker {
                 // value enters a record's LITERAL fields only — computed
                 // cells carry scalars and tables, never faces.
                 if matches!(lat.resolve(&val_ty), Ty::Closure(_)) {
-                    return Err(
-                        "Type Error: a closure value enters only a record's literal \
-                         fields — computed cells carry scalars and tables"
-                            .to_string(),
-                    );
+                    return Err(Diagnostic::ty(
+                        "a closure value enters only a record's literal \
+                         fields — computed cells carry scalars and tables",
+                    ));
                 }
 
                 if matches!(lat.resolve(&elem), Ty::Any) {
@@ -991,25 +995,24 @@ impl Checker {
                             return Ok(());
                         }
                         Ty::Tbl(_) => {
-                            return Err(
-                                "Type Error: an Any table's cells hold scalars — a table value \
-                                 cannot enter a dynamic cell"
-                                    .to_string(),
-                            );
+                            return Err(Diagnostic::ty(
+                                "an Any table's cells hold scalars — a table value \
+                                 cannot enter a dynamic cell",
+                            ));
                         }
                         Ty::Ffi | Ty::FfiLib | Ty::Coro => {
-                            return Err("Type Error: an Any table's cells hold scalars — the ffi \
-                                 surface cannot enter a dynamic cell"
-                                .to_string());
+                            return Err(Diagnostic::ty(
+                                "an Any table's cells hold scalars — the ffi \
+                                 surface cannot enter a dynamic cell",
+                            ));
                         }
                         // unreachable in practice: the closure reject above
                         // fired — the arm keeps the match total
                         Ty::Closure(_) => {
-                            return Err(
-                                "Type Error: a closure value enters only a record's literal \
-                                 fields — computed cells carry scalars and tables"
-                                    .to_string(),
-                            );
+                            return Err(Diagnostic::ty(
+                                "a closure value enters only a record's literal \
+                                 fields — computed cells carry scalars and tables",
+                            ));
                         }
                         // flow state never rides a resolved checker type —
                         // the elems table materializes it before this half
@@ -1048,7 +1051,7 @@ impl Checker {
             }
             Stmt::Break { .. } => {
                 if self.loop_depth == 0 {
-                    return Err("Type Error: 'break' outside of loop".to_string());
+                    return Err(Diagnostic::ty("'break' outside of loop"));
                 }
             }
             Stmt::If {
@@ -1078,15 +1081,15 @@ impl Checker {
                 for e in exprs {
                     let ty = self.check_expr(lat, e)?;
                     if matches!(ty, Ty::Tbl(_)) {
-                        return Err("Type Error: cannot print a table — print its cells instead"
-                            .to_string());
+                        return Err(Diagnostic::ty(
+                            "cannot print a table — print its cells instead",
+                        ));
                     }
                     if matches!(ty, Ty::Closure(_)) {
-                        return Err(
-                            "Type Error: cannot print a closure — call it, alias it, or \
-                             store it in a record field"
-                                .to_string(),
-                        );
+                        return Err(Diagnostic::ty(
+                            "cannot print a closure — call it, alias it, or \
+                             store it in a record field",
+                        ));
                     }
                 }
             }
@@ -1111,19 +1114,18 @@ impl Checker {
                             // host — a closure field would smuggle this
                             // module's heap state across.
                             if self.carries_closure(expr) {
-                                return Err(
-                                    "Type Error: a closure cannot cross a module boundary — \
-                                     the boundary 'return' marshals flat cells only"
-                                        .to_string(),
-                                );
+                                return Err(Diagnostic::ty(
+                                    "a closure cannot cross a module boundary — \
+                                     the boundary 'return' marshals flat cells only",
+                                ));
                             }
                         }
                         other => {
-                            return Err(format!(
-                                "Type Error: 'return' hands a value to the host — \
+                            return Err(Diagnostic::ty(format!(
+                                "'return' hands a value to the host — \
                                      return a table (or nil for null), got {}",
                                 type_name(&other)
-                            ));
+                            )));
                         }
                     },
                 },
@@ -1131,10 +1133,11 @@ impl Checker {
                     let expr = match value {
                         Some(expr) if !matches!(expr, Expr::Nil) => expr,
                         _ => {
-                            return Err("Type Error: an internal 'return' carries a value — \
+                            return Err(Diagnostic::ty(
+                                "an internal 'return' carries a value — \
                                      the bare and nil forms belong to the script's host \
-                                     boundary"
-                                .to_string());
+                                     boundary",
+                            ));
                         }
                     };
                     let actual = self.check_expr(lat, expr)?;
@@ -1166,7 +1169,7 @@ impl Checker {
         &mut self,
         lat: &mut UnknownStore,
         obj: &Expr,
-    ) -> Result<(Ty, String), String> {
+    ) -> Result<(Ty, String), Diagnostic> {
         let ty = self.check_expr(lat, obj)?;
         match ty {
             Ty::Tbl(elem) => {
@@ -1181,10 +1184,10 @@ impl Checker {
                     .insert((obj as *const Expr, site), (*elem).clone());
                 Ok((*elem, desc))
             }
-            _ => Err(format!(
-                "Type Error: cannot index {} — only tables support '[]'",
+            _ => Err(Diagnostic::ty(format!(
+                "cannot index {} — only tables support '[]'",
                 type_name(&ty)
-            )),
+            ))),
         }
     }
 
@@ -1194,7 +1197,7 @@ impl Checker {
     /// is NOT an error — the negative no-op is pinned language contract
     /// (soundness_edge_gauntlet S6, ctor_expr_keys): the store drops, the
     /// read answers the element zero.
-    fn check_index_key(&mut self, lat: &mut UnknownStore, key: &Expr) -> Result<Ty, String> {
+    fn check_index_key(&mut self, lat: &mut UnknownStore, key: &Expr) -> Result<Ty, Diagnostic> {
         let key_ty = self.check_expr(lat, key)?;
         let key_ty = lat.resolve(&key_ty);
         let key_ty = if let Ty::Unknown(id) = key_ty {
@@ -1205,11 +1208,11 @@ impl Checker {
         };
         if key_ty != Ty::Int && key_ty != Ty::Str {
             let note = self.any_provenance_note(lat, &key_ty, key);
-            return Err(format!(
-                "Type Error: table index must be an Integer or a String, got {}{}",
+            return Err(Diagnostic::ty(format!(
+                "table index must be an Integer or a String, got {}{}",
                 type_name(&key_ty),
                 note.unwrap_or_default()
-            ));
+            )));
         }
         if key_ty == Ty::Str {
             signal!(trace::TRACE_CHK_STRKEY);
@@ -1245,15 +1248,14 @@ impl Checker {
         obj: &Expr,
         name: &str,
         args: &[Expr],
-    ) -> Result<Ty, String> {
+    ) -> Result<Ty, Diagnostic> {
         let base = match obj {
             Expr::Identifier(n) => n.clone(),
             _ => {
-                return Err(
-                    "Type Error: the ffi surface's '.' base must be a name — a bound \
-                     module or library handle"
-                        .to_string(),
-                );
+                return Err(Diagnostic::ty(
+                    "the ffi surface's '.' base must be a name — a bound \
+                     module or library handle",
+                ));
             }
         };
         let raw = self.check_expr(lat, obj)?;
@@ -1262,7 +1264,7 @@ impl Checker {
             Ty::Ffi => match name {
                 "load" => {
                     if args.len() != 1 {
-                        return Err("Type Error: ffi.load takes exactly one path".to_string());
+                        return Err(Diagnostic::ty("ffi.load takes exactly one path"));
                     }
                     let t = self.check_expr(lat, &args[0])?;
                     let t = lat.resolve(&t);
@@ -1277,22 +1279,19 @@ impl Checker {
                             self.record_verb(call, FfiVerb::Load);
                             Ok(Ty::FfiLib)
                         }
-                        other => Err(format!(
-                            "Type Error: ffi.load's path is a String, got {}",
+                        other => Err(Diagnostic::ty(format!(
+                            "ffi.load's path is a String, got {}",
                             type_name(&other)
-                        )),
+                        ))),
                     }
                 }
-                "cdef" => Err(
-                    "Type Error: ffi.cdef is a statement verb — call it on its own line; its \
-                     nothing cannot bind"
-                        .to_string(),
-                ),
+                "cdef" => Err(Diagnostic::ty(
+                    "ffi.cdef is a statement verb — call it on its own line; its \
+                     nothing cannot bind",
+                )),
                 "arg_kind" => {
                     if args.len() != 1 {
-                        return Err(
-                            "Type Error: ffi.arg_kind takes exactly one library".to_string()
-                        );
+                        return Err(Diagnostic::ty("ffi.arg_kind takes exactly one library"));
                     }
                     let raw = self.check_expr(lat, &args[0])?;
                     let t = lat.resolve(&raw);
@@ -1301,173 +1300,170 @@ impl Checker {
                             self.record_verb(call, FfiVerb::ArgKind);
                             Ok(Ty::Int)
                         }
-                        other => Err(format!(
-                            "Type Error: ffi.arg_kind takes a library handle, got {}",
+                        other => Err(Diagnostic::ty(format!(
+                            "ffi.arg_kind takes a library handle, got {}",
                             type_name(&other)
-                        )),
+                        ))),
                     }
                 }
-                _ => Err(format!(
-                    "Type Error: unknown ffi member '{name}' — load, cdef, arg_kind"
-                )),
+                _ => Err(Diagnostic::ty(format!(
+                    "unknown ffi member '{name}' — load, cdef, arg_kind"
+                ))),
             },
-            Ty::Coro => {
-                match name {
-                    "create" => {
-                        if args.len() != 1 {
-                            return Err("Type Error: coroutine.create takes exactly one library"
-                                .to_string());
+            Ty::Coro => match name {
+                "create" => {
+                    if args.len() != 1 {
+                        return Err(Diagnostic::ty("coroutine.create takes exactly one library"));
+                    }
+                    let raw = self.check_expr(lat, &args[0])?;
+                    let t = lat.resolve(&raw);
+                    match t {
+                        Ty::FfiLib => {
+                            self.record_verb(call, FfiVerb::CoroCreate);
+                            Ok(Ty::Int)
                         }
-                        let raw = self.check_expr(lat, &args[0])?;
-                        let t = lat.resolve(&raw);
-                        match t {
-                            Ty::FfiLib => {
-                                self.record_verb(call, FfiVerb::CoroCreate);
-                                Ok(Ty::Int)
-                            }
-                            other => Err(format!(
-                                "Type Error: coroutine.create takes a library handle, got {}",
-                                type_name(&other),
-                            )),
+                        other => Err(Diagnostic::ty(format!(
+                            "coroutine.create takes a library handle, got {}",
+                            type_name(&other),
+                        ))),
+                    }
+                }
+                "resume" => {
+                    if args.len() != 2 {
+                        return Err(Diagnostic::ty(
+                            "coroutine.resume takes a coroutine handle and one \
+                             table — the spawn inputs (its first three cells ride the \
+                             worker's boundary)",
+                        ));
+                    }
+                    let raw = self.check_expr(lat, &args[0])?;
+                    let t = lat.resolve(&raw);
+                    let t = if let Ty::Unknown(id) = t {
+                        lat.bind(id, Ty::Int)?;
+                        Ty::Int
+                    } else {
+                        t
+                    };
+                    match t {
+                        Ty::Int => {}
+                        other => {
+                            return Err(Diagnostic::ty(format!(
+                                "coroutine.resume's first argument is a \
+                                 coroutine handle, got {}",
+                                type_name(&other)
+                            )));
                         }
                     }
-                    "resume" => {
-                        if args.len() != 2 {
-                            return Err(
-                                "Type Error: coroutine.resume takes a coroutine handle and one \
-                             table — the spawn inputs (its first three cells ride the \
-                             worker's boundary)"
-                                    .to_string(),
-                            );
-                        }
-                        let raw = self.check_expr(lat, &args[0])?;
-                        let t = lat.resolve(&raw);
-                        let t = if let Ty::Unknown(id) = t {
-                            lat.bind(id, Ty::Int)?;
-                            Ty::Int
-                        } else {
-                            t
-                        };
-                        match t {
-                            Ty::Int => {}
-                            other => {
-                                return Err(format!(
-                                    "Type Error: coroutine.resume's first argument is a \
-                                 coroutine handle, got {}",
-                                    type_name(&other)
+                    let raw = self.check_expr(lat, &args[1])?;
+                    let t = lat.resolve(&raw);
+                    match t {
+                        Ty::Tbl(_) => {
+                            if self.carries_closure(&args[1]) {
+                                return Err(Diagnostic::ty(
+                                    "a closure cannot cross a module \
+                                         boundary — the spawn table marshals flat cells only",
                                 ));
                             }
+                            self.record_verb(call, FfiVerb::CoroResume);
+                            Ok(Ty::Int)
                         }
-                        let raw = self.check_expr(lat, &args[1])?;
-                        let t = lat.resolve(&raw);
-                        match t {
-                            Ty::Tbl(_) => {
-                                if self.carries_closure(&args[1]) {
-                                    return Err("Type Error: a closure cannot cross a module \
-                                         boundary — the spawn table marshals flat cells only"
-                                        .to_string());
-                                }
-                                self.record_verb(call, FfiVerb::CoroResume);
-                                Ok(Ty::Int)
-                            }
-                            other => Err(format!(
-                                "Type Error: coroutine.resume's second argument is the input \
+                        other => Err(Diagnostic::ty(format!(
+                            "coroutine.resume's second argument is the input \
                                  table, got {}",
-                                type_name(&other),
-                            )),
-                        }
+                            type_name(&other),
+                        ))),
                     }
-                    "yield" => {
-                        if args.len() != 1 {
-                            return Err(
-                                "Type Error: coroutine.yield takes exactly one integer".to_string()
-                            );
-                        }
-                        let raw = self.check_expr(lat, &args[0])?;
-                        let t = lat.resolve(&raw);
-                        let t = if let Ty::Unknown(id) = t {
-                            lat.bind(id, Ty::Int)?;
-                            Ty::Int
-                        } else {
-                            t
-                        };
-                        match t {
-                            Ty::Int => {
-                                self.record_verb(call, FfiVerb::CoroYield);
-                                Ok(Ty::Int)
-                            }
-                            other => Err(format!(
-                                "Type Error: coroutine.yield streams one integer, got {}",
-                                type_name(&other),
-                            )),
-                        }
-                    }
-                    "status" => {
-                        if args.len() != 1 {
-                            return Err("Type Error: coroutine.status takes exactly one coroutine"
-                                .to_string());
-                        }
-                        let raw = self.check_expr(lat, &args[0])?;
-                        let t = lat.resolve(&raw);
-                        let t = if let Ty::Unknown(id) = t {
-                            lat.bind(id, Ty::Int)?;
-                            Ty::Int
-                        } else {
-                            t
-                        };
-                        match t {
-                            Ty::Int => {
-                                self.record_verb(call, FfiVerb::CoroStatus);
-                                Ok(Ty::Str)
-                            }
-                            other => Err(format!(
-                                "Type Error: coroutine.status takes a coroutine handle, got {}",
-                                type_name(&other),
-                            )),
-                        }
-                    }
-                    "close" => {
-                        if args.len() != 1 {
-                            return Err("Type Error: coroutine.close takes exactly one coroutine"
-                                .to_string());
-                        }
-                        let raw = self.check_expr(lat, &args[0])?;
-                        let t = lat.resolve(&raw);
-                        let t = if let Ty::Unknown(id) = t {
-                            lat.bind(id, Ty::Int)?;
-                            Ty::Int
-                        } else {
-                            t
-                        };
-                        match t {
-                            Ty::Int => {
-                                self.record_verb(call, FfiVerb::CoroClose);
-                                Ok(Ty::Int)
-                            }
-                            other => Err(format!(
-                                "Type Error: coroutine.close takes a coroutine handle, got {}",
-                                type_name(&other),
-                            )),
-                        }
-                    }
-                    _ => Err(format!(
-                        "Type Error: unknown coroutine member '{name}' — create, resume, yield, \
-                     status, close"
-                    )),
                 }
-            }
-            Ty::FfiLib => Err(format!(
-                "Type Error: {base}.{name} is the drive verb — a statement on its own line; \
+                "yield" => {
+                    if args.len() != 1 {
+                        return Err(Diagnostic::ty("coroutine.yield takes exactly one integer"));
+                    }
+                    let raw = self.check_expr(lat, &args[0])?;
+                    let t = lat.resolve(&raw);
+                    let t = if let Ty::Unknown(id) = t {
+                        lat.bind(id, Ty::Int)?;
+                        Ty::Int
+                    } else {
+                        t
+                    };
+                    match t {
+                        Ty::Int => {
+                            self.record_verb(call, FfiVerb::CoroYield);
+                            Ok(Ty::Int)
+                        }
+                        other => Err(Diagnostic::ty(format!(
+                            "coroutine.yield streams one integer, got {}",
+                            type_name(&other),
+                        ))),
+                    }
+                }
+                "status" => {
+                    if args.len() != 1 {
+                        return Err(Diagnostic::ty(
+                            "coroutine.status takes exactly one coroutine",
+                        ));
+                    }
+                    let raw = self.check_expr(lat, &args[0])?;
+                    let t = lat.resolve(&raw);
+                    let t = if let Ty::Unknown(id) = t {
+                        lat.bind(id, Ty::Int)?;
+                        Ty::Int
+                    } else {
+                        t
+                    };
+                    match t {
+                        Ty::Int => {
+                            self.record_verb(call, FfiVerb::CoroStatus);
+                            Ok(Ty::Str)
+                        }
+                        other => Err(Diagnostic::ty(format!(
+                            "coroutine.status takes a coroutine handle, got {}",
+                            type_name(&other),
+                        ))),
+                    }
+                }
+                "close" => {
+                    if args.len() != 1 {
+                        return Err(Diagnostic::ty(
+                            "coroutine.close takes exactly one coroutine",
+                        ));
+                    }
+                    let raw = self.check_expr(lat, &args[0])?;
+                    let t = lat.resolve(&raw);
+                    let t = if let Ty::Unknown(id) = t {
+                        lat.bind(id, Ty::Int)?;
+                        Ty::Int
+                    } else {
+                        t
+                    };
+                    match t {
+                        Ty::Int => {
+                            self.record_verb(call, FfiVerb::CoroClose);
+                            Ok(Ty::Int)
+                        }
+                        other => Err(Diagnostic::ty(format!(
+                            "coroutine.close takes a coroutine handle, got {}",
+                            type_name(&other),
+                        ))),
+                    }
+                }
+                _ => Err(Diagnostic::ty(format!(
+                    "unknown coroutine member '{name}' — create, resume, yield, \
+                     status, close"
+                ))),
+            },
+            Ty::FfiLib => Err(Diagnostic::ty(format!(
+                "{base}.{name} is the drive verb — a statement on its own line; \
                  the module's result stays in the module's world, nothing comes back to bind"
-            )),
-            _ => Err(format!(
-                "Type Error: '{base}' is not a module surface — '.' is the ffi/coroutine \
+            ))),
+            _ => Err(Diagnostic::ty(format!(
+                "'{base}' is not a module surface — '.' is the ffi/coroutine \
                  surface's, tables use '[]'"
-            )),
+            ))),
         }
     }
 
-    fn check_ffi_verb(&mut self, lat: &mut UnknownStore, expr: &Expr) -> Result<bool, String> {
+    fn check_ffi_verb(&mut self, lat: &mut UnknownStore, expr: &Expr) -> Result<bool, Diagnostic> {
         let Expr::Call { callee, args } = expr else {
             return Ok(false);
         };
@@ -1482,9 +1478,9 @@ impl Checker {
         match (&bt, name.as_str()) {
             (Ty::Ffi, "cdef") => {
                 if args.len() != 1 {
-                    return Err(
-                        "Type Error: ffi.cdef takes exactly one declaration string".to_string()
-                    );
+                    return Err(Diagnostic::ty(
+                        "ffi.cdef takes exactly one declaration string",
+                    ));
                 }
                 let raw = self.check_expr(lat, &args[0])?;
                 let t = lat.resolve(&raw);
@@ -1493,18 +1489,18 @@ impl Checker {
                         self.record_verb(expr, FfiVerb::Cdef);
                         Ok(true)
                     }
-                    other => Err(format!(
-                        "Type Error: ffi.cdef's declaration is a String, got {}",
+                    other => Err(Diagnostic::ty(format!(
+                        "ffi.cdef's declaration is a String, got {}",
                         type_name(&other)
-                    )),
+                    ))),
                 }
             }
             (Ty::FfiLib, _) => {
                 if args.len() != 1 {
-                    return Err(format!(
-                        "Type Error: the drive call .{name} takes exactly one table — the \
+                    return Err(Diagnostic::ty(format!(
+                        "the drive call .{name} takes exactly one table — the \
                          boundary the module reads"
-                    ));
+                    )));
                 }
                 let raw = self.check_expr(lat, &args[0])?;
                 let t = lat.resolve(&raw);
@@ -1514,9 +1510,10 @@ impl Checker {
                         // table into the target process's heap — a closure
                         // field cannot ride it.
                         if self.carries_closure(&args[0]) {
-                            return Err("Type Error: a closure cannot cross a module boundary — \
-                                 the drive table marshals flat cells only"
-                                .to_string());
+                            return Err(Diagnostic::ty(
+                                "a closure cannot cross a module boundary — \
+                                 the drive table marshals flat cells only",
+                            ));
                         }
                         self.record_verb(
                             expr,
@@ -1527,10 +1524,10 @@ impl Checker {
                         );
                         Ok(true)
                     }
-                    other => Err(format!(
-                        "Type Error: the drive call .{name} takes one table, got {}",
+                    other => Err(Diagnostic::ty(format!(
+                        "the drive call .{name} takes one table, got {}",
                         type_name(&other)
-                    )),
+                    ))),
                 }
             }
             _ => Ok(false),
@@ -1542,17 +1539,17 @@ impl Checker {
         lat: &mut UnknownStore,
         condition: &Expr,
         kw: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         let ty = self.check_expr(lat, condition)?;
         let ty = self.pin_bool(lat, &ty)?;
         if ty != Ty::Bool {
             let note = self.any_provenance_note(lat, &ty, condition);
-            return Err(format!(
-                "Type Error: '{}' condition must be a Boolean, got {}{}",
+            return Err(Diagnostic::ty(format!(
+                "'{}' condition must be a Boolean, got {}{}",
                 kw,
                 type_name(&ty),
                 note.unwrap_or_default()
-            ));
+            )));
         }
         Ok(())
     }
@@ -1571,18 +1568,18 @@ impl Checker {
         expr: &Expr,
         name: &str,
         ptr: *const Expr,
-    ) -> Result<Ty, String> {
+    ) -> Result<Ty, Diagnostic> {
         if self.inline_stack.contains(&ptr) {
-            return Err(format!(
-                "Type Error: '{name}' cannot escape its own expansion — \
+            return Err(Diagnostic::ty(format!(
+                "'{name}' cannot escape its own expansion — \
                  a closure cannot capture itself"
-            ));
+            )));
         }
         if self.cond_depth > 0 {
-            return Err(format!(
-                "Type Error: '{name}' cannot be created inside a conditional arm \
+            return Err(Diagnostic::ty(format!(
+                "'{name}' cannot be created inside a conditional arm \
                  or loop body — creations are straight-line (V1)"
-            ));
+            )));
         }
         let caps = self.ctx.fn_captures.get(&ptr).cloned().unwrap_or_default();
         let mut face: BTreeMap<String, Ty> = BTreeMap::new();
@@ -1601,10 +1598,10 @@ impl Checker {
                             lat.unify(p, t)?;
                         }
                         None => {
-                            return Err(format!(
+                            return Err(Diagnostic::desync(format!(
                                 "Type Error: '{name}' has no capture '{n}' at an earlier \
                                  creation site — the checker and the analyzer disagree"
-                            ));
+                            )));
                         }
                     }
                 }
@@ -1621,13 +1618,12 @@ impl Checker {
     /// the read would carry an untracked second free at its own scope
     /// exit, so a face read feeds only the escape positions — a call
     /// argument, a return, a literal record field — never a name.
-    fn reject_face_extraction(expr: &Expr, ty: &Ty) -> Result<(), String> {
+    fn reject_face_extraction(expr: &Expr, ty: &Ty) -> Result<(), Diagnostic> {
         if matches!(expr, Expr::Field { .. }) && matches!(ty, Ty::Closure(_)) {
-            return Err(
-                "Type Error: the face rides the field — a closure field cannot be \
-                 extracted into a name; call it through the record"
-                    .to_string(),
-            );
+            return Err(Diagnostic::ty(
+                "the face rides the field — a closure field cannot be \
+                 extracted into a name; call it through the record",
+            ));
         }
         Ok(())
     }
@@ -1674,7 +1670,7 @@ impl Checker {
         false
     }
 
-    fn check_expr(&mut self, lat: &mut UnknownStore, expr: &Expr) -> Result<Ty, String> {
+    fn check_expr(&mut self, lat: &mut UnknownStore, expr: &Expr) -> Result<Ty, Diagnostic> {
         match expr {
             Expr::Integer(_) => Ok(Ty::Int),
             Expr::Float(_) => Ok(Ty::Flt),
@@ -1682,11 +1678,10 @@ impl Checker {
             Expr::String(_) => Ok(Ty::Str),
             Expr::Nil => {
                 signal!(trace::TRACE_CHK_NIL_EXPR);
-                Err(
-                    "Type Error: 'nil' is only valid as the right-hand side of 't = nil' — \
-                     it releases a table's memory, it is not a value"
-                        .to_string(),
-                )
+                Err(Diagnostic::ty(
+                    "'nil' is only valid as the right-hand side of 't = nil' — \
+                     it releases a table's memory, it is not a value",
+                ))
             }
             Expr::TableCtor { entries, .. } => {
                 let elem = self.elem_of(lat, expr);
@@ -1711,11 +1706,10 @@ impl Checker {
                         }
                     }
                     if has_int_key && has_str_key {
-                        return Err(
-                            "Type Error: mixed array and record constructor elements — a \
-                             constructor is an array or a record, never both"
-                                .to_string(),
-                        );
+                        return Err(Diagnostic::ty(
+                            "mixed array and record constructor elements — a \
+                             constructor is an array or a record, never both",
+                        ));
                     }
                     let ty = self.check_expr(lat, e)?;
                     // W3a, R3 (the record-face rule): a closure-valued
@@ -1726,20 +1720,20 @@ impl Checker {
                         match key {
                             CtorKey::Str(field) => {
                                 let Some(&site) = self.ctx.sites.get(&(expr as *const Expr)) else {
-                                    return Err(
+                                    return Err(Diagnostic::desync(
                                         "Type Error: a closure field's constructor carries no \
-                                         site — the checker and the analyzer disagree"
-                                            .to_string(),
-                                    );
+                                         site — the checker and the analyzer disagree",
+                                    ));
                                 };
                                 self.closure_fields.insert((site, field.clone()), ptr);
                                 continue;
                             }
                             _ => {
-                                return Err("Type Error: a closure value enters only a record's \
+                                return Err(Diagnostic::ty(
+                                    "a closure value enters only a record's \
                                      literal fields — array cells and computed keys carry \
-                                     scalars and tables"
-                                    .to_string());
+                                     scalars and tables",
+                                ));
                             }
                         }
                     }
@@ -1758,11 +1752,11 @@ impl Checker {
                     } else if ty != elem {
                         if matches!(elem, Ty::Any) {
                             if matches!(ty, Ty::Tbl(_)) {
-                                return Err(format!(
-                                    "Type Error: an Any table's cells hold scalars — a table \
+                                return Err(Diagnostic::ty(format!(
+                                    "an Any table's cells hold scalars — a table \
                                      value cannot enter a dynamic cell ({} after Any)",
                                     type_name(&ty)
-                                ));
+                                )));
                             }
                             if matches!(ty, Ty::Unknown(_)) {
                                 lat.unify(&elem, &ty)?;
@@ -1772,11 +1766,11 @@ impl Checker {
                         lat.unify(&elem, &ty)?;
                         let resolved = lat.resolve(&ty);
                         if resolved != lat.resolve(&elem) {
-                            return Err(format!(
-                                "Type Error: mixed table constructor elements — {} after {}",
+                            return Err(Diagnostic::ty(format!(
+                                "mixed table constructor elements — {} after {}",
                                 type_name(&ty),
                                 type_name(&elem)
-                            ));
+                            )));
                         }
                     }
                 }
@@ -1801,11 +1795,11 @@ impl Checker {
                     match lat.resolve(&elem) {
                         Ty::Int | Ty::Flt | Ty::Str | Ty::Unknown(_) | Ty::Pending => {}
                         other => {
-                            return Err(format!(
-                                "Type Error: a closure record's non-closure fields are 8-byte \
+                            return Err(Diagnostic::ty(format!(
+                                "a closure record's non-closure fields are 8-byte \
                                  scalars (Int/Flt/Str) — its element type is {}",
                                 type_name(&other)
-                            ));
+                            )));
                         }
                     }
                 }
@@ -1843,13 +1837,13 @@ impl Checker {
                         if l == Ty::Bool && r == Ty::Bool {
                             Ok(Ty::Bool)
                         } else {
-                            Err(format!(
-                                "Type Error: '{}' requires Boolean operands on both sides",
+                            Err(Diagnostic::ty(format!(
+                                "'{}' requires Boolean operands on both sides",
                                 match op {
                                     BinOp::And => "and",
                                     _ => "or",
                                 }
-                            ))
+                            )))
                         }
                     }
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::IntDiv | BinOp::Mod => {
@@ -1863,10 +1857,10 @@ impl Checker {
                             let note = self
                                 .any_provenance_note(lat, &l, left)
                                 .or_else(|| self.any_provenance_note(lat, &r, right));
-                            return Err(format!(
-                                "Type Error: '/' requires numeric operands{}",
+                            return Err(Diagnostic::ty(format!(
+                                "'/' requires numeric operands{}",
                                 note.unwrap_or_default()
-                            ));
+                            )));
                         }
                         Ok(Ty::Flt)
                     }
@@ -1883,14 +1877,14 @@ impl Checker {
                             return Ok(Ty::Bool);
                         }
                         if l == Ty::Str || r == Ty::Str {
-                            return Err(format!(
-                                "Type Error: '{}' compares String with {}",
+                            return Err(Diagnostic::ty(format!(
+                                "'{}' compares String with {}",
                                 match op {
                                     BinOp::Equal => "==",
                                     _ => "~=",
                                 },
                                 type_name(if l == Ty::Str { &r } else { &l })
-                            ));
+                            )));
                         }
                         let l_unk = matches!(l, Ty::Unknown(_));
                         let r_unk = matches!(r, Ty::Unknown(_));
@@ -1898,22 +1892,21 @@ impl Checker {
                             && (self.is_boundary_chained(lat, &l)
                                 || self.is_boundary_chained(lat, &r))
                         {
-                            return Err(
-                                "Type Error: '==' compares a boundary cell with a table — \
-                                 boundary cells hold scalars"
-                                    .to_string(),
-                            );
+                            return Err(Diagnostic::ty(
+                                "'==' compares a boundary cell with a table — \
+                                 boundary cells hold scalars",
+                            ));
                         }
                         if !types_compatible(&l, &r) {
-                            return Err(format!(
-                                "Type Error: '{}' compares {} with {}",
+                            return Err(Diagnostic::ty(format!(
+                                "'{}' compares {} with {}",
                                 match op {
                                     BinOp::Equal => "==",
                                     _ => "~=",
                                 },
                                 type_name(&l),
                                 type_name(&r)
-                            ));
+                            )));
                         }
                         Ok(Ty::Bool)
                     }
@@ -1932,16 +1925,14 @@ impl Checker {
                         };
                         match t {
                             Ty::Int | Ty::Flt => Ok(t),
-                            _ => {
-                                Err("Type Error: unary '-' requires a numeric operand".to_string())
-                            }
+                            _ => Err(Diagnostic::ty("unary '-' requires a numeric operand")),
                         }
                     }
                     UnOp::Not => {
                         let t = self.pin_bool(lat, &t)?;
                         match t {
                             Ty::Bool => Ok(Ty::Bool),
-                            _ => Err("Type Error: 'not' requires a Boolean operand".to_string()),
+                            _ => Err(Diagnostic::ty("'not' requires a Boolean operand")),
                         }
                     }
                     UnOp::Len => match lat.resolve(&t) {
@@ -1957,10 +1948,10 @@ impl Checker {
                             self.len_deferrals.push((unknown, line));
                             Ok(Ty::Int)
                         }
-                        _ => Err(format!(
-                            "Type Error: '#' requires a Table, String, or Any operand, got {}",
+                        _ => Err(Diagnostic::ty(format!(
+                            "'#' requires a Table, String, or Any operand, got {}",
                             type_name(&t)
-                        )),
+                        ))),
                     },
                 }
             }
@@ -1995,17 +1986,16 @@ impl Checker {
                             .insert((obj.as_ref() as *const Expr, site), (*elem).clone());
                         Ok(*elem)
                     }
-                    other => Err(format!(
-                        "Type Error: dot access needs a record or the ffi surface, got {}",
+                    other => Err(Diagnostic::ty(format!(
+                        "dot access needs a record or the ffi surface, got {}",
                         type_name(&other)
-                    )),
+                    ))),
                 }
             }
-            Expr::Function { .. } => Err(
-                "Type Error: a function value binds directly to a variable — \
-                 'local f = function(a, b) ... end'"
-                    .to_string(),
-            ),
+            Expr::Function { .. } => Err(Diagnostic::ty(
+                "a function value binds directly to a variable — \
+                 'local f = function(a, b) ... end'",
+            )),
             Expr::Call { callee, args } => {
                 let name = match callee.as_ref() {
                     Expr::Identifier(n) => n.clone(),
@@ -2097,12 +2087,12 @@ impl Checker {
         fn_ptr: *const Expr,
         call_through: bool,
         args: &[Expr],
-    ) -> Result<Ty, String> {
+    ) -> Result<Ty, Diagnostic> {
         if self.inline_stack.contains(&fn_ptr) {
-            return Err(format!(
-                "Type Error: '{name}' is recursive — inline closures expand at \
+            return Err(Diagnostic::ty(format!(
+                "'{name}' is recursive — inline closures expand at \
                  their call sites, so a call chain may not reach back into itself"
-            ));
+            )));
         }
         if !call_through {
             // W3a's capture guard (the direct-call half): a fn with a
@@ -2118,25 +2108,25 @@ impl Checker {
                         && self.active_env_override(cap).is_none()
                         && self.active_env_face(cap).is_none()
                     {
-                        return Err(format!(
-                            "Type Error: '{name}' is a closure — call it through its value"
-                        ));
+                        return Err(Diagnostic::ty(format!(
+                            "'{name}' is a closure — call it through its value"
+                        )));
                     }
                 }
             }
         }
         let def = self.fn_defs.get(&fn_ptr).cloned().ok_or_else(|| {
-            format!(
+            Diagnostic::desync(format!(
                 "Type Error: '{name}' holds no function body — \
                      the checker and the analyzer disagree"
-            )
+            ))
         })?;
         if args.len() != def.params.len() {
-            return Err(format!(
-                "Type Error: '{name}' takes {} argument(s), got {}",
+            return Err(Diagnostic::ty(format!(
+                "'{name}' takes {} argument(s), got {}",
                 def.params.len(),
                 args.len()
-            ));
+            )));
         }
         let mut arg_tys = Vec::with_capacity(args.len());
         let stmt_position = std::mem::take(&mut self.stmt_position_call);
@@ -2167,11 +2157,11 @@ impl Checker {
                     }
                     let want = type_name(&lat.resolve(f));
                     let got = type_name(&lat.resolve(a));
-                    return Err(format!(
-                        "Type Error: argument {} of '{name}' is {got} where \
+                    return Err(Diagnostic::ty(format!(
+                        "argument {} of '{name}' is {got} where \
                                  the first call fixed {want} — calls are monomorphic",
                         i + 1
-                    ));
+                    )));
                 }
             }
         }
@@ -2185,10 +2175,10 @@ impl Checker {
         // valueless: its fall-off path answers the R13 typed zero
         // by the Store Window Law.
         if !stmt_position && !body_has_valued_return(body) {
-            return Err(format!(
-                "Type Error: '{name}' is an expansion with no return — \
+            return Err(Diagnostic::ty(format!(
+                "'{name}' is an expansion with no return — \
                  it produces no value"
-            ));
+            )));
         }
 
         // the per-instantiation fact key: the OUTERMOST expansion
@@ -2208,10 +2198,10 @@ impl Checker {
                     .map(|(n, t)| (n.clone(), lat.resolve(t)))
                     .collect(),
                 None => {
-                    return Err(format!(
+                    return Err(Diagnostic::desync(format!(
                         "Type Error: '{name}' dispatches with no recorded env — \
                          the checker and the analyzer disagree"
-                    ));
+                    )));
                 }
             }
         } else {
@@ -2264,14 +2254,11 @@ impl Checker {
         for stmt in stmts {
             if let Err(msg) = self.check_stmt(lat, stmt) {
                 signal!(trace::TRACE_GHOST_BAIL_CHECKER);
-                if msg.contains("disagree") {
+                if msg.is_desync() {
                     signal!(trace::TRACE_ENG_DESYNC);
                 }
-                let line = self.ctx.stmt_lines.get(&(stmt as *const Stmt)).copied();
-                self.diagnostics.push(match line {
-                    Some(l) => format!("line {l}: {msg}"),
-                    None => msg,
-                });
+                self.diagnostics
+                    .push(msg.with_site(self.ctx.stmt_lines.get(&(stmt as *const Stmt)).copied()));
                 return;
             }
         }
@@ -2285,24 +2272,24 @@ impl Checker {
         op: &BinOp,
         l_expr: &Expr,
         r_expr: &Expr,
-    ) -> Result<Ty, String> {
+    ) -> Result<Ty, Diagnostic> {
         let (l, r) = self.infer_numeric_pair(lat, l, r)?;
         match (&l, &r) {
             (Ty::Int, Ty::Int) => Ok(Ty::Int),
             (Ty::Flt, Ty::Flt) => Ok(Ty::Flt),
-            (Ty::Int, Ty::Flt) | (Ty::Flt, Ty::Int) => Err(format!(
-                "Type Error: '{}' does not support mixed Integer and Float operands",
+            (Ty::Int, Ty::Flt) | (Ty::Flt, Ty::Int) => Err(Diagnostic::ty(format!(
+                "'{}' does not support mixed Integer and Float operands",
                 bin_op_name(op)
-            )),
+            ))),
             _ => {
                 let note = self
                     .any_provenance_note(lat, &l, l_expr)
                     .or_else(|| self.any_provenance_note(lat, &r, r_expr));
-                Err(format!(
-                    "Type Error: '{}' requires numeric operands{}",
+                Err(Diagnostic::ty(format!(
+                    "'{}' requires numeric operands{}",
                     bin_op_name(op),
                     note.unwrap_or_default()
-                ))
+                )))
             }
         }
     }
@@ -2318,7 +2305,7 @@ impl Checker {
         )
     }
 
-    fn pin_bool(&mut self, lat: &mut UnknownStore, ty: &Ty) -> Result<Ty, String> {
+    fn pin_bool(&mut self, lat: &mut UnknownStore, ty: &Ty) -> Result<Ty, Diagnostic> {
         let resolved = lat.resolve(ty);
         if let Ty::Unknown(id) = resolved {
             lat.bind(id, Ty::Bool)?;
@@ -2332,7 +2319,7 @@ impl Checker {
         lat: &mut UnknownStore,
         l: &Ty,
         r: &Ty,
-    ) -> Result<(Ty, Ty), String> {
+    ) -> Result<(Ty, Ty), Diagnostic> {
         let lr = lat.resolve(l);
         let rr = lat.resolve(r);
         let num = |t: &Ty| matches!(t, Ty::Int | Ty::Flt);
@@ -2360,7 +2347,12 @@ impl Checker {
         }
     }
 
-    fn pin_scalar_pair(&mut self, lat: &mut UnknownStore, l: &Ty, r: &Ty) -> Result<(), String> {
+    fn pin_scalar_pair(
+        &mut self,
+        lat: &mut UnknownStore,
+        l: &Ty,
+        r: &Ty,
+    ) -> Result<(), Diagnostic> {
         let lr = lat.resolve(l);
         let rr = lat.resolve(r);
         let scalar = |t: &Ty| matches!(t, Ty::Int | Ty::Flt | Ty::Bool | Ty::Str);

@@ -1,5 +1,6 @@
 use super::{IrLowerer, LowerError};
 
+use crate::diag::Diagnostic;
 use crate::ir::{
     Any, AnyReg, BlockId, Bool, Byte, CellRepr, CellTy, CellVal, CmpRegs, CmpRepr, Float,
     Instruction, Int, MoveRegs, NumRegs, NumRegsRhs, NumRepr, PackRegs, PhiRegs, PhiRepr, Ptr, Reg,
@@ -88,10 +89,10 @@ pub(super) fn string_repr(ty: &Ty, reg: AnyReg) -> AnyReg {
 }
 
 fn repr_mismatch(where_: &str) -> LowerError {
-    LowerError(format!(
+    LowerError(Diagnostic::desync(format!(
         "Lower Error: {where_} received a different repr — \
          the checker and the lowerer disagree"
-    ))
+    )))
 }
 
 pub(super) enum NumPair {
@@ -203,11 +204,10 @@ impl IrLowerer<'_> {
             AnyReg::Bool(r) => PackRegs::Bool(r),
             AnyReg::Str(r) => PackRegs::Str(r),
             AnyReg::Ptr(_) | AnyReg::Byte(_) => {
-                return Err(LowerError(
+                return Err(LowerError(Diagnostic::desync(
                     "Lower Error: a dynamic cell holds scalars — a table value cannot be \
-                     packed into one (the checker and the lowerer disagree)"
-                        .into(),
-                ));
+                     packed into one (the checker and the lowerer disagree)",
+                )));
             }
             AnyReg::Any(_) => unreachable!("the early return handled the Any repr"),
         };
@@ -383,11 +383,10 @@ impl IrLowerer<'_> {
         elem: &Ty,
     ) -> Result<(), LowerError> {
         if CellTy::of(elem) != E::TAG {
-            return Err(LowerError(
+            return Err(LowerError(Diagnostic::desync(
                 "Lower Error: a stored value's repr disagrees with the table's element type — \
-                 the checker and the lowerer disagree"
-                    .into(),
-            ));
+                 the checker and the lowerer disagree",
+            )));
         }
         self.emit(Instruction::TableSet(E::set(table, index, value)));
         Ok(())
@@ -402,11 +401,10 @@ impl IrLowerer<'_> {
         layout: crate::shape::LayoutVerdict,
     ) -> Result<(), LowerError> {
         if CellTy::of(elem) != E::TAG {
-            return Err(LowerError(
+            return Err(LowerError(Diagnostic::desync(
                 "Lower Error: a stored value's repr disagrees with the table's element type — \
-                 the checker and the lowerer disagree"
-                    .into(),
-            ));
+                 the checker and the lowerer disagree",
+            )));
         }
         let cont = self.new_block();
         self.emit(Instruction::TableSetFast(E::set_fast(

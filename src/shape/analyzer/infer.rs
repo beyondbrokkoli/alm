@@ -171,9 +171,9 @@ impl Analyzer {
         let base = match obj {
             Expr::Identifier(n) => n.as_str(),
             _ => {
-                return Err(ShapeError(
-                    "Scope Error: the ffi surface's '.' base must be a name".into(),
-                ));
+                return Err(ShapeError(Diagnostic::scope(
+                    "the ffi surface's '.' base must be a name",
+                )));
             }
         };
         let (_, bind) = self.resolve(rec, base)?;
@@ -211,10 +211,10 @@ impl Analyzer {
             }
             return Ok((Pending, BTreeSet::new(), BTreeMap::new()));
         }
-        Err(ShapeError(format!(
-            "Scope Error: '{base}' is not the ffi module, a loaded library, or the coroutine \
+        Err(ShapeError(Diagnostic::scope(format!(
+            "'{base}' is not the ffi module, a loaded library, or the coroutine \
              module — '.' is the module surfaces', tables use '[]'"
-        )))
+        ))))
     }
 
     pub(super) fn infer_expr(
@@ -307,23 +307,21 @@ impl Analyzer {
                                 for &g in &entry_ghosts {
                                     let Some(&birth) = self.lattice.ghost_site.get(&g) else {
                                         signal!(rec.on(), trace::TRACE_FAIL_ROW_STORE);
-                                        return Err(ShapeError(
-                                            "Lifetime Error: a row read with a dynamic or \
+                                        return Err(ShapeError(Diagnostic::lifetime(
+                                            "a row read with a dynamic or \
                                              unproven key cannot be stored — its birth \
                                              site is not visible to the lattice; store a \
-                                             row read through a literal key instead"
-                                                .to_string(),
-                                        ));
+                                             row read through a literal key instead",
+                                        )));
                                     };
                                     if id == birth || self.birth_closure(id).contains(&birth) {
                                         signal!(rec.on(), trace::TRACE_FAIL_ROW_STORE);
-                                        return Err(ShapeError(
-                                            "Lifetime Error: cyclic row store — the row \
+                                        return Err(ShapeError(Diagnostic::lifetime(
+                                            "cyclic row store — the row \
                                              read would be stored into a table that \
                                              already contains it (alm's element types \
-                                             are finite)"
-                                                .to_string(),
-                                        ));
+                                             are finite)",
+                                        )));
                                     }
                                     self.check_row_housing(g, e)?;
                                 }
@@ -349,12 +347,11 @@ impl Analyzer {
                                 }
                             } else if esites.iter().all(is_root) && !elineage.is_empty() {
                                 signal!(rec.on(), trace::TRACE_FAIL_BORROW_ESCAPE);
-                                return Err(ShapeError(
-                                    "Lifetime Error: a row read cannot be stored — borrows \
+                                return Err(ShapeError(Diagnostic::lifetime(
+                                    "a row read cannot be stored — borrows \
                                      hold no ownership, and cells own exactly the headers \
-                                     they are given"
-                                        .to_string(),
-                                ));
+                                     they are given",
+                                )));
                             }
                             self.own.stored_ctor_parents.insert(id);
                             let proj_values: Vec<usize> = esites
@@ -472,12 +469,11 @@ impl Analyzer {
                     .collect();
                 if !claimed_rows.is_empty() {
                     let err = || {
-                        ShapeError(
-                            "Lifetime Error: this row was already released with its \
+                        ShapeError(Diagnostic::lifetime(
+                            "this row was already released with its \
                              housing — read it through the housing's cell before it \
-                             drops"
-                                .to_string(),
-                        )
+                             drops",
+                        ))
                     };
                     for &s in &sites {
                         let row = if is_ghost(&s) {
@@ -723,9 +719,9 @@ impl Analyzer {
                             ty,
                             sites
                         );
-                        Err(ShapeError(
-                            "Scope Error: dot access needs a record or the ffi surface".into(),
-                        ))
+                        Err(ShapeError(Diagnostic::scope(
+                            "dot access needs a record or the ffi surface",
+                        )))
                     }
                 }
             }
@@ -796,12 +792,12 @@ impl Analyzer {
                                 && bind.aliases.contains(&BOUNDARY_ROOT)
                             {
                                 let p = params.get(i).cloned().unwrap_or_default();
-                                return Err(ShapeError(format!(
-                                    "Lifetime Error: '{name}' moves its parameter '{p}' \
+                                return Err(ShapeError(Diagnostic::lifetime(format!(
+                                    "'{name}' moves its parameter '{p}' \
                                      into another table or binding — the pinned table \
                                      '{n}' may not be passed to it (the host owns the \
                                      boundary header)"
-                                )));
+                                ))));
                             }
                         }
                         if ret_params.as_ref().is_some_and(|r| r.contains(&i))
@@ -879,9 +875,7 @@ impl Analyzer {
             signal!(rec.on(), trace::TRACE_THRESH_INT);
             if i >= BOUNDS_FAIL_THRESHOLD {
                 signal!(rec.on(), trace::TRACE_THRESH_BOUNDS);
-                return Err(ShapeError(
-                    "Table Bounds Error: table index overflow".to_string(),
-                ));
+                return Err(ShapeError(Diagnostic::bounds("table index overflow")));
             }
             if i > SPARSE_THRESHOLD {
                 signal!(rec.on(), trace::TRACE_THRESH_SPARSE);

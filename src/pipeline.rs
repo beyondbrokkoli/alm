@@ -18,6 +18,7 @@
 use crate::analysis;
 use crate::ast::{self, Stmt};
 use crate::backend;
+use crate::diag::Diagnostic;
 use crate::ir;
 use crate::lexer;
 use crate::lowerer;
@@ -72,10 +73,10 @@ const FFI_EXE_ONLY: &str = "alm compiler error: the ffi surface (require(\"ffi\"
 /// The shipped compile: lex → parse → front gate → ffi gate → one walk
 /// → lower → render, returning the `.ll` text or the rejecting stage
 /// with its diagnostics.
-pub fn compile(source: &str, opts: &PipelineOpts) -> Result<String, (Stage, Vec<String>)> {
+pub fn compile(source: &str, opts: &PipelineOpts) -> Result<String, (Stage, Vec<Diagnostic>)> {
     let mut tokens = Vec::new();
     let mut offsets = Vec::new();
-    let mut front_diagnostics = Vec::new();
+    let mut front_diagnostics: Vec<Diagnostic> = Vec::new();
     let mut lexer = lexer::Token::lexer(source);
     loop {
         match lexer.next() {
@@ -90,7 +91,9 @@ pub fn compile(source: &str, opts: &PipelineOpts) -> Result<String, (Stage, Vec<
                     .count();
                 // a lexer error LATCHES: the truncated stream still
                 // parses, and both halves reject together at the gate
-                front_diagnostics.push(format!("line {line}: Syntax Error: Lexer error"));
+                // kind Syntax is the front gate's face — the bytes
+                // stay the driver's ("Syntax Error: Lexer error")
+                front_diagnostics.push(Diagnostic::syntax("Lexer error").with_site(Some(line)));
                 break;
             }
             None => break,
@@ -117,7 +120,7 @@ pub fn compile_parts(
     tokens: Vec<(lexer::Token<'_>, usize)>,
     source: &str,
     opts: &PipelineOpts,
-) -> Result<String, (Stage, Vec<String>)> {
+) -> Result<String, (Stage, Vec<Diagnostic>)> {
     let mut parser = Parser::new(tokens, source);
     let ast = parser.parse_program();
     if !parser.diagnostics.is_empty() {
@@ -128,9 +131,9 @@ pub fn compile_parts(
 
 /// Everything past the front gate: the ffi gate, the one walk, the
 /// lowerer, and the backend — the half both callers always shared.
-fn post_front(ast: Vec<Stmt>, opts: &PipelineOpts) -> Result<String, (Stage, Vec<String>)> {
+fn post_front(ast: Vec<Stmt>, opts: &PipelineOpts) -> Result<String, (Stage, Vec<Diagnostic>)> {
     if uses_ffi(&ast) && !opts.standalone {
-        return Err((Stage::Ffi, vec![FFI_EXE_ONLY.to_string()]));
+        return Err((Stage::Ffi, vec![Diagnostic::bare(FFI_EXE_ONLY)]));
     }
 
     let ctx = analysis::build_context(&ast);

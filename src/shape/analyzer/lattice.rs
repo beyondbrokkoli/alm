@@ -13,11 +13,14 @@ impl Analyzer {
     pub(super) fn report_conflict(&mut self, id: usize) -> Ty {
         if self.ledger.conflict_reported.insert(id) {
             let line = self.ctor_lines[id];
-            self.ledger.diagnostics.push(format!(
-                "line {line}: Type Error: a table's cells hold one scalar kind — mixing scalar \
-                 kinds chooses the dynamic cell (Any), but a table value never rides a cell \
-                 (table site #{id})"
-            ));
+            self.ledger.diagnostics.push(
+                Diagnostic::ty(format!(
+                    "a table's cells hold one scalar kind — mixing scalar \
+                     kinds chooses the dynamic cell (Any), but a table value never rides a cell \
+                     (table site #{id})"
+                ))
+                .with_site(Some(line)),
+            );
         }
         Ty::Unknown(id)
     }

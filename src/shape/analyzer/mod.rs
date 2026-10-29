@@ -7,10 +7,13 @@ use super::core::{
     BOUNDARY_ROOT, BOUNDS_FAIL_THRESHOLD, LayoutVerdict, MOVED_ROOT, NULL_ROOT, RowLineage,
     SPARSE_THRESHOLD, TableShape, is_ghost, is_root,
 };
+// H11: the diagnostic type, one name for every analyzer child (the
+// `use super::*` globs below the mod decls reach it)
 use super::facts;
 use super::facts::{FillPlan, ShapeFacts};
 use super::helpers::{const_key_value, extract_guard, merge_table_scopes};
 use super::ty::{Ty, arith_ty, contains_any, decided, join_ty, pinned_scalar, value_kind};
+pub(super) use crate::diag::Diagnostic;
 use Ty::{Any, Bool, Conflict, Coro, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
 
 mod checker;
@@ -30,7 +33,9 @@ use lattice::*;
 use rebind::*;
 use rows::*;
 
-struct ShapeError(String);
+/// A walk rejection — minted typed (H11); the pushing boundary stamps
+/// the site off the statement's own line.
+struct ShapeError(pub Diagnostic);
 
 fn boundary_root_scope() -> BTreeMap<String, TableShape> {
     let mut scope = BTreeMap::new();
@@ -47,7 +52,7 @@ fn boundary_root_scope() -> BTreeMap<String, TableShape> {
 }
 
 struct Ledger {
-    diagnostics: Vec<String>,
+    diagnostics: Vec<Diagnostic>,
     conflict_reported: BTreeSet<usize>,
 }
 
@@ -592,11 +597,10 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
         chk.snapshot_pre(&a.walk, &a.holds.moved_severed);
         if let Err(err) = a.walk_stmt(rec, stmt) {
             signal!(rec.on(), trace::TRACE_GHOST_BAIL);
-            let line = a.stmt_lines.get(&(stmt as *const Stmt)).copied();
-            a.ledger.diagnostics.push(match line {
-                Some(l) => format!("line {l}: {}", err.0),
-                None => err.0,
-            });
+            a.ledger.diagnostics.push(
+                err.0
+                    .with_site(a.stmt_lines.get(&(stmt as *const Stmt)).copied()),
+            );
             checker_ran = false;
             walk_completed = false;
             break;
@@ -605,14 +609,12 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
         last_post = Some(a.walk.scopes.clone());
         if checker_ran && let Err(msg) = chk.check_stmt(&mut a.lattice.unknowns, stmt) {
             signal!(trace::TRACE_GHOST_BAIL_CHECKER);
-            if msg.contains("disagree") {
+            if msg.is_desync() {
                 signal!(trace::TRACE_ENG_DESYNC);
             }
-            let line = a.stmt_lines.get(&(stmt as *const Stmt)).copied();
-            a.ledger.diagnostics.push(match line {
-                Some(l) => format!("line {l}: {msg}"),
-                None => msg,
-            });
+            a.ledger
+                .diagnostics
+                .push(msg.with_site(a.stmt_lines.get(&(stmt as *const Stmt)).copied()));
             // a top-level checker error stops the walk, but the closing
             // moves still run — the standalone pass did the same
             walk_completed = false;
@@ -682,7 +684,7 @@ struct Recorded {
     static_elems: Vec<crate::shape::Ty>,
     /// the elem table's own diagnostics (pending/missing/conflict/
     /// nested-store/cyclic), appended after the walk's
-    elems_diags: Vec<String>,
+    elems_diags: Vec<Diagnostic>,
     chk: checker::CheckFacts,
 }
 
@@ -691,7 +693,7 @@ impl Analyzer {
         self,
         adopt_lines: BTreeMap<String, usize>,
         static_elems: Vec<crate::shape::Ty>,
-        elems_diags: Vec<String>,
+        elems_diags: Vec<Diagnostic>,
         chk: checker::CheckFacts,
     ) -> Recorded {
         Recorded {
@@ -716,7 +718,7 @@ impl Analyzer {
     /// checker checks against the exact table the assembled facts will
     /// carry. Diagnostics land in the ledger and are
     /// drained out here (the walk clears it anyway).
-    fn compute_static_elems(&mut self, n: usize) -> (Vec<crate::shape::Ty>, Vec<String>) {
+    fn compute_static_elems(&mut self, n: usize) -> (Vec<crate::shape::Ty>, Vec<Diagnostic>) {
         let mut elems: Vec<crate::shape::Ty> = (0..n).map(crate::shape::Ty::Unknown).collect();
 
         let site_ids: Vec<usize> = self.lattice.sites.values().copied().collect();
@@ -734,10 +736,12 @@ impl Analyzer {
                 }
                 signal!(trace::TRACE_ANALYZE_MISSING_VALUE);
                 let line = self.ctor_lines[id];
-                self.ledger.diagnostics.push(format!(
-                    "line {line}: Type Error: a table is read before it is ever given a value \
-                     (table site #{id})"
-                ));
+                self.ledger.diagnostics.push(
+                    Diagnostic::ty(format!(
+                        "a table is read before it is ever given a value (table site #{id})"
+                    ))
+                    .with_site(Some(line)),
+                );
                 elems[id] = crate::shape::Ty::Unknown(id);
             } else if self.lattice.site_elem[id] == Pending {
                 signal!(trace::TRACE_ANALYZE_PENDING);
@@ -752,26 +756,32 @@ impl Analyzer {
             if !self.reads.tbl_value_stores.contains(&site) {
                 signal!(trace::TRACE_STMT_IDX_NULL_ROW);
                 let line = self.ctor_lines[site];
-                self.ledger.diagnostics.push(format!(
-                    "line {line}: Type Error: cannot index a row of '{name}' — no table is ever \
-                     stored into '{name}', and stores do not create rows (table site #{site})"
-                ));
+                self.ledger.diagnostics.push(
+                    Diagnostic::ty(format!(
+                        "cannot index a row of '{name}' — no table is ever \
+                         stored into '{name}', and stores do not create rows (table site #{site})"
+                    ))
+                    .with_site(Some(line)),
+                );
             }
         }
 
         for (base, (value, line)) in &self.holds.cyclic_stores {
             signal!(trace::TRACE_FAIL_CYCLIC_STORE);
-            self.ledger.diagnostics.push(format!(
-                "line {line}: Type Error: cyclic table store — '{value}' stored into '{base}' \
-                 would create a table cycle (alm's element types are finite)"
-            ));
+            self.ledger.diagnostics.push(
+                Diagnostic::ty(format!(
+                    "cyclic table store — '{value}' stored into '{base}' \
+                     would create a table cycle (alm's element types are finite)"
+                ))
+                .with_site(Some(*line)),
+            );
         }
 
         for id in 0..n {
             propagate_elem_down(&mut elems, &self.lattice.child_sites, id);
         }
 
-        let elems_diags: Vec<String> = std::mem::take(&mut self.ledger.diagnostics);
+        let elems_diags: Vec<Diagnostic> = std::mem::take(&mut self.ledger.diagnostics);
         (elems, elems_diags)
     }
 }
@@ -858,11 +868,11 @@ fn get_base_identifier(expr: &Expr) -> Option<&String> {
 /// closure value is. Both halves would print this exact text —
 /// whichever fires first (post-W3a the walk tolerates value calls, so
 /// the checker owns the reject).
-pub(super) fn value_call_msg(name: &str) -> String {
-    format!(
-        "Type Error: '{name}' is not an expansion — a call through a value \
+pub(super) fn value_call_msg(name: &str) -> Diagnostic {
+    Diagnostic::ty(format!(
+        "'{name}' is not an expansion — a call through a value \
          needs a closure"
-    )
+    ))
 }
 
 /// Flatten a dotted callee chain (`A.b`, `A.B.c`, …) into its ONE
@@ -882,8 +892,9 @@ pub(super) fn dotted_callee(callee: &Expr) -> Option<String> {
 
 /// The ONE non-identifier-callee diagnostic, same discipline as
 /// `not_a_function_msg`.
-pub(super) fn calls_through_fn_var_msg() -> String {
-    "Type Error: calls go through a macro's name — only macros \
-     assigned directly to variables are callable"
-        .to_string()
+pub(super) fn calls_through_fn_var_msg() -> Diagnostic {
+    Diagnostic::ty(
+        "calls go through a macro's name — only macros \
+     assigned directly to variables are callable",
+    )
 }

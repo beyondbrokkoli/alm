@@ -1,10 +1,14 @@
 use crate::ast::{BinOp, CtorKey, Expr, Loc, Stmt, UnOp};
+use crate::diag::Diagnostic;
 use crate::lexer::Token;
 use crate::shape::BOUNDS_FAIL_THRESHOLD;
 use std::collections::BTreeSet;
 use std::iter::Peekable;
 
-pub struct ParseError(pub String);
+/// A parse rejection — always the Syntax face; `parse_program` stamps
+/// the site off the token stream (H11: the line rides the Diagnostic,
+/// one formatter renders it).
+pub struct ParseError(pub Diagnostic);
 
 pub const MAX_EXPR_DEPTH: usize = 1024;
 
@@ -30,7 +34,7 @@ impl<'a> Tokens<'a> {
 
 pub struct Parser<'a> {
     tokens: Tokens<'a>,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
     depth: usize,
     newlines: Vec<usize>,
 }
@@ -78,10 +82,10 @@ impl<'a> Parser<'a> {
     fn expect(&mut self, expected: Token<'a>) -> Result<(), ParseError> {
         let next = self.tokens.next();
         if next != Some(expected.clone()) {
-            return Err(ParseError(format!(
-                "Syntax Error: Expected {:?}, got {:?}",
+            return Err(ParseError(Diagnostic::syntax(format!(
+                "Expected {:?}, got {:?}",
                 expected, next
-            )));
+            ))));
         }
         Ok(())
     }
@@ -92,8 +96,10 @@ impl<'a> Parser<'a> {
             match self.parse_stmt() {
                 Ok(stmt) => stmts.push(stmt),
                 Err(e) => {
+                    // the ONE site-stamp: the parser knows the offending
+                    // line from the token stream; render derives the rest
                     let line = self.err_line();
-                    self.diagnostics.push(format!("line {line}: {}", e.0));
+                    self.diagnostics.push(e.0.with_site(Some(line)));
                     alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_GHOST_BAIL_PARSER);
                     break;
                 }
@@ -127,10 +133,9 @@ impl<'a> Parser<'a> {
                     let name = match self.tokens.next() {
                         Some(Token::Identifier(n)) => n.to_string(),
                         _ => {
-                            return Err(ParseError(
-                                "Syntax Error: Expected function name after 'local function'"
-                                    .into(),
-                            ));
+                            return Err(ParseError(Diagnostic::syntax(
+                                "Expected function name after 'local function'",
+                            )));
                         }
                     };
                     let expr = self.parse_fn_literal()?;
@@ -145,9 +150,9 @@ impl<'a> Parser<'a> {
                     let name = match self.tokens.next() {
                         Some(Token::Identifier(n)) => n.to_string(),
                         _ => {
-                            return Err(ParseError(
-                                "Syntax Error: Expected variable name after 'local'".into(),
-                            ));
+                            return Err(ParseError(Diagnostic::syntax(
+                                "Expected variable name after 'local'",
+                            )));
                         }
                     };
                     names.push(name);
@@ -167,11 +172,11 @@ impl<'a> Parser<'a> {
                         exprs.push(self.parse_expr()?);
                     }
                     if exprs.len() != names.len() {
-                        return Err(ParseError(format!(
-                            "Syntax Error: 'local' binds {} names to {} values — counts must match",
+                        return Err(ParseError(Diagnostic::syntax(format!(
+                            "'local' binds {} names to {} values — counts must match",
                             names.len(),
                             exprs.len()
-                        )));
+                        ))));
                     }
                 }
 
@@ -210,9 +215,9 @@ impl<'a> Parser<'a> {
                 let var = match self.tokens.next() {
                     Some(Token::Identifier(n)) => n.to_string(),
                     _ => {
-                        return Err(ParseError(
-                            "Syntax Error: Expected loop variable name after 'for'".into(),
-                        ));
+                        return Err(ParseError(Diagnostic::syntax(
+                            "Expected loop variable name after 'for'",
+                        )));
                     }
                 };
                 self.expect(Token::Assign)?;
@@ -224,15 +229,14 @@ impl<'a> Parser<'a> {
                 // through a name still meets the checker's mixed-operand
                 // law at the same header line).
                 if matches!(start, Expr::Float(_)) || matches!(limit, Expr::Float(_)) {
-                    return Err(ParseError(
-                        "Syntax Error: for-loop bounds must be integers".into(),
-                    ));
+                    return Err(ParseError(Diagnostic::syntax(
+                        "for-loop bounds must be integers",
+                    )));
                 }
                 if matches!(self.tokens.peek(), Some(Token::Comma)) {
-                    return Err(ParseError(
-                        "Syntax Error: for-step is not in the dialect — 'for i = a, b do' has start and limit only"
-                            .into(),
-                    ));
+                    return Err(ParseError(Diagnostic::syntax(
+                        "for-step is not in the dialect — 'for i = a, b do' has start and limit only",
+                    )));
                 }
                 self.expect(Token::Do)?;
 
@@ -243,9 +247,9 @@ impl<'a> Parser<'a> {
                 self.expect(Token::End)?;
 
                 if Self::body_assigns_to(&body, &var) {
-                    return Err(ParseError(format!(
-                        "Syntax Error: cannot assign to for-loop variable '{var}'"
-                    )));
+                    return Err(ParseError(Diagnostic::syntax(format!(
+                        "cannot assign to for-loop variable '{var}'"
+                    ))));
                 }
 
                 // Desugar: the pure elaborator owns the shape (H8).
@@ -283,9 +287,9 @@ impl<'a> Parser<'a> {
                         self.tokens.next();
                     }
                     _ => {
-                        return Err(ParseError(
-                            "Syntax Error: Expected 'else', 'elseif' or 'end' after if body".into(),
-                        ));
+                        return Err(ParseError(Diagnostic::syntax(
+                            "Expected 'else', 'elseif' or 'end' after if body",
+                        )));
                     }
                 }
 
@@ -397,7 +401,7 @@ impl<'a> Parser<'a> {
                             value: rhs,
                             loc: at,
                         }),
-                        _ => Err(ParseError("Syntax Error: Invalid assignment target".into())),
+                        _ => Err(ParseError(Diagnostic::syntax("Invalid assignment target"))),
                     }
                 } else if matches!(lhs, Expr::Call { .. }) {
                     Ok(Stmt::Expr { expr: lhs, loc: at })
@@ -408,30 +412,27 @@ impl<'a> Parser<'a> {
                         // to answer it. The dialect's loop verbs are
                         // 'break' and the loop condition — name the word
                         // (the for-step diagnostic's style).
-                        Err(ParseError(
-                            "Syntax Error: continue is not in the dialect — guard the \
-                             rest of the body with 'if' instead"
-                                .into(),
-                        ))
+                        Err(ParseError(Diagnostic::syntax(
+                            "continue is not in the dialect — guard the \
+                             rest of the body with 'if' instead",
+                        )))
                     } else {
-                        Err(ParseError(
-                            "Syntax Error: Expected '=' (assignment) or '()' (call) after \
-                             expression statement"
-                                .into(),
-                        ))
+                        Err(ParseError(Diagnostic::syntax(
+                            "Expected '=' (assignment) or '()' (call) after \
+                             expression statement",
+                        )))
                     }
                 } else {
-                    Err(ParseError(
-                        "Syntax Error: Expected '=' (assignment) or '()' (call) after \
-                         expression statement"
-                            .into(),
-                    ))
+                    Err(ParseError(Diagnostic::syntax(
+                        "Expected '=' (assignment) or '()' (call) after \
+                         expression statement",
+                    )))
                 }
             }
-            _ => Err(ParseError(format!(
-                "Syntax Error: Unexpected statement starting with {:?}",
+            _ => Err(ParseError(Diagnostic::syntax(format!(
+                "Unexpected statement starting with {:?}",
                 self.tokens.peek()
-            ))),
+            )))),
         }
     }
 
@@ -458,11 +459,11 @@ impl<'a> Parser<'a> {
             values.push(self.parse_expr()?);
         }
         if values.len() != targets.len() {
-            return Err(ParseError(format!(
-                "Syntax Error: tuple assignment binds {} targets to {} values — counts must match",
+            return Err(ParseError(Diagnostic::syntax(format!(
+                "tuple assignment binds {} targets to {} values — counts must match",
                 targets.len(),
                 values.len()
-            )));
+            ))));
         }
         let mut cells = Vec::with_capacity(targets.len());
         for target in targets {
@@ -477,16 +478,16 @@ impl<'a> Parser<'a> {
                     cells.push((*obj, Expr::String(name)));
                 }
                 Expr::Identifier(name) => {
-                    return Err(ParseError(format!(
-                        "Syntax Error: cannot tuple-assign the name '{name}' — tuple assignment \
+                    return Err(ParseError(Diagnostic::syntax(format!(
+                        "cannot tuple-assign the name '{name}' — tuple assignment \
                          targets cells ('t[k]' or 't.k'); names rebind through plain '=' or \
                          'local'"
-                    )));
+                    ))));
                 }
                 _ => {
-                    return Err(ParseError(
-                        "Syntax Error: tuple assignment targets cells — 't[k]' or 't.k'".into(),
-                    ));
+                    return Err(ParseError(Diagnostic::syntax(
+                        "tuple assignment targets cells — 't[k]' or 't.k'",
+                    )));
                 }
             }
         }
@@ -506,9 +507,9 @@ impl<'a> Parser<'a> {
         let mut name = match self.tokens.next() {
             Some(Token::Identifier(n)) => n.to_string(),
             _ => {
-                return Err(ParseError(
-                    "Syntax Error: Expected function name after 'function'".into(),
-                ));
+                return Err(ParseError(Diagnostic::syntax(
+                    "Expected function name after 'function'",
+                )));
             }
         };
         loop {
@@ -521,20 +522,19 @@ impl<'a> Parser<'a> {
                             name.push_str(seg);
                         }
                         _ => {
-                            return Err(ParseError(
-                                "Syntax Error: Expected name segment after '.' in function \
-                                 declaration"
-                                    .into(),
-                            ));
+                            return Err(ParseError(Diagnostic::syntax(
+                                "Expected name segment after '.' in function \
+                                 declaration",
+                            )));
                         }
                     }
                 }
                 Some(Token::Colon) => {
-                    return Err(ParseError(format!(
-                        "Syntax Error: 'function {name}:...' — colon methods are not surface; \
+                    return Err(ParseError(Diagnostic::syntax(format!(
+                        "'function {name}:...' — colon methods are not surface; \
                          declare 'function {name}.<method>(receiver, ...)' and pass the \
                          receiver as an explicit first parameter"
-                    )));
+                    ))));
                 }
                 _ => return Ok(name),
             }
@@ -604,9 +604,9 @@ impl<'a> Parser<'a> {
                 self.tokens.next();
             }
             _ => {
-                return Err(ParseError(
-                    "Syntax Error: Expected 'else', 'elseif' or 'end' after elseif body".into(),
-                ));
+                return Err(ParseError(Diagnostic::syntax(
+                    "Expected 'else', 'elseif' or 'end' after elseif body",
+                )));
             }
         }
 
@@ -625,10 +625,10 @@ impl<'a> Parser<'a> {
         self.depth += 1;
         if self.depth > MAX_EXPR_DEPTH {
             self.depth -= 1;
-            return Err(ParseError(format!(
-                "Syntax Error: expression nesting too deep (limit {MAX_EXPR_DEPTH} — alm's \
+            return Err(ParseError(Diagnostic::syntax(format!(
+                "expression nesting too deep (limit {MAX_EXPR_DEPTH} — alm's \
                  static analyses are finite; deeper source is rejected, not crashed on)"
-            )));
+            ))));
         }
         let r = f(self);
         self.depth -= 1;
@@ -780,9 +780,9 @@ impl<'a> Parser<'a> {
                     let name = match self.tokens.next() {
                         Some(Token::Identifier(n)) => n.to_string(),
                         _ => {
-                            return Err(ParseError(
-                                "Syntax Error: expected a name after '.'".into(),
-                            ));
+                            return Err(ParseError(Diagnostic::syntax(
+                                "expected a name after '.'",
+                            )));
                         }
                     };
                     expr = Expr::Field {
@@ -838,12 +838,11 @@ impl<'a> Parser<'a> {
                     let module = match self.tokens.next() {
                         Some(Token::String(module)) => module,
                         _ => {
-                            return Err(ParseError(
-                                "Syntax Error: require takes one string literal — \
+                            return Err(ParseError(Diagnostic::syntax(
+                                "require takes one string literal — \
                                  require(\"ffi\") and require(\"coroutine\") are the \
-                                 modules the dialect provides"
-                                    .into(),
-                            ));
+                                 modules the dialect provides",
+                            )));
                         }
                     };
                     let name = module.trim_matches('"');
@@ -854,12 +853,12 @@ impl<'a> Parser<'a> {
                             return Ok(Expr::CoroModule);
                         }
                         other => {
-                            return Err(ParseError(format!(
-                                "Syntax Error: require(\"{other}\") — the dialect provides \
+                            return Err(ParseError(Diagnostic::syntax(format!(
+                                "require(\"{other}\") — the dialect provides \
                                  only require(\"ffi\") (the mocked LuaJIT ffi surface) and \
                                  require(\"coroutine\") (the OS-thread parody of Lua's \
                                  cooperative coroutines)"
-                            )));
+                            ))));
                         }
                     }
                     self.expect(Token::RightParen)?;
@@ -873,7 +872,7 @@ impl<'a> Parser<'a> {
                 Ok(inner)
             }
             Some(Token::Function) => self.parse_fn_literal(),
-            _ => Err(ParseError("Syntax Error: Expected expression".into())),
+            _ => Err(ParseError(Diagnostic::syntax("Expected expression"))),
         }
     }
 
@@ -886,24 +885,23 @@ impl<'a> Parser<'a> {
         if !matches!(self.tokens.peek(), Some(Token::RightParen)) {
             loop {
                 if matches!(self.tokens.peek(), Some(Token::Dot)) {
-                    return Err(ParseError(
-                        "Syntax Error: the dialect has no varargs — \
-                         name your parameters"
-                            .into(),
-                    ));
+                    return Err(ParseError(Diagnostic::syntax(
+                        "the dialect has no varargs — \
+                         name your parameters",
+                    )));
                 }
                 let name = match self.tokens.next() {
                     Some(Token::Identifier(n)) => n.to_string(),
                     _ => {
-                        return Err(ParseError(
-                            "Syntax Error: Expected parameter name in function header".into(),
-                        ));
+                        return Err(ParseError(Diagnostic::syntax(
+                            "Expected parameter name in function header",
+                        )));
                     }
                 };
                 if params.contains(&name) {
-                    return Err(ParseError(format!(
-                        "Syntax Error: duplicate parameter '{name}'"
-                    )));
+                    return Err(ParseError(Diagnostic::syntax(format!(
+                        "duplicate parameter '{name}'"
+                    ))));
                 }
                 params.push(name);
                 if matches!(self.tokens.peek(), Some(Token::Comma)) {
@@ -917,9 +915,9 @@ impl<'a> Parser<'a> {
         let mut body = Vec::new();
         while self.tokens.peek() != Some(&Token::End) {
             if self.tokens.peek().is_none() {
-                return Err(ParseError(
-                    "Syntax Error: 'function' body not closed by 'end'".into(),
-                ));
+                return Err(ParseError(Diagnostic::syntax(
+                    "'function' body not closed by 'end'",
+                )));
             }
             body.push(self.parse_stmt()?);
         }
@@ -960,33 +958,31 @@ impl<'a> Parser<'a> {
             match &key {
                 CtorKey::Const(slot) => {
                     if !slots.insert(*slot) {
-                        return Err(ParseError(format!(
-                            "Syntax Error: duplicate index {slot} in constructor — each slot may \
+                        return Err(ParseError(Diagnostic::syntax(format!(
+                            "duplicate index {slot} in constructor — each slot may \
                              be written once (last-wins is not alm's rule)"
-                        )));
+                        ))));
                     }
                     if !names.is_empty() {
-                        return Err(ParseError(
-                            "Syntax Error: mixed array and record constructor elements — a \
-                             constructor is an array or a record, never both"
-                                .into(),
-                        ));
+                        return Err(ParseError(Diagnostic::syntax(
+                            "mixed array and record constructor elements — a \
+                             constructor is an array or a record, never both",
+                        )));
                     }
                 }
                 CtorKey::Str(_) | CtorKey::Expr(_) if record_name.is_some() => {
                     let name = record_name.unwrap();
                     if !names.insert(name.to_string()) {
-                        return Err(ParseError(format!(
-                            "Syntax Error: duplicate key '{name}' in constructor — each field may \
+                        return Err(ParseError(Diagnostic::syntax(format!(
+                            "duplicate key '{name}' in constructor — each field may \
                              be written once (last-wins is not alm's rule)"
-                        )));
+                        ))));
                     }
                     if !slots.is_empty() {
-                        return Err(ParseError(
-                            "Syntax Error: mixed array and record constructor elements — a \
-                             constructor is an array or a record, never both"
-                                .into(),
-                        ));
+                        return Err(ParseError(Diagnostic::syntax(
+                            "mixed array and record constructor elements — a \
+                             constructor is an array or a record, never both",
+                        )));
                     }
                 }
                 _ => {}
@@ -1019,9 +1015,7 @@ impl<'a> Parser<'a> {
             match key {
                 Expr::Integer(k) => {
                     if k >= BOUNDS_FAIL_THRESHOLD {
-                        return Err(ParseError(
-                            "Table Bounds Error: table index overflow".into(),
-                        ));
+                        return Err(ParseError(Diagnostic::bounds("table index overflow")));
                     }
                     Ok((CtorKey::Const(k), value))
                 }
@@ -1037,9 +1031,9 @@ impl<'a> Parser<'a> {
                     let name = match &value {
                         Expr::Identifier(n) => n.clone(),
                         _ => {
-                            return Err(ParseError(
-                                "Syntax Error: expected identifier before '='".into(),
-                            ));
+                            return Err(ParseError(Diagnostic::syntax(
+                                "expected identifier before '='",
+                            )));
                         }
                     };
                     self.tokens.next(); // consume '='

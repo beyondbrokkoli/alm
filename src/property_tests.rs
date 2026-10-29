@@ -36,8 +36,8 @@
 
 use crate::analysis;
 use crate::ast::{BinOp, Expr, Stmt};
+use crate::diag::Diagnostic;
 use crate::lexer;
-use crate::lowerer::LowerError;
 use crate::parser::Parser;
 use crate::pipeline::{self, PipelineOpts, Stage};
 use logos::Logos;
@@ -107,7 +107,18 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// text, or the stage that rejected it with its diagnostics. Panics
 /// inside a phase are caught and reported as their own stage — the
 /// compiler must diagnose, never crash.
-fn compile(source: &str) -> Result<String, (Stage, Vec<String>)> {
+
+/// The failure-report face of the format law: rendered diagnostics,
+/// joined for assert messages only (the pins compare full renders).
+fn diags_text(diags: &[Diagnostic]) -> String {
+    diags
+        .iter()
+        .map(|d| d.render())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn compile(source: &str) -> Result<String, (Stage, Vec<Diagnostic>)> {
     compile_with(source, true)
 }
 
@@ -115,14 +126,17 @@ fn compile(source: &str) -> Result<String, (Stage, Vec<String>)> {
 /// cluster A): `walk_pins = false` routes the analyzer with its
 /// use-site pins disarmed, so only the checker's own land — the subset
 /// discipline's A/B leg.
-fn compile_with(source: &str, walk_pins: bool) -> Result<String, (Stage, Vec<String>)> {
+fn compile_with(source: &str, walk_pins: bool) -> Result<String, (Stage, Vec<Diagnostic>)> {
     match std::panic::catch_unwind(AssertUnwindSafe(|| {
         pipeline::compile(source, &property_opts(walk_pins))
     })) {
         Ok(r) => r,
         Err(payload) => Err((
             Stage::Panicked,
-            vec![format!("panic: {}", panic_message(payload))],
+            vec![Diagnostic::bare(format!(
+                "panic: {}",
+                panic_message(payload)
+            ))],
         )),
     }
 }
@@ -130,7 +144,7 @@ fn compile_with(source: &str, walk_pins: bool) -> Result<String, (Stage, Vec<Str
 /// The exe-opts leg: the ffi surface is legal standalone, so probes of
 /// it reach the TYPE discipline at analysis instead of the packaging
 /// gate (their .so-opts twin rejects at `Stage::Ffi`).
-fn compile_exe(source: &str) -> Result<String, (Stage, Vec<String>)> {
+fn compile_exe(source: &str) -> Result<String, (Stage, Vec<Diagnostic>)> {
     match std::panic::catch_unwind(AssertUnwindSafe(|| {
         pipeline::compile(
             source,
@@ -144,7 +158,10 @@ fn compile_exe(source: &str) -> Result<String, (Stage, Vec<String>)> {
         Ok(r) => r,
         Err(payload) => Err((
             Stage::Panicked,
-            vec![format!("panic: {}", panic_message(payload))],
+            vec![Diagnostic::bare(format!(
+                "panic: {}",
+                panic_message(payload)
+            ))],
         )),
     }
 }
@@ -155,7 +172,7 @@ fn compile_exe(source: &str) -> Result<String, (Stage, Vec<String>)> {
 fn compile_tokenized(
     source: &str,
     tokens: Vec<(lexer::Token<'_>, usize)>,
-) -> Result<String, (Stage, Vec<String>)> {
+) -> Result<String, (Stage, Vec<Diagnostic>)> {
     compile_tokenized_with(source, tokens, true)
 }
 
@@ -163,14 +180,17 @@ fn compile_tokenized_with(
     source: &str,
     tokens: Vec<(lexer::Token<'_>, usize)>,
     walk_pins: bool,
-) -> Result<String, (Stage, Vec<String>)> {
+) -> Result<String, (Stage, Vec<Diagnostic>)> {
     match std::panic::catch_unwind(AssertUnwindSafe(|| {
         pipeline::compile_parts(tokens, source, &property_opts(walk_pins))
     })) {
         Ok(r) => r,
         Err(payload) => Err((
             Stage::Panicked,
-            vec![format!("panic: {}", panic_message(payload))],
+            vec![Diagnostic::bare(format!(
+                "panic: {}",
+                panic_message(payload)
+            ))],
         )),
     }
 }
@@ -629,7 +649,7 @@ fn generated_programs_keep_one_elem_truth() {
                     format!(
                         "valid-by-construction program was rejected at {}: {}",
                         stage.name(),
-                        diags.join("; ")
+                        diags_text(&diags)
                     ),
                 )
             ),
@@ -686,7 +706,7 @@ fn generator_sweep_survives_fresh_seeds() {
                             "valid-by-construction program (sweep seed {seed}) was rejected \
                              at {}: {}",
                             stage.name(),
-                            diags.join("; ")
+                            diags_text(&diags)
                         ),
                     )
                 ),
@@ -777,7 +797,7 @@ fn hand_pinned_shapes_match_the_any_law() {
                     format!(
                         "pinned shape was rejected at {}: {}",
                         stage.name(),
-                        diags.join("; ")
+                        diags_text(&diags)
                     ),
                 )
             ),
@@ -814,7 +834,7 @@ fn rebind_adoption_probes_stay_pinned() {
                     format!(
                         "adoption probe was rejected at {}: {}",
                         stage.name(),
-                        diags.join("; ")
+                        diags_text(&diags)
                     ),
                 )
             ),
@@ -833,7 +853,7 @@ fn rebind_adoption_probes_stay_pinned() {
                     format!(
                         "nested adoption probe was rejected at {}: {}",
                         stage.name(),
-                        diags.join("; ")
+                        diags_text(&diags)
                     ),
                 )
             )
@@ -868,7 +888,9 @@ fn rebind_adoption_probes_stay_pinned() {
     let (_, diags) = compile("local t = {1}\nlocal u = t\nprint(t[0])\n")
         .expect_err("a read through a moved name must reject");
     assert!(
-        diags.iter().any(|d| d.contains("may be moved here")),
+        diags
+            .iter()
+            .any(|d| d.render().contains("may be moved here")),
         "moved read rejected with the wrong diagnostic: {diags:?}"
     );
 }
@@ -954,11 +976,8 @@ fn corpus_mutations_never_desync_the_walks() {
                     Err((stage, diags))
                         if matches!(stage, Stage::Panicked | Stage::Lower | Stage::Backend) =>
                     {
-                        let desyncs: Vec<String> = diags
-                            .iter()
-                            .filter(|d| LowerError((*d).clone()).is_desync())
-                            .cloned()
-                            .collect();
+                        let desyncs: Vec<Diagnostic> =
+                            diags.iter().filter(|d| d.is_desync()).cloned().collect();
                         let crime = match stage {
                             Stage::Panicked => "the compiler crashed",
                             _ => "checker-accepted mutant reached a walk desync",
@@ -970,11 +989,11 @@ fn corpus_mutations_never_desync_the_walks() {
                             path.display(),
                             stage.name(),
                             i + 1,
-                            diags.join("; "),
+                            diags_text(&diags),
                             if desyncs.is_empty() {
                                 "no".to_string()
                             } else {
-                                desyncs.join("; ")
+                                diags_text(&desyncs)
                             },
                             indent(&mutant),
                         );
@@ -1087,11 +1106,8 @@ fn token_soup_never_panics_or_desyncs() {
                 Err((stage, diags))
                     if matches!(stage, Stage::Panicked | Stage::Lower | Stage::Backend) =>
                 {
-                    let desyncs: Vec<String> = diags
-                        .iter()
-                        .filter(|d| LowerError((*d).clone()).is_desync())
-                        .cloned()
-                        .collect();
+                    let desyncs: Vec<Diagnostic> =
+                        diags.iter().filter(|d| d.is_desync()).cloned().collect();
                     let crime = match stage {
                         Stage::Panicked => "the compiler crashed on token soup",
                         _ => "checker-accepted token soup reached a walk desync",
@@ -1100,11 +1116,11 @@ fn token_soup_never_panics_or_desyncs() {
                         "{crime} — base {label} failed at {}\ndiagnostics: {}\n\
                          desync-class: {}\nsoup (Debug tokens):\n{}\nbase:\n{}",
                         stage.name(),
-                        diags.join("; "),
+                        diags_text(&diags),
                         if desyncs.is_empty() {
                             "no".to_string()
                         } else {
-                            desyncs.join("; ")
+                            diags_text(&desyncs)
                         },
                         soup.iter()
                             .map(|(t, _)| format!("  {t:?}"))
@@ -1295,11 +1311,11 @@ fn walk_pins_are_a_pure_subset_over_the_corpus() {
                     "walk pins flipped acceptance for {label}:\n  pins on : {}\n  pins off: {}",
                     match &on {
                         Ok(_) => "accepted".to_string(),
-                        Err((s, d)) => format!("{}: {}", s.name(), d.join("; ")),
+                        Err((s, d)) => format!("{}: {}", s.name(), diags_text(&d)),
                     },
                     match &off {
                         Ok(_) => "accepted".to_string(),
-                        Err((s, d)) => format!("{}: {}", s.name(), d.join("; ")),
+                        Err((s, d)) => format!("{}: {}", s.name(), diags_text(&d)),
                     }
                 );
             }
@@ -1368,16 +1384,17 @@ fn w3a_crossing_faces_reject_on_both_drive_and_spawn() {
                 assert!(
                     diags
                         .iter()
-                        .any(|d| d.contains("ffi surface") && d.contains("--exe-only")),
+                        .any(|d| d.render().contains("ffi surface")
+                            && d.render().contains("--exe-only")),
                     "the {label} face's .so-opts rejection lost the gate text: {}",
-                    diags.join("; ")
+                    diags_text(&diags)
                 );
             }
             other => panic!(
                 "the {label} ffi face must reject at the ffi gate under .so opts: {}",
                 match other {
                     Ok(_) => "accepted".to_string(),
-                    Err((s, d)) => format!("{}: {}", s.name(), d.join("; ")),
+                    Err((s, d)) => format!("{}: {}", s.name(), diags_text(&d)),
                 }
             ),
         }
@@ -1386,16 +1403,16 @@ fn w3a_crossing_faces_reject_on_both_drive_and_spawn() {
         match compile_exe(source) {
             Err((Stage::Analyze, diags)) => {
                 assert!(
-                    diags.iter().any(|d| d.contains(needle)),
+                    diags.iter().any(|d| d.render().contains(needle)),
                     "the {label} face rejected with the wrong text: {}",
-                    diags.join("; ")
+                    diags_text(&diags)
                 );
             }
             other => panic!(
                 "the {label} crossing face did not reject at analysis under exe opts: {}",
                 match other {
                     Ok(_) => "accepted".to_string(),
-                    Err((s, d)) => format!("{}: {}", s.name(), d.join("; ")),
+                    Err((s, d)) => format!("{}: {}", s.name(), diags_text(&d)),
                 }
             ),
         }
@@ -2038,4 +2055,191 @@ fn h7_census_sees_through_field_pin() {
         loc: at(1),
     }];
     analysis::build_context(&ast);
+}
+
+/// H11 pin 1 — ONE formatter, shipped-path golden renders. Every
+/// reachable rejection face (parse, the lex latch, the bounds guard,
+/// scope, the checker, the walk, the lattice, the elem table, the ffi
+/// gate's bare refusal) through the ONE pipeline, compared as FULL
+/// rendered strings — not substrings — so the format bytes
+/// (`line N: Kind: text`, the bare face verbatim) cannot drift
+/// between mints. The goldens are the pre-fold binary's bytes
+/// (probed byte-for-byte at the fold).
+#[test]
+fn h11_one_formatter_shipped_path_pin() {
+    let faces: &[(&str, Stage, &str)] = &[
+        // the parser: site from the token stream, kind Syntax
+        (
+            "local a = 1\nlocal b =\n",
+            Stage::Front,
+            "line 2: Syntax Error: Expected expression",
+        ),
+        // a lexer error LATCHES: the truncated stream still parses,
+        // both halves reject together at the front gate
+        (
+            "local a = 1\nlocal b = 1 $\n",
+            Stage::Front,
+            "line 2: Syntax Error: Lexer error",
+        ),
+        // the sixth face: the dialect's bounds guard (parser site)
+        (
+            "local t = {[1152921504606846976]=1}\n",
+            Stage::Front,
+            "line 1: Table Bounds Error: table index overflow",
+        ),
+        // the walk's scope face
+        (
+            "print(q)\n",
+            Stage::Analyze,
+            "line 1: Scope Error: reference to undeclared variable 'q'",
+        ),
+        // the checker's arithmetic face
+        (
+            "local a = \"x\"\nlocal b = a + 1\n",
+            Stage::Analyze,
+            "line 2: Type Error: '+' requires numeric operands",
+        ),
+        // the walk's lifetime face (the move law)
+        (
+            "local t = {1}\nlocal u = t\nlocal v = t\n",
+            Stage::Analyze,
+            "line 3: Lifetime Error: 't' may be moved here — reads through a \
+             possibly-moved name are rejected at compile time",
+        ),
+        // the lattice's conflict face — site from ctor_lines
+        (
+            "local t = {1}\nlocal u = {2}\nt[0] = u\n",
+            Stage::Analyze,
+            "line 1: Type Error: a table's cells hold one scalar kind — mixing scalar \
+             kinds chooses the dynamic cell (Any), but a table value never rides a \
+             cell (table site #0)",
+        ),
+        // the elem table's read-before-value face
+        (
+            "local t = {}\nprint(t[0])\n",
+            Stage::Analyze,
+            "line 1: Type Error: a table is read before it is ever given a value \
+             (table site #0)",
+        ),
+        // the ffi gate: bare — no site, no kind prefix, verbatim text
+        (
+            "local ffi = require(\"ffi\")\nffi.cdef(\"void* alm_exec(void*);\")\n",
+            Stage::Ffi,
+            "alm compiler error: the ffi surface (require(\"ffi\") / ffi.load / \
+             lib.sym) is --exe-only — rebuild with --exe; a shared object loading \
+             shared objects is not acyclic destiny",
+        ),
+    ];
+    for (source, want_stage, golden) in faces {
+        let Err((stage, diags)) = compile(source) else {
+            panic!("the face must reject: {golden:?}");
+        };
+        assert_eq!(
+            stage.name(),
+            want_stage.name(),
+            "the face rejected at the wrong stage: {golden:?}"
+        );
+        let rendered: Vec<String> = diags.iter().map(|d| d.render()).collect();
+        assert_eq!(
+            rendered,
+            vec![golden.to_string()],
+            "the rendered bytes drifted — the format law is byte-stable"
+        );
+        // the typed face behind the bytes: a real rejection is never a
+        // desync — the variant names the internal class only
+        assert!(
+            diags.iter().all(|d| !d.is_desync()),
+            "a shipped rejection minted as desync: {golden:?}"
+        );
+    }
+}
+
+/// H11 pin 2 — the site is the ONLY line source. One diagnostic text,
+/// two programs whose failing statements sit on different lines: the
+/// renders differ by the prefix alone, derived from the stamp. The
+/// unit leg pins the same law at the mint: site None renders no
+/// prefix at all (the root-exit/bare pushes' face).
+#[test]
+fn h11_site_derives_the_prefix_pin() {
+    // unit: the prefix appears iff the site does — nothing else moves
+    let d = Diagnostic::ty("'+' requires numeric operands");
+    assert_eq!(
+        d.render(),
+        "Type Error: '+' requires numeric operands",
+        "site None renders no line prefix"
+    );
+    assert_eq!(
+        d.clone().with_site(Some(3)).render(),
+        "line 3: Type Error: '+' requires numeric operands",
+        "the prefix is derived from the stamp alone"
+    );
+    assert_eq!(
+        d.with_site(Some(41)).render(),
+        "line 41: Type Error: '+' requires numeric operands",
+        "the text is unchanged by the stamp"
+    );
+    // shipped: same reject, same TEXT — the line tracks the statement
+    let near =
+        compile("local t = {1}\nlocal u = t\nlocal v = t\n").expect_err("the double move rejects");
+    let far = compile("local t = {1}\nlocal u = t\n\n\nlocal v = t\n")
+        .expect_err("the same double move rejects three lines later");
+    let render_near = near.1[0].render();
+    let render_far = far.1[0].render();
+    assert_eq!(
+        render_near,
+        "line 3: Lifetime Error: 't' may be moved here — reads through a \
+         possibly-moved name are rejected at compile time"
+    );
+    assert_eq!(
+        render_far,
+        "line 5: Lifetime Error: 't' may be moved here — reads through a \
+         possibly-moved name are rejected at compile time"
+    );
+    assert_eq!(
+        render_near.replace("line 3: ", ""),
+        render_far.replace("line 5: ", ""),
+        "one text, two sites — only the derived prefix differs"
+    );
+    assert_eq!(near.1[0].site, Some(3));
+    assert_eq!(far.1[0].site, Some(5));
+}
+
+/// H11 pin 3 — the kinds table and the desync protocol's render law.
+/// The six regular faces own their exact prefixes; Bare and Desync
+/// render their text verbatim (the desync message's face and
+/// "— … disagree" tail are content, not format — H12's 7c deletes the
+/// variant with the class). Desync-ness is the variant, never bytes.
+#[test]
+fn h11_kinds_and_desync_render_law_pin() {
+    let table: &[(Diagnostic, &str)] = &[
+        (Diagnostic::syntax("body"), "line 1: Syntax Error: body"),
+        (Diagnostic::ty("body"), "line 1: Type Error: body"),
+        (Diagnostic::scope("body"), "line 1: Scope Error: body"),
+        (Diagnostic::lifetime("body"), "line 1: Lifetime Error: body"),
+        (Diagnostic::lower("body"), "line 1: Lower Error: body"),
+        (
+            Diagnostic::bounds("body"),
+            "line 1: Table Bounds Error: body",
+        ),
+    ];
+    for (d, golden) in table {
+        let stamped = d.clone().with_site(Some(1));
+        assert_eq!(stamped.render(), *golden, "the prefix table is exact");
+        assert!(!d.is_desync(), "a regular face is never a desync");
+        assert!(d.site.is_none(), "the mint carries no site");
+    }
+    // Bare: the driver-face refusal shape — verbatim, prefixless
+    assert_eq!(Diagnostic::bare("refusal text").render(), "refusal text");
+    assert!(!Diagnostic::bare("refusal text").is_desync());
+    // Desync: the protocol's face — verbatim (its inline "Lower
+    // Error:" face and tail stay), and the variant classifies
+    let desync_text = "Lower Error: a stored value's repr disagrees with the table's \
+         element type — the checker and the lowerer disagree";
+    let desync = Diagnostic::desync(desync_text);
+    assert_eq!(desync.render(), desync_text);
+    assert!(desync.is_desync());
+    assert!(
+        desync.with_site(Some(7)).is_desync(),
+        "the stamp never changes the class"
+    );
 }
