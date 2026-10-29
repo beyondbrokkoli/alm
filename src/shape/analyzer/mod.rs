@@ -1,5 +1,5 @@
 use crate::analysis::AnalysisContext;
-use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
+use crate::ast::{BinOp, CtorKey, Expr, NodeId, Stmt, UnOp};
 use alm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -75,7 +75,7 @@ impl GateOn for Option<Recording> {
 
 struct WalkState {
     scopes: Vec<BTreeMap<String, TableShape>>,
-    fn_scopes: Vec<BTreeMap<String, Option<*const Expr>>>,
+    fn_scopes: Vec<BTreeMap<String, Option<NodeId>>>,
     changed: bool,
     conv_fires: BTreeSet<u8>,
     prov: Vec<BTreeMap<String, Option<Prov>>>,
@@ -89,17 +89,17 @@ struct WalkState {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Prov {
-    If(*const Stmt),
-    Call(*const Expr),
+    If(NodeId),
+    Call(NodeId),
 }
 
 struct LatticeState {
-    sites: BTreeMap<*const Expr, usize>,
+    sites: BTreeMap<NodeId, usize>,
     site_elem: Vec<Ty>,
     needed: Vec<bool>,
     child_sites: BTreeMap<usize, BTreeSet<usize>>,
     ghost_next: usize,
-    row_ghosts: BTreeMap<*const Expr, usize>,
+    row_ghosts: BTreeMap<NodeId, usize>,
     row_ghost_next: usize,
     ghost_mints: BTreeMap<usize, GhostMint>,
     site_slots: BTreeMap<usize, BTreeMap<i64, usize>>,
@@ -122,25 +122,25 @@ struct GhostMint {
 }
 
 struct OwnershipState {
-    free_sites: BTreeSet<*const Stmt>,
-    free_keeps: BTreeMap<*const Stmt, Vec<super::facts::Keep>>,
-    do_exit_frees: BTreeMap<(*const Stmt, u8), Vec<super::facts::DoExitFree>>,
+    free_sites: BTreeSet<NodeId>,
+    free_keeps: BTreeMap<NodeId, Vec<super::facts::Keep>>,
+    do_exit_frees: BTreeMap<(NodeId, u8), Vec<super::facts::DoExitFree>>,
     root_exit_frees: Vec<super::facts::DoExitFree>,
-    stmt_temp_frees: BTreeMap<*const Stmt, Vec<usize>>,
-    cond_temp_frees: BTreeMap<*const Stmt, Vec<usize>>,
-    arm_temp_frees: BTreeMap<*const Expr, Vec<usize>>,
-    ret_path_frees: BTreeMap<*const Stmt, Vec<super::facts::DoExitFree>>,
-    break_path_frees: BTreeMap<*const Stmt, Vec<super::facts::DoExitFree>>,
-    ret_path_keep_frees: BTreeMap<*const Stmt, Vec<super::facts::DoExitFree>>,
-    ret_path_keep_temps: BTreeMap<*const Stmt, Vec<usize>>,
-    rebind_grants: BTreeMap<*const Stmt, BTreeMap<String, Vec<super::facts::Keep>>>,
+    stmt_temp_frees: BTreeMap<NodeId, Vec<usize>>,
+    cond_temp_frees: BTreeMap<NodeId, Vec<usize>>,
+    arm_temp_frees: BTreeMap<NodeId, Vec<usize>>,
+    ret_path_frees: BTreeMap<NodeId, Vec<super::facts::DoExitFree>>,
+    break_path_frees: BTreeMap<NodeId, Vec<super::facts::DoExitFree>>,
+    ret_path_keep_frees: BTreeMap<NodeId, Vec<super::facts::DoExitFree>>,
+    ret_path_keep_temps: BTreeMap<NodeId, Vec<usize>>,
+    rebind_grants: BTreeMap<NodeId, BTreeMap<String, Vec<super::facts::Keep>>>,
     stored_ctor_parents: BTreeSet<usize>,
-    move_poisons: BTreeMap<*const Stmt, BTreeSet<String>>,
-    store_ghost_keeps: BTreeMap<*const Stmt, Vec<usize>>,
-    ctor_ghost_keeps: BTreeMap<*const Expr, Vec<(usize, usize)>>,
-    arm_free_sites: BTreeMap<*const Stmt, Vec<super::facts::ArmFreeEntry>>,
-    arm_rebind_frees: BTreeMap<*const Stmt, Vec<super::facts::ArmFreeEntry>>,
-    arm_do_exit_frees: BTreeMap<(*const Stmt, u8), Vec<super::facts::ArmFreeEntry>>,
+    move_poisons: BTreeMap<NodeId, BTreeSet<String>>,
+    store_ghost_keeps: BTreeMap<NodeId, Vec<usize>>,
+    ctor_ghost_keeps: BTreeMap<NodeId, Vec<(usize, usize)>>,
+    arm_free_sites: BTreeMap<NodeId, Vec<super::facts::ArmFreeEntry>>,
+    arm_rebind_frees: BTreeMap<NodeId, Vec<super::facts::ArmFreeEntry>>,
+    arm_do_exit_frees: BTreeMap<(NodeId, u8), Vec<super::facts::ArmFreeEntry>>,
     arm_root_exit_frees: Vec<super::facts::ArmFreeEntry>,
 }
 
@@ -174,16 +174,12 @@ struct ReadSideState {
 
 struct LayoutFactsState {
     name_dense: BTreeMap<(String, usize), bool>,
-    fill_loops: BTreeMap<*const Stmt, super::facts::FillPlan>,
+    fill_loops: BTreeMap<NodeId, super::facts::FillPlan>,
     verdicts: Vec<LayoutVerdict>,
 }
 
-fn collect_body_sites(
-    stmts: &[Stmt],
-    sites: &BTreeMap<*const Expr, usize>,
-    out: &mut BTreeSet<usize>,
-) {
-    fn walk_stmt(s: &Stmt, sites: &BTreeMap<*const Expr, usize>, out: &mut BTreeSet<usize>) {
+fn collect_body_sites(stmts: &[Stmt], sites: &BTreeMap<NodeId, usize>, out: &mut BTreeSet<usize>) {
+    fn walk_stmt(s: &Stmt, sites: &BTreeMap<NodeId, usize>, out: &mut BTreeSet<usize>) {
         match s {
             Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
                 exprs.iter().for_each(|e| walk_expr(e, sites, out))
@@ -221,8 +217,8 @@ fn collect_body_sites(
             }
         }
     }
-    fn walk_expr(e: &Expr, sites: &BTreeMap<*const Expr, usize>, out: &mut BTreeSet<usize>) {
-        if let Some(&id) = sites.get(&(e as *const Expr)) {
+    fn walk_expr(e: &Expr, sites: &BTreeMap<NodeId, usize>, out: &mut BTreeSet<usize>) {
+        if let Some(&id) = sites.get(&e.id()) {
             out.insert(id);
         }
         match e {
@@ -234,7 +230,7 @@ fn collect_body_sites(
                     walk_expr(v, sites, out);
                 }
             }
-            Expr::Index { obj, key } => {
+            Expr::Index { obj, key, .. } => {
                 walk_expr(obj, sites, out);
                 walk_expr(key, sites, out);
             }
@@ -243,7 +239,7 @@ fn collect_body_sites(
                 walk_expr(right, sites, out);
             }
             Expr::UnaryOp { expr, .. } => walk_expr(expr, sites, out),
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 walk_expr(callee, sites, out);
                 args.iter().for_each(|a| walk_expr(a, sites, out));
             }
@@ -312,7 +308,7 @@ fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
                     walk_expr(v, out);
                 }
             }
-            Expr::Index { obj, key } => {
+            Expr::Index { obj, key, .. } => {
                 walk_expr(obj, out);
                 walk_expr(key, out);
             }
@@ -321,7 +317,7 @@ fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
                 walk_expr(right, out);
             }
             Expr::UnaryOp { expr, .. } => walk_expr(expr, out),
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 walk_expr(callee, out);
                 args.iter().for_each(|a| walk_expr(a, out));
             }
@@ -331,7 +327,7 @@ fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
     }
     fn stmt_base(e: &Expr) -> Option<String> {
         match e {
-            Expr::Identifier(n) => Some(n.clone()),
+            Expr::Identifier { name: n, .. } => Some(n.clone()),
             Expr::Index { obj, .. } => stmt_base(obj),
             _ => None,
         }
@@ -352,30 +348,29 @@ struct Analyzer {
     /// the differential lever (see `analyze_with`): false disarms the
     /// walk-side use-site pins so only the checker's own land.
     walk_pins: bool,
-    stmt_lines: BTreeMap<*const Stmt, usize>,
     ctor_lines: Vec<usize>,
     fn_rets: Vec<Option<TableShape>>,
     fn_edge_frames: Vec<Vec<TableShape>>,
-    fn_ret_shapes: BTreeMap<*const Expr, TableShape>,
-    fn_ret_edge_shapes: BTreeMap<*const Expr, Vec<TableShape>>,
-    join_arm_shapes: BTreeMap<(*const Stmt, String), (TableShape, TableShape)>,
-    join_tags: BTreeMap<*const Stmt, bool>,
-    call_tags: BTreeMap<*const Expr, Vec<bool>>,
-    fn_scope_keys: BTreeMap<*const Expr, (*const Stmt, u8)>,
+    fn_ret_shapes: BTreeMap<NodeId, TableShape>,
+    fn_ret_edge_shapes: BTreeMap<NodeId, Vec<TableShape>>,
+    join_arm_shapes: BTreeMap<(NodeId, String), (TableShape, TableShape)>,
+    join_tags: BTreeMap<NodeId, bool>,
+    call_tags: BTreeMap<NodeId, Vec<bool>>,
+    fn_scope_keys: BTreeMap<NodeId, (NodeId, u8)>,
     fn_body_sites: BTreeSet<usize>,
-    fn_params: BTreeMap<*const Expr, Vec<String>>,
-    fn_store_params: BTreeMap<*const Expr, BTreeSet<String>>,
+    fn_params: BTreeMap<NodeId, Vec<String>>,
+    fn_store_params: BTreeMap<NodeId, BTreeSet<String>>,
     fn_param_sites: BTreeSet<usize>,
-    fn_moved_params: BTreeMap<*const Expr, BTreeSet<String>>,
-    fn_ret_params: BTreeMap<*const Expr, BTreeSet<usize>>,
-    fn_ret_reach: BTreeMap<*const Expr, BTreeSet<usize>>,
+    fn_moved_params: BTreeMap<NodeId, BTreeSet<String>>,
+    fn_ret_params: BTreeMap<NodeId, BTreeSet<usize>>,
+    fn_ret_reach: BTreeMap<NodeId, BTreeSet<usize>>,
     fn_ret_reaches: Vec<BTreeSet<usize>>,
-    fn_walk: Vec<(*const Expr, Vec<String>)>,
+    fn_walk: Vec<(NodeId, Vec<String>)>,
     fn_scope_entries: Vec<usize>,
     /// the Hygiene Law's definition-side record: per fn literal, the
     /// defining-scope chain snapshot taken at its definition walk (see
     /// `walk_fn_def`). Read by the checking half's call resolution.
-    fn_def_sites: BTreeMap<*const Expr, BTreeMap<String, Option<*const Expr>>>,
+    fn_def_sites: BTreeMap<NodeId, BTreeMap<String, Option<NodeId>>>,
     /// W3a's capture sets (the invariance argument lives HERE, fold d
     /// B4 style): per fn literal, the enclosing-scope (below-top-level)
     /// non-fn names its body transitively reads. WHICH names a body
@@ -385,7 +380,7 @@ struct Analyzer {
     /// definition, consumed by the checking half (env faces, capture
     /// guard). The CELL TYPES are per-instantiation checker territory
     /// (`env_faces`).
-    fn_captures: BTreeMap<*const Expr, BTreeSet<String>>,
+    fn_captures: BTreeMap<NodeId, BTreeSet<String>>,
     loop_scope_entries: Vec<usize>,
 }
 
@@ -472,7 +467,6 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
             fill_loops: BTreeMap::new(),
             verdicts: vec![LayoutVerdict::Growing; n],
         },
-        stmt_lines: ctx.stmt_lines.clone(),
         ctor_lines: ctx.ctor_lines.clone(),
         fn_rets: Vec::new(),
         fn_edge_frames: Vec::new(),
@@ -571,7 +565,6 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
     // the statement's walk (its queries) and after it (its fresh
     // declarations' view compare).
     let mut chk = checker::Checker::new(checker::CheckCtx {
-        stmt_lines: a.stmt_lines.clone(),
         adopt_lines: adopt_lines.clone(),
         sites: a.lattice.sites.clone(),
         elems: static_elems.clone(),
@@ -597,10 +590,9 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
         chk.snapshot_pre(&a.walk, &a.holds.moved_severed);
         if let Err(err) = a.walk_stmt(rec, stmt) {
             signal!(rec.on(), trace::TRACE_GHOST_BAIL);
-            a.ledger.diagnostics.push(
-                err.0
-                    .with_site(a.stmt_lines.get(&(stmt as *const Stmt)).copied()),
-            );
+            a.ledger
+                .diagnostics
+                .push(err.0.with_site(Some(stmt.loc().line as usize)));
             checker_ran = false;
             walk_completed = false;
             break;
@@ -614,7 +606,7 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
             }
             a.ledger
                 .diagnostics
-                .push(msg.with_site(a.stmt_lines.get(&(stmt as *const Stmt)).copied()));
+                .push(msg.with_site(Some(stmt.loc().line as usize)));
             // a top-level checker error stops the walk, but the closing
             // moves still run — the standalone pass did the same
             walk_completed = false;
@@ -673,11 +665,10 @@ struct Recorded {
     own: OwnershipState,
     reads: ReadSideState,
     layout: LayoutFactsState,
-    stmt_lines: BTreeMap<*const Stmt, usize>,
     ctor_lines: Vec<usize>,
-    fn_scope_keys: BTreeMap<*const Expr, (*const Stmt, u8)>,
-    join_tags: BTreeMap<*const Stmt, bool>,
-    call_tags: BTreeMap<*const Expr, Vec<bool>>,
+    fn_scope_keys: BTreeMap<NodeId, (NodeId, u8)>,
+    join_tags: BTreeMap<NodeId, bool>,
+    call_tags: BTreeMap<NodeId, Vec<bool>>,
     adopt_lines: BTreeMap<String, usize>,
     /// the single elem table, computed once post-fixpoint — the same
     /// values the checker checked against ride out in the facts
@@ -702,7 +693,6 @@ impl Analyzer {
             own: self.own,
             reads: self.reads,
             layout: self.layout,
-            stmt_lines: self.stmt_lines,
             ctor_lines: self.ctor_lines,
             fn_scope_keys: self.fn_scope_keys,
             join_tags: self.join_tags,
@@ -846,7 +836,6 @@ impl Recorded {
             ffi_verbs: self.chk.ffi_verbs,
             index_key_lanes: self.chk.index_key_lanes,
             access_elems: self.chk.access_elems,
-            stmt_lines: self.stmt_lines,
             ctor_lines: self.ctor_lines,
             adopt_lines: self.adopt_lines,
             diagnostics,
@@ -856,7 +845,7 @@ impl Recorded {
 
 fn get_base_identifier(expr: &Expr) -> Option<&String> {
     match expr {
-        Expr::Identifier(name) => Some(name),
+        Expr::Identifier { name, .. } => Some(name),
         Expr::Index { obj, .. } => get_base_identifier(obj),
         _ => None,
     }
@@ -879,11 +868,11 @@ pub(super) fn value_call_msg(name: &str) -> Diagnostic {
 /// string key. None when the chain does not bottom out at a plain
 /// identifier (that face is a module-surface call, not a name).
 pub(super) fn dotted_callee(callee: &Expr) -> Option<String> {
-    let Expr::Field { obj, name } = callee else {
+    let Expr::Field { obj, name, .. } = callee else {
         return None;
     };
     let base = match obj.as_ref() {
-        Expr::Identifier(b) => b.clone(),
+        Expr::Identifier { name: b, .. } => b.clone(),
         Expr::Field { .. } => dotted_callee(obj.as_ref())?,
         _ => return None,
     };

@@ -11,17 +11,19 @@ pub(super) enum NumExpr {
 
 pub(super) fn num_of(expr: &Expr) -> NumExpr {
     match expr {
-        Expr::Integer(v) => NumExpr::Lit(*v),
-        Expr::Identifier(n) => NumExpr::Var(n.clone()),
+        Expr::Integer { value: v, .. } => NumExpr::Lit(*v),
+        Expr::Identifier { name: n, .. } => NumExpr::Var(n.clone()),
         Expr::BinaryOp {
             op: BinOp::Add,
             left,
             right,
+            ..
         } => NumExpr::Add(Box::new(num_of(left)), Box::new(num_of(right))),
         Expr::BinaryOp {
             op: BinOp::Mul,
             left,
             right,
+            ..
         } => NumExpr::Mul(Box::new(num_of(left)), Box::new(num_of(right))),
         _ => NumExpr::Other,
     }
@@ -92,11 +94,12 @@ pub(super) fn guard_only_ascends(
                     op: BinOp::Add,
                     left,
                     right,
+                    ..
                 } = expr
                 else {
                     return false;
                 };
-                if !matches!(left.as_ref(), Expr::Identifier(n) if n == guard) {
+                if !matches!(left.as_ref(), Expr::Identifier { name: n, .. } if n == guard) {
                     return false;
                 }
                 if !guard_provably_nonneg_expr(num_assigns, right) {
@@ -142,7 +145,7 @@ impl Analyzer {
     ) -> Result<(), ShapeError> {
         if let Expr::TableCtor { entries, .. } = expr {
             for (_, e) in entries {
-                if let Expr::Identifier(n) = e {
+                if let Expr::Identifier { name: n, .. } = e {
                     let (d, bind) = self.resolve(rec, n)?;
                     self.record_moved_param(n);
                     self.check_boundary_pin(&bind, n)?;
@@ -169,7 +172,7 @@ impl Analyzer {
         args: &[Expr],
     ) -> Result<(Ty, BTreeSet<usize>, RowLineage), ShapeError> {
         let base = match obj {
-            Expr::Identifier(n) => n.as_str(),
+            Expr::Identifier { name: n, .. } => n.as_str(),
             _ => {
                 return Err(ShapeError(Diagnostic::scope(
                     "the ffi surface's '.' base must be a name",
@@ -223,33 +226,33 @@ impl Analyzer {
         expr: &Expr,
     ) -> Result<(Ty, BTreeSet<usize>, RowLineage), ShapeError> {
         match expr {
-            Expr::Integer(_) => {
+            Expr::Integer { .. } => {
                 signal!(rec.on(), trace::TRACE_INFER_INT);
                 Ok((Int, BTreeSet::new(), BTreeMap::new()))
             }
-            Expr::Float(_) => {
+            Expr::Float { .. } => {
                 signal!(rec.on(), trace::TRACE_INFER_FLT);
                 Ok((Flt, BTreeSet::new(), BTreeMap::new()))
             }
-            Expr::Boolean(_) => {
+            Expr::Boolean { .. } => {
                 signal!(rec.on(), trace::TRACE_INFER_BOOL);
                 Ok((Bool, BTreeSet::new(), BTreeMap::new()))
             }
-            Expr::String(_) => {
+            Expr::String { .. } => {
                 signal!(rec.on(), trace::TRACE_INFER_STR);
                 Ok((Str, BTreeSet::new(), BTreeMap::new()))
             }
-            Expr::Nil => {
+            Expr::Nil { .. } => {
                 signal!(rec.on(), trace::TRACE_INFER_NIL);
                 Ok((Conflict, BTreeSet::new(), BTreeMap::new()))
             }
             Expr::TableCtor { entries, .. } => {
-                let id = self.lattice.sites[&(expr as *const Expr)];
+                let id = self.lattice.sites[&expr.id()];
                 let mut first_elem_ty: Option<Ty> = None;
                 let mut row_sites: Vec<usize> = Vec::new();
                 for (ei, (k, e)) in entries.iter().enumerate() {
                     if let CtorKey::Const(c) = k
-                        && let Some(&child) = self.lattice.sites.get(&(e as *const Expr))
+                        && let Some(&child) = self.lattice.sites.get(&e.id())
                         && matches!(e, Expr::TableCtor { .. })
                     {
                         self.lattice
@@ -273,7 +276,14 @@ impl Analyzer {
                     } else if let CtorKey::Const(c) = k
                         && rec.on()
                     {
-                        self.check_key_threshold(rec, &Expr::Integer(*c), &BTreeSet::from([id]))?;
+                        self.check_key_threshold(
+                            rec,
+                            &Expr::Integer {
+                                value: *c,
+                                id: NodeId::mint(),
+                            },
+                            &BTreeSet::from([id]),
+                        )?;
                     }
                     let (t, esites, elineage) = self.infer_expr(rec, e)?;
                     if matches!(t, Pending)
@@ -291,7 +301,7 @@ impl Analyzer {
                         {
                             row_sites.push(s);
                         }
-                        if let Some(&child_site) = self.lattice.sites.get(&(e as *const Expr)) {
+                        if let Some(&child_site) = self.lattice.sites.get(&e.id()) {
                             signal!(rec.on(), trace::TRACE_INFER_TBL_CHILD);
                             self.lattice
                                 .child_sites
@@ -339,7 +349,7 @@ impl Analyzer {
                                     if rec.on() {
                                         self.own
                                             .ctor_ghost_keeps
-                                            .entry(expr as *const Expr)
+                                            .entry(expr.id())
                                             .or_default()
                                             .push((ei, g));
                                         signal!(rec.on(), trace::TRACE_ROW_HOUSED);
@@ -425,7 +435,7 @@ impl Analyzer {
                     BTreeMap::new(),
                 ))
             }
-            Expr::Index { obj, key } => {
+            Expr::Index { obj, key, .. } => {
                 let (kt, _, _) = self.infer_expr(rec, key)?;
                 if matches!(kt, Flt | Bool) {
                     crate::alm_dbgln!("[idx] bad key ty={:?}", kt);
@@ -529,7 +539,7 @@ impl Analyzer {
                 for (_, d) in lineage.values_mut() {
                     *d += 1;
                 }
-                if let Expr::Identifier(name) = obj.as_ref() {
+                if let Expr::Identifier { name, .. } = obj.as_ref() {
                     for &s in &sites {
                         if !is_root(&s) {
                             lineage.entry(s).or_insert((name.clone(), 1));
@@ -540,7 +550,7 @@ impl Analyzer {
                     BTreeSet::new()
                 } else {
                     signal!(rec.on(), trace::TRACE_ROW_GHOST_MINT);
-                    let node = expr as *const Expr;
+                    let node = expr.id();
                     let ghost = match self.lattice.row_ghosts.get(&node) {
                         Some(&g) => g,
                         None => {
@@ -586,7 +596,7 @@ impl Analyzer {
                 };
                 Ok((r, aliases, lineage))
             }
-            Expr::Identifier(name) => {
+            Expr::Identifier { name, .. } => {
                 signal!(rec.on(), trace::TRACE_INFER_IDENT);
                 let (depth, bind) = self.resolve(rec, name)?;
                 let _ = depth;
@@ -598,7 +608,9 @@ impl Analyzer {
                 }
                 Ok((bind.ty, bind.aliases.clone(), bind.lineage.clone()))
             }
-            Expr::BinaryOp { op, left, right } => {
+            Expr::BinaryOp {
+                op, left, right, ..
+            } => {
                 let (lt, _, _) = self.infer_expr(rec, left)?;
                 let (rt, _, _) = self.infer_expr(rec, right)?;
                 // the use-site pin disciplines, mirroring the checking
@@ -664,7 +676,7 @@ impl Analyzer {
                     }
                 }
             }
-            Expr::UnaryOp { op, expr } => {
+            Expr::UnaryOp { op, expr, .. } => {
                 let (t, _, _) = self.infer_expr(rec, expr)?;
                 match op {
                     UnOp::Neg => {
@@ -691,16 +703,16 @@ impl Analyzer {
                     }
                 }
             }
-            Expr::SysAllocCount => {
+            Expr::SysAllocCount { .. } => {
                 signal!(rec.on(), trace::TRACE_INFER_SYSALLOC);
                 Ok((Int, BTreeSet::new(), BTreeMap::new()))
             }
-            Expr::SysExecCount => {
+            Expr::SysExecCount { .. } => {
                 signal!(rec.on(), trace::TRACE_INFER_SYS_EXEC);
                 Ok((Int, BTreeSet::new(), BTreeMap::new()))
             }
-            Expr::FfiModule => Ok((Ffi, BTreeSet::new(), BTreeMap::new())),
-            Expr::CoroModule => Ok((Coro, BTreeSet::new(), BTreeMap::new())),
+            Expr::FfiModule { .. } => Ok((Ffi, BTreeSet::new(), BTreeMap::new())),
+            Expr::CoroModule { .. } => Ok((Coro, BTreeSet::new(), BTreeMap::new())),
             Expr::Field { obj, .. } => {
                 // a record read answers the table's element type and rides
                 // the receiver's sites: record cells are the table's elem
@@ -729,9 +741,9 @@ impl Analyzer {
                 signal!(rec.on(), trace::TRACE_INFER_IDENT);
                 Ok((Pending, BTreeSet::new(), BTreeMap::new()))
             }
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 let name: String = match callee.as_ref() {
-                    Expr::Field { obj, name } => {
+                    Expr::Field { obj, name, .. } => {
                         // D4 precedence, walk half: a dotted callee chain
                         // ("A.b", "A.B.c") that resolves through the fn
                         // maps is an expansion call — the expansion map
@@ -744,7 +756,7 @@ impl Analyzer {
                             return self.infer_module_call(rec, obj, name, args);
                         }
                     }
-                    Expr::Identifier(n) => n.clone(),
+                    Expr::Identifier { name: n, .. } => n.clone(),
                     _ => {
                         return Err(ShapeError(calls_through_fn_var_msg()));
                     }
@@ -771,7 +783,7 @@ impl Analyzer {
                 let mut ret_arg_sites: BTreeSet<usize> = BTreeSet::new();
                 let mut ret_lineage: RowLineage = BTreeMap::new();
                 for (i, a) in args.iter().enumerate() {
-                    if let Expr::Identifier(n) = a {
+                    if let Expr::Identifier { name: n, .. } = a {
                         let moves_it = moved_params
                             .as_ref()
                             .is_some_and(|m| params.get(i).is_some_and(|p| m.contains(p)));
@@ -820,7 +832,7 @@ impl Analyzer {
                         );
                     }
                     if ret_params.as_ref().is_some_and(|r| r.contains(&i))
-                        && !matches!(a, Expr::Identifier(_))
+                        && !matches!(a, Expr::Identifier { .. })
                     {
                         ret_arg_sites.extend(sites.iter().copied().filter(|s| !is_root(s)));
                         for (origin, val) in &arg_lineage {
@@ -903,7 +915,7 @@ impl Analyzer {
     pub(super) fn detect_fill_loop(
         &mut self,
         rec: Gate,
-        while_stmt: *const Stmt,
+        while_stmt: NodeId,
         guard: &str,
         bound: &Expr,
         body: &[Stmt],
@@ -940,7 +952,10 @@ impl Analyzer {
             for stmt in stmts {
                 if let Stmt::IndexAssign {
                     obj,
-                    key: Expr::Identifier(key_ident),
+                    key:
+                        Expr::Identifier {
+                            name: key_ident, ..
+                        },
                     ..
                 } = stmt
                     && key_ident == guard
@@ -948,7 +963,7 @@ impl Analyzer {
                     && !mutated.contains(table_name)
                 {
                     match obj {
-                        Expr::Identifier(_) => {
+                        Expr::Identifier { .. } => {
                             fills.insert(table_name.clone());
                         }
                         Expr::Index { .. } => {
@@ -1054,7 +1069,7 @@ impl Analyzer {
 fn idents_of(expr: &Expr) -> BTreeSet<String> {
     fn go(expr: &Expr, out: &mut BTreeSet<String>) {
         match expr {
-            Expr::Identifier(name) => {
+            Expr::Identifier { name, .. } => {
                 out.insert(name.clone());
             }
             Expr::BinaryOp { left, right, .. } => {
@@ -1062,11 +1077,11 @@ fn idents_of(expr: &Expr) -> BTreeSet<String> {
                 go(right, out);
             }
             Expr::UnaryOp { expr, .. } => go(expr, out),
-            Expr::Index { obj, key } => {
+            Expr::Index { obj, key, .. } => {
                 go(obj, out);
                 go(key, out);
             }
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 go(callee, out);
                 for a in args {
                     go(a, out);

@@ -1,5 +1,5 @@
 use super::core::LayoutVerdict;
-use crate::ast::{Expr, Stmt};
+use crate::ast::{Expr, NodeId, Stmt};
 use crate::diag::Diagnostic;
 use crate::shape::Ty;
 use alm_rt::{signal, trace};
@@ -22,8 +22,8 @@ pub struct DoExitFree {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TagSrc {
-    If(*const Stmt),
-    Call(*const Expr),
+    If(NodeId),
+    Call(NodeId),
 }
 
 #[derive(Clone)]
@@ -34,10 +34,16 @@ pub struct ArmFreeEntry {
     pub keeps: Vec<Keep>,
 }
 
+/// The fn literal's body, OWNED (H6): identity rides the node's id,
+/// not its address, so the facts are self-contained — the AST may move
+/// or die after analysis and the recorded bodies stay valid. A copy of
+/// a node IS the node (the id copies with it); construction is the
+/// only way to mint a new one, and the derivation pass's identity
+/// census (analysis.rs) keeps duplicate ids out of any tree it reads.
 #[derive(Clone)]
 pub struct FnDef {
     pub params: Vec<String>,
-    pub body: *const [Stmt],
+    pub body: Vec<Stmt>,
     pub ret: Ty,
     pub signature: Option<Vec<Ty>>,
 }
@@ -77,8 +83,8 @@ pub enum KeyLane {
 }
 
 impl FnDef {
-    pub unsafe fn body(&self) -> &[Stmt] {
-        unsafe { &*self.body }
+    pub fn body(&self) -> &[Stmt] {
+        &self.body
     }
 }
 
@@ -97,7 +103,7 @@ pub struct FillPlan {
 
 #[derive(Clone)]
 pub struct ShapeFacts {
-    pub sites: BTreeMap<*const Expr, usize>,
+    pub sites: BTreeMap<NodeId, usize>,
     pub elems: Vec<Ty>,
     pub boundary_elem: Option<Ty>,
     #[allow(dead_code)]
@@ -113,32 +119,32 @@ pub struct ShapeFacts {
     /// the same statements, the same scope tree, and the same exit
     /// edges at every site. Nothing kind-flavored may join this family
     /// without gaining the `(expr/stmt, expansion site)` key.
-    pub free_sites: BTreeSet<*const Stmt>,
-    pub free_keeps: BTreeMap<*const Stmt, Vec<Keep>>,
-    pub do_exit_frees: BTreeMap<(*const Stmt, u8), Vec<DoExitFree>>,
+    pub free_sites: BTreeSet<NodeId>,
+    pub free_keeps: BTreeMap<NodeId, Vec<Keep>>,
+    pub do_exit_frees: BTreeMap<(NodeId, u8), Vec<DoExitFree>>,
     pub root_exit_frees: Vec<DoExitFree>,
-    pub stmt_temp_frees: BTreeMap<*const Stmt, Vec<usize>>,
-    pub cond_temp_frees: BTreeMap<*const Stmt, Vec<usize>>,
-    pub arm_temp_frees: BTreeMap<*const Expr, Vec<usize>>,
-    pub ret_path_frees: BTreeMap<*const Stmt, Vec<DoExitFree>>,
-    pub break_path_frees: BTreeMap<*const Stmt, Vec<DoExitFree>>,
-    pub ret_path_keep_frees: BTreeMap<*const Stmt, Vec<DoExitFree>>,
-    pub ret_path_keep_temps: BTreeMap<*const Stmt, Vec<usize>>,
-    pub rebind_frees: BTreeMap<*const Stmt, BTreeMap<String, Vec<Keep>>>,
-    pub join_tags: BTreeMap<*const Stmt, bool>,
-    pub call_tags: BTreeMap<*const Expr, Vec<bool>>,
-    pub store_ghost_keeps: BTreeMap<*const Stmt, Vec<usize>>,
-    pub ctor_ghost_keeps: BTreeMap<*const Expr, Vec<(usize, usize)>>,
-    pub arm_free_sites: BTreeMap<*const Stmt, Vec<ArmFreeEntry>>,
-    pub arm_rebind_frees: BTreeMap<*const Stmt, Vec<ArmFreeEntry>>,
-    pub arm_do_exit_frees: BTreeMap<(*const Stmt, u8), Vec<ArmFreeEntry>>,
+    pub stmt_temp_frees: BTreeMap<NodeId, Vec<usize>>,
+    pub cond_temp_frees: BTreeMap<NodeId, Vec<usize>>,
+    pub arm_temp_frees: BTreeMap<NodeId, Vec<usize>>,
+    pub ret_path_frees: BTreeMap<NodeId, Vec<DoExitFree>>,
+    pub break_path_frees: BTreeMap<NodeId, Vec<DoExitFree>>,
+    pub ret_path_keep_frees: BTreeMap<NodeId, Vec<DoExitFree>>,
+    pub ret_path_keep_temps: BTreeMap<NodeId, Vec<usize>>,
+    pub rebind_frees: BTreeMap<NodeId, BTreeMap<String, Vec<Keep>>>,
+    pub join_tags: BTreeMap<NodeId, bool>,
+    pub call_tags: BTreeMap<NodeId, Vec<bool>>,
+    pub store_ghost_keeps: BTreeMap<NodeId, Vec<usize>>,
+    pub ctor_ghost_keeps: BTreeMap<NodeId, Vec<(usize, usize)>>,
+    pub arm_free_sites: BTreeMap<NodeId, Vec<ArmFreeEntry>>,
+    pub arm_rebind_frees: BTreeMap<NodeId, Vec<ArmFreeEntry>>,
+    pub arm_do_exit_frees: BTreeMap<(NodeId, u8), Vec<ArmFreeEntry>>,
     pub arm_root_exit_frees: Vec<ArmFreeEntry>,
     /// (`move_poisons`: the names a statement moved FROM — the lowerer's
     /// null_moves_of zeroes each source register AT the keyed statement,
     /// so a moved binding can never be read or freed twice; the map is
     /// structure (which names died where), the zeroing is
     /// per-instantiation codegen at the site.)
-    pub move_poisons: BTreeMap<*const Stmt, BTreeSet<String>>,
+    pub move_poisons: BTreeMap<NodeId, BTreeSet<String>>,
     pub name_dense: BTreeMap<(String, usize), bool>,
     /// KEYING DISCIPLINE (H9): keyed by the While stmt node. The plan
     /// is recorded ONCE per loop node in the walk's recorded pass —
@@ -148,7 +154,7 @@ pub struct ShapeFacts {
     /// per-instantiation (the lowerer's scope depth, `has_var`, the
     /// depth-matched dense verdict) stays consumption-side — this map
     /// carries only the acceptance decision and its fill bases.
-    pub fill_loops: BTreeMap<*const Stmt, FillPlan>,
+    pub fill_loops: BTreeMap<NodeId, FillPlan>,
     pub stored_ctor_parents: BTreeSet<usize>,
     pub substitutions: BTreeMap<usize, Ty>,
     /// KEYING DISCIPLINE (B3, fold d): keyed by the triple
@@ -160,12 +166,12 @@ pub struct ShapeFacts {
     /// expansions of one body may close the same bare local
     /// differently — each expansion lowers its own IR local, and this
     /// key keeps each lowering on its own resolved truth.
-    pub local_types: BTreeMap<(*const Stmt, Option<*const Expr>, String), Ty>,
+    pub local_types: BTreeMap<(NodeId, Option<NodeId>, String), Ty>,
     pub row_reads: BTreeMap<usize, (String, usize)>,
     pub cell_children: BTreeMap<usize, BTreeSet<usize>>,
-    pub fn_scope_keys: BTreeMap<*const Expr, (*const Stmt, u8)>,
-    pub fn_touched: BTreeMap<*const Expr, BTreeSet<String>>,
-    pub fn_defs: BTreeMap<*const Expr, FnDef>,
+    pub fn_scope_keys: BTreeMap<NodeId, (NodeId, u8)>,
+    pub fn_touched: BTreeMap<NodeId, BTreeSet<String>>,
+    pub fn_defs: BTreeMap<NodeId, FnDef>,
     /// KEYING DISCIPLINE (W3a): per fn literal, the RESOLVED env face —
     /// capture name → cell type — recorded at the FIRST creation site
     /// and unified (never contradicted) at later sites: the enclosing
@@ -173,14 +179,14 @@ pub struct ShapeFacts {
     /// every creation site of one fn literal in one program agrees.
     /// `resolve_fn_defs_through_subs` re-resolves these through the
     /// final store (the Store Window Law rides here as everywhere).
-    pub env_faces: BTreeMap<*const Expr, BTreeMap<String, Ty>>,
+    pub env_faces: BTreeMap<NodeId, BTreeMap<String, Ty>>,
     /// KEYING DISCIPLINE: same `(expr, expansion site)` pairs as
     /// `call_defs` — the creation sites themselves: an fn name read as
     /// a VALUE (escape position) mints the env here. Map value is the
     /// fn literal the value names. One identifier expr may be checked
     /// once per expansion site; the pair key keeps each lowering on
     /// its own mint.
-    pub creation_envs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
+    pub creation_envs: BTreeMap<(NodeId, NodeId), NodeId>,
     /// KEYING DISCIPLINE (W3a): same `(call expr, expansion site)`
     /// pairs as `call_defs` — WHICH resolved calls dispatch through a
     /// closure VALUE (a record field's singleton) rather than the
@@ -188,7 +194,7 @@ pub struct ShapeFacts {
     /// kind: a dotted callee may be either a D4 dot-ns expansion call
     /// or a closure-field dispatch, and the two lower differently
     /// (env cell read vs. no read at all).
-    pub closure_calls: BTreeSet<(*const Expr, *const Expr)>,
+    pub closure_calls: BTreeSet<(NodeId, NodeId)>,
     /// KEYING DISCIPLINE (W3a, R3's record-face rule): (ctor SITE,
     /// field name) → the fn literal the field carries. The closure
     /// face rides the FIELD, never the elem — a record's array elem
@@ -197,7 +203,7 @@ pub struct ShapeFacts {
     /// statically. Sites flow to readers through the existing alias
     /// machinery (that is what table identity IS in the checker's
     /// world).
-    pub closure_fields: BTreeMap<(usize, String), *const Expr>,
+    pub closure_fields: BTreeMap<(usize, String), NodeId>,
     /// KEYING DISCIPLINE (the R1 law): keyed by the pair
     /// `(call expr, expansion site)` where the expansion site is the
     /// OUTERMOST call whose inline expansion the call expr is being
@@ -249,13 +255,13 @@ pub struct ShapeFacts {
     /// final truth. Resolving at insertion would close the mechanism
     /// itself, but no divergence exists to close — this note is the
     /// law, not a debt.
-    pub call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
+    pub call_defs: BTreeMap<(NodeId, NodeId), NodeId>,
     /// KEYING DISCIPLINE: same `(call expr, expansion site)` pairs as
     /// `call_defs` — the RESOLVED return type of that one expansion.
     /// `FnDef.ret` stays the per-definition lattice anchor (the
     /// monomorphic law is per-definition); the resolved truth a call
     /// site's lowering consumes is per-instantiation, recorded here.
-    pub call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
+    pub call_rets: BTreeMap<(NodeId, NodeId), Ty>,
     /// INVARIANCE ARGUMENT (fold d, B4) — why `ffi_verbs` needs NO
     /// expansion-site key, unlike its checker-recorded neighbors: a
     /// verb is (member name, base-type family); the member name is
@@ -265,13 +271,13 @@ pub struct ShapeFacts {
     /// family, hence the same verb. A base that changed families
     /// between sites would have been REJECTED in one expansion, and
     /// acceptance is per-program. One expr, one verb, every site.
-    pub ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
+    pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,
     /// KEYING DISCIPLINE: same `(expr, expansion site)` pairs as
     /// `call_defs` — the addressing lane of THIS one expansion's key.
     /// The key expr may sit inside a body inlined at many call sites;
     /// each expansion's lane is its own truth (a late-bound callee can
     /// return an Integer at one site and a String at another).
-    pub index_key_lanes: BTreeMap<(*const Expr, *const Expr), KeyLane>,
+    pub index_key_lanes: BTreeMap<(NodeId, NodeId), KeyLane>,
     /// KEYING DISCIPLINE: same `(expr, expansion site)` pairs as
     /// `call_defs` — the element face of one table access base, per
     /// expansion: recorded at the access choke points
@@ -282,8 +288,7 @@ pub struct ShapeFacts {
     /// base reached in two expansions of one body may carry two faces
     /// (a late-bound callee's return elem differs per site); the pair
     /// key keeps each expansion's lowering on its own face.
-    pub access_elems: BTreeMap<(*const Expr, *const Expr), Ty>,
-    pub stmt_lines: BTreeMap<*const Stmt, usize>,
+    pub access_elems: BTreeMap<(NodeId, NodeId), Ty>,
     pub ctor_lines: Vec<usize>,
     #[allow(dead_code)]
     pub adopt_lines: BTreeMap<String, usize>,
@@ -292,7 +297,7 @@ pub struct ShapeFacts {
 
 impl ShapeFacts {
     pub fn elem_of(&self, ctor: &Expr) -> Ty {
-        let id = self.sites[&(ctor as *const Expr)];
+        let id = self.sites[&ctor.id()];
         let elem = self.elems[id].clone();
         self.resolve_elem_type(elem)
     }
@@ -357,6 +362,6 @@ impl ShapeFacts {
     }
 
     pub fn is_free(&self, stmt: &Stmt) -> bool {
-        self.free_sites.contains(&(stmt as *const Stmt))
+        self.free_sites.contains(&stmt.id())
     }
 }

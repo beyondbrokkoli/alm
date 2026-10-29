@@ -231,11 +231,11 @@ impl Analyzer {
                     }
                     MixedPlan::Fire { keeps } => {
                         signal!(rec.on(), trace::TRACE_ROW_GHOST_FIRE);
-                        self.own.free_sites.insert(stmt as *const Stmt);
+                        self.own.free_sites.insert(stmt.id());
                         if !keeps.is_empty() {
                             signal!(rec.on(), trace::TRACE_ROW_KEEP_FREE);
                             self.own.free_keeps.insert(
-                                stmt as *const Stmt,
+                                stmt.id(),
                                 keeps.into_iter().map(super::facts::Keep::Name).collect(),
                             );
                         }
@@ -247,16 +247,14 @@ impl Analyzer {
                         keeps,
                     } => {
                         signal!(rec.on(), trace::TRACE_JOIN_ARM_SPLIT);
-                        self.own
-                            .arm_free_sites
-                            .entry(stmt as *const Stmt)
-                            .or_default()
-                            .push(super::facts::ArmFreeEntry {
+                        self.own.arm_free_sites.entry(stmt.id()).or_default().push(
+                            super::facts::ArmFreeEntry {
                                 carrier: name.to_string(),
                                 tag,
                                 nothing_on,
                                 keeps: keeps.into_iter().map(super::facts::Keep::Name).collect(),
-                            });
+                            },
+                        );
                         signal!(rec.on(), trace::TRACE_SHAPE_DROP);
                     }
                 }
@@ -328,11 +326,9 @@ impl Analyzer {
                 {
                     signal!(rec.on(), trace::TRACE_ROW_KEEP_FREE);
                 }
-                self.own.free_sites.insert(stmt as *const Stmt);
+                self.own.free_sites.insert(stmt.id());
                 if !keeps.is_empty() {
-                    self.own
-                        .free_keeps
-                        .insert(stmt as *const Stmt, keeps.clone());
+                    self.own.free_keeps.insert(stmt.id(), keeps.clone());
                 }
                 for &r in &roots {
                     self.mark_claimed(r, &keeps);
@@ -387,14 +383,10 @@ impl Analyzer {
                 }
                 MixedPlan::Fire { keeps } => {
                     signal!(rec.on(), trace::TRACE_ROW_GHOST_FIRE);
-                    self.own
-                        .rebind_grants
-                        .entry(stmt as *const Stmt)
-                        .or_default()
-                        .insert(
-                            name.to_string(),
-                            keeps.into_iter().map(super::facts::Keep::Name).collect(),
-                        );
+                    self.own.rebind_grants.entry(stmt.id()).or_default().insert(
+                        name.to_string(),
+                        keeps.into_iter().map(super::facts::Keep::Name).collect(),
+                    );
                     signal!(rec.on(), trace::TRACE_SHAPE_REBIND_DROP);
                     return Ok(());
                 }
@@ -406,7 +398,7 @@ impl Analyzer {
                     signal!(rec.on(), trace::TRACE_JOIN_ARM_SPLIT);
                     self.own
                         .arm_rebind_frees
-                        .entry(stmt as *const Stmt)
+                        .entry(stmt.id())
                         .or_default()
                         .push(super::facts::ArmFreeEntry {
                             carrier: name.to_string(),
@@ -474,7 +466,7 @@ impl Analyzer {
         }
         self.own
             .rebind_grants
-            .entry(stmt as *const Stmt)
+            .entry(stmt.id())
             .or_default()
             .insert(name.to_string(), keeps);
         Ok(())

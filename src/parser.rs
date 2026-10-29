@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, CtorKey, Expr, Loc, Stmt, UnOp};
+use crate::ast::{BinOp, CtorKey, Expr, Loc, NodeId, Stmt, UnOp};
 use crate::diag::Diagnostic;
 use crate::lexer::Token;
 use crate::shape::BOUNDS_FAIL_THRESHOLD;
@@ -143,6 +143,7 @@ impl<'a> Parser<'a> {
                         names: vec![name],
                         exprs: vec![expr],
                         loc: at,
+                        id: NodeId::mint(),
                     });
                 }
                 let mut names = Vec::new();
@@ -184,6 +185,7 @@ impl<'a> Parser<'a> {
                     names,
                     exprs,
                     loc: at,
+                    id: NodeId::mint(),
                 })
             }
             Some(Token::While) => {
@@ -201,6 +203,7 @@ impl<'a> Parser<'a> {
                     condition,
                     body,
                     loc: at,
+                    id: NodeId::mint(),
                 })
             }
             Some(Token::For) => {
@@ -228,7 +231,7 @@ impl<'a> Parser<'a> {
                 // the header, not the body's `end` (a float that arrives
                 // through a name still meets the checker's mixed-operand
                 // law at the same header line).
-                if matches!(start, Expr::Float(_)) || matches!(limit, Expr::Float(_)) {
+                if matches!(start, Expr::Float { .. }) || matches!(limit, Expr::Float { .. }) {
                     return Err(ParseError(Diagnostic::syntax(
                         "for-loop bounds must be integers",
                     )));
@@ -259,7 +262,10 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Break) => {
                 self.tokens.next();
-                Ok(Stmt::Break { loc: at })
+                Ok(Stmt::Break {
+                    loc: at,
+                    id: NodeId::mint(),
+                })
             }
             Some(Token::If) => {
                 self.tokens.next();
@@ -298,6 +304,7 @@ impl<'a> Parser<'a> {
                     then_body,
                     else_body,
                     loc: at,
+                    id: NodeId::mint(),
                 })
             }
             Some(Token::Do) => {
@@ -307,7 +314,11 @@ impl<'a> Parser<'a> {
                     body.push(self.parse_stmt()?);
                 }
                 self.expect(Token::End)?;
-                Ok(Stmt::Do { body, loc: at })
+                Ok(Stmt::Do {
+                    body,
+                    loc: at,
+                    id: NodeId::mint(),
+                })
             }
             Some(Token::Print) => {
                 self.tokens.next();
@@ -321,7 +332,11 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(Token::RightParen)?;
-                Ok(Stmt::Print { exprs, loc: at })
+                Ok(Stmt::Print {
+                    exprs,
+                    loc: at,
+                    id: NodeId::mint(),
+                })
             }
             Some(Token::Return) => {
                 self.tokens.next();
@@ -342,7 +357,11 @@ impl<'a> Parser<'a> {
                     ) => Some(self.parse_expr()?),
                     _ => None,
                 };
-                Ok(Stmt::Return { value, loc: at })
+                Ok(Stmt::Return {
+                    value,
+                    loc: at,
+                    id: NodeId::mint(),
+                })
             }
             Some(Token::Function) => {
                 // D4 surface sugar, pure desugar — no new semantics:
@@ -362,6 +381,7 @@ impl<'a> Parser<'a> {
                     name,
                     expr,
                     loc: at,
+                    id: NodeId::mint(),
                 })
             }
             Some(Token::Identifier(_)) => {
@@ -376,12 +396,13 @@ impl<'a> Parser<'a> {
                     self.tokens.next();
                     let rhs = self.parse_expr()?;
                     match lhs {
-                        Expr::Identifier(name) => Ok(Stmt::Assignment {
+                        Expr::Identifier { name, .. } => Ok(Stmt::Assignment {
                             name,
                             expr: rhs,
                             loc: at,
+                            id: NodeId::mint(),
                         }),
-                        Expr::Field { obj, name } => {
+                        Expr::Field { obj, name, .. } => {
                             // dot write sugar desugars to a string-keyed
                             // index at parse time (the checker later
                             // rejects a non-table receiver)
@@ -390,22 +411,31 @@ impl<'a> Parser<'a> {
                             );
                             Ok(Stmt::IndexAssign {
                                 obj: *obj,
-                                key: Expr::String(name),
+                                key: Expr::String {
+                                    value: name,
+                                    id: NodeId::mint(),
+                                },
                                 value: rhs,
                                 loc: at,
+                                id: NodeId::mint(),
                             })
                         }
-                        Expr::Index { obj, key } => Ok(Stmt::IndexAssign {
+                        Expr::Index { obj, key, .. } => Ok(Stmt::IndexAssign {
                             obj: *obj,
                             key: *key,
                             value: rhs,
                             loc: at,
+                            id: NodeId::mint(),
                         }),
                         _ => Err(ParseError(Diagnostic::syntax("Invalid assignment target"))),
                     }
                 } else if matches!(lhs, Expr::Call { .. }) {
-                    Ok(Stmt::Expr { expr: lhs, loc: at })
-                } else if let Expr::Identifier(name) = &lhs {
+                    Ok(Stmt::Expr {
+                        expr: lhs,
+                        loc: at,
+                        id: NodeId::mint(),
+                    })
+                } else if let Expr::Identifier { name, .. } = &lhs {
                     if name == "continue" {
                         // C3's named rejection: 'continue' parses as a
                         // bare NAME, so the generic statement error used
@@ -468,16 +498,22 @@ impl<'a> Parser<'a> {
         let mut cells = Vec::with_capacity(targets.len());
         for target in targets {
             match target {
-                Expr::Index { obj, key } => cells.push((*obj, *key)),
-                Expr::Field { obj, name } => {
+                Expr::Index { obj, key, .. } => cells.push((*obj, *key)),
+                Expr::Field { obj, name, .. } => {
                     // dot targets convert to the string-keyed store
                     // here, the single-assign path's twin (the trace
                     // signal fires at the parse site; the elaborator
                     // stays pure)
                     alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_STRKEY_DOT);
-                    cells.push((*obj, Expr::String(name)));
+                    cells.push((
+                        *obj,
+                        Expr::String {
+                            value: name,
+                            id: NodeId::mint(),
+                        },
+                    ));
                 }
-                Expr::Identifier(name) => {
+                Expr::Identifier { name, .. } => {
                     return Err(ParseError(Diagnostic::syntax(format!(
                         "cannot tuple-assign the name '{name}' — tuple assignment \
                          targets cells ('t[k]' or 't.k'); names rebind through plain '=' or \
@@ -615,6 +651,7 @@ impl<'a> Parser<'a> {
             then_body,
             else_body,
             loc: at,
+            id: NodeId::mint(),
         })
     }
 
@@ -648,6 +685,7 @@ impl<'a> Parser<'a> {
                 op: BinOp::Or,
                 left: Box::new(left),
                 right: Box::new(right),
+                id: NodeId::mint(),
             };
         }
         Ok(left)
@@ -662,6 +700,7 @@ impl<'a> Parser<'a> {
                 op: BinOp::And,
                 left: Box::new(left),
                 right: Box::new(right),
+                id: NodeId::mint(),
             };
         }
         Ok(left)
@@ -685,6 +724,7 @@ impl<'a> Parser<'a> {
             op,
             left: Box::new(left),
             right: Box::new(right),
+            id: NodeId::mint(),
         })
     }
 
@@ -702,6 +742,7 @@ impl<'a> Parser<'a> {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
+                id: NodeId::mint(),
             };
         }
         Ok(left)
@@ -727,6 +768,7 @@ impl<'a> Parser<'a> {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
+                id: NodeId::mint(),
             };
         }
         Ok(left)
@@ -740,6 +782,7 @@ impl<'a> Parser<'a> {
                 Ok(Expr::UnaryOp {
                     op: UnOp::Neg,
                     expr: Box::new(expr),
+                    id: NodeId::mint(),
                 })
             }
             Some(Token::Not) => {
@@ -748,6 +791,7 @@ impl<'a> Parser<'a> {
                 Ok(Expr::UnaryOp {
                     op: UnOp::Not,
                     expr: Box::new(expr),
+                    id: NodeId::mint(),
                 })
             }
             Some(Token::Len) => {
@@ -756,6 +800,7 @@ impl<'a> Parser<'a> {
                 Ok(Expr::UnaryOp {
                     op: UnOp::Len,
                     expr: Box::new(expr),
+                    id: NodeId::mint(),
                 })
             }
             _ => self.parse_postfix(),
@@ -773,6 +818,7 @@ impl<'a> Parser<'a> {
                     expr = Expr::Index {
                         obj: Box::new(expr),
                         key: Box::new(key),
+                        id: NodeId::mint(),
                     };
                 }
                 Some(Token::Dot) => {
@@ -788,6 +834,7 @@ impl<'a> Parser<'a> {
                     expr = Expr::Field {
                         obj: Box::new(expr),
                         name,
+                        id: NodeId::mint(),
                     };
                 }
                 Some(Token::LeftParen) => {
@@ -804,6 +851,7 @@ impl<'a> Parser<'a> {
                     expr = Expr::Call {
                         callee: Box::new(expr),
                         args,
+                        id: NodeId::mint(),
                     };
                 }
                 _ => return Ok(expr),
@@ -813,25 +861,40 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.tokens.next() {
-            Some(Token::Integer(val)) => Ok(Expr::Integer(val)),
-            Some(Token::Float(val)) => Ok(Expr::Float(val)),
-            Some(Token::True) => Ok(Expr::Boolean(true)),
-            Some(Token::False) => Ok(Expr::Boolean(false)),
-            Some(Token::Nil) => Ok(Expr::Nil),
+            Some(Token::Integer(val)) => Ok(Expr::Integer {
+                value: val,
+                id: NodeId::mint(),
+            }),
+            Some(Token::Float(val)) => Ok(Expr::Float {
+                value: val,
+                id: NodeId::mint(),
+            }),
+            Some(Token::True) => Ok(Expr::Boolean {
+                value: true,
+                id: NodeId::mint(),
+            }),
+            Some(Token::False) => Ok(Expr::Boolean {
+                value: false,
+                id: NodeId::mint(),
+            }),
+            Some(Token::Nil) => Ok(Expr::Nil { id: NodeId::mint() }),
             Some(Token::LeftBrace) => self.parse_table_ctor(),
-            Some(Token::String(s)) => Ok(Expr::String(s.trim_matches('"').to_string())),
+            Some(Token::String(s)) => Ok(Expr::String {
+                value: s.trim_matches('"').to_string(),
+                id: NodeId::mint(),
+            }),
             Some(Token::Identifier(name)) => {
                 if name == "sys_alloc_count" && matches!(self.tokens.peek(), Some(Token::LeftParen))
                 {
                     self.tokens.next();
                     self.expect(Token::RightParen)?;
-                    return Ok(Expr::SysAllocCount);
+                    return Ok(Expr::SysAllocCount { id: NodeId::mint() });
                 }
                 if name == "sys_exec_count" && matches!(self.tokens.peek(), Some(Token::LeftParen))
                 {
                     self.tokens.next();
                     self.expect(Token::RightParen)?;
-                    return Ok(Expr::SysExecCount);
+                    return Ok(Expr::SysExecCount { id: NodeId::mint() });
                 }
                 if name == "require" && matches!(self.tokens.peek(), Some(Token::LeftParen)) {
                     self.tokens.next();
@@ -850,7 +913,7 @@ impl<'a> Parser<'a> {
                         "ffi" => {}
                         "coroutine" => {
                             self.expect(Token::RightParen)?;
-                            return Ok(Expr::CoroModule);
+                            return Ok(Expr::CoroModule { id: NodeId::mint() });
                         }
                         other => {
                             return Err(ParseError(Diagnostic::syntax(format!(
@@ -862,9 +925,12 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(Token::RightParen)?;
-                    return Ok(Expr::FfiModule);
+                    return Ok(Expr::FfiModule { id: NodeId::mint() });
                 }
-                Ok(Expr::Identifier(name.to_string()))
+                Ok(Expr::Identifier {
+                    name: name.to_string(),
+                    id: NodeId::mint(),
+                })
             }
             Some(Token::LeftParen) => {
                 let inner = self.parse_expr()?;
@@ -922,7 +988,11 @@ impl<'a> Parser<'a> {
             body.push(self.parse_stmt()?);
         }
         self.expect(Token::End)?;
-        Ok(Expr::Function { params, body })
+        Ok(Expr::Function {
+            params,
+            body,
+            id: NodeId::mint(),
+        })
     }
 
     fn parse_table_ctor(&mut self) -> Result<Expr, ParseError> {
@@ -937,6 +1007,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr::TableCtor {
                 entries: Vec::new(),
                 line: line as u32,
+                id: NodeId::mint(),
             });
         }
 
@@ -952,7 +1023,7 @@ impl<'a> Parser<'a> {
             let (key, value) = self.parse_ctor_entry(&mut next_pos)?;
             let record_name = match &key {
                 CtorKey::Str(n) => Some(n.as_str()),
-                CtorKey::Expr(Expr::String(s)) => Some(s.as_str()),
+                CtorKey::Expr(Expr::String { value: s, .. }) => Some(s.as_str()),
                 _ => None,
             };
             match &key {
@@ -1002,6 +1073,7 @@ impl<'a> Parser<'a> {
         Ok(Expr::TableCtor {
             entries,
             line: line as u32,
+            id: NodeId::mint(),
         })
     }
 
@@ -1013,7 +1085,7 @@ impl<'a> Parser<'a> {
             self.expect(Token::Assign)?;
             let value = self.parse_expr()?;
             match key {
-                Expr::Integer(k) => {
+                Expr::Integer { value: k, .. } => {
                     if k >= BOUNDS_FAIL_THRESHOLD {
                         return Err(ParseError(Diagnostic::bounds("table index overflow")));
                     }
@@ -1029,7 +1101,7 @@ impl<'a> Parser<'a> {
             match self.tokens.peek() {
                 Some(Token::Assign) => {
                     let name = match &value {
-                        Expr::Identifier(n) => n.clone(),
+                        Expr::Identifier { name: n, .. } => n.clone(),
                         _ => {
                             return Err(ParseError(Diagnostic::syntax(
                                 "expected identifier before '='",

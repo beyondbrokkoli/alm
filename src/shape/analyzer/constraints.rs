@@ -24,7 +24,7 @@
 //! the site and the node disciplines meet in this one store.
 
 use super::checker::type_name;
-use crate::ast::Expr;
+use crate::ast::NodeId;
 use crate::diag::Diagnostic;
 use crate::shape::Ty;
 use alm_rt::{signal, trace};
@@ -39,11 +39,11 @@ pub(super) struct UnknownStore {
     /// construction; the checking half's seed reads this same node
     boundary_seed: Option<usize>,
     /// return nodes for function definitions, anchored by `walk_fn_def`
-    fn_ret_nodes: BTreeMap<*const Expr, usize>,
+    fn_ret_nodes: BTreeMap<NodeId, usize>,
     /// value nodes for function definitions — the dummy a function VALUE
     /// binds under, anchored per definition (the name→type view derives
     /// a fn binding's type from it, stably)
-    fn_value_nodes: BTreeMap<*const Expr, usize>,
+    fn_value_nodes: BTreeMap<NodeId, usize>,
 }
 
 impl UnknownStore {
@@ -80,7 +80,7 @@ impl UnknownStore {
 
     /// The return node for one function definition — anchored by
     /// `walk_fn_def`.
-    pub(super) fn ensure_fn_ret(&mut self, fn_ptr: *const Expr) -> usize {
+    pub(super) fn ensure_fn_ret(&mut self, fn_ptr: NodeId) -> usize {
         if let Some(&id) = self.fn_ret_nodes.get(&fn_ptr) {
             return id;
         }
@@ -91,7 +91,7 @@ impl UnknownStore {
 
     /// Read-only view of the same anchor (the walk's use-site pinning
     /// derives a call's node from it).
-    pub(super) fn fn_ret_node(&self, fn_ptr: *const Expr) -> Option<usize> {
+    pub(super) fn fn_ret_node(&self, fn_ptr: NodeId) -> Option<usize> {
         self.fn_ret_nodes.get(&fn_ptr).copied()
     }
 
@@ -99,7 +99,7 @@ impl UnknownStore {
     /// binds under. Anchored here (minted by the checking half at the
     /// definition, once per definition) so the name→type view can derive
     /// a fn binding's type without the checker storing an entry.
-    pub(super) fn ensure_fn_value(&mut self, fn_ptr: *const Expr) -> usize {
+    pub(super) fn ensure_fn_value(&mut self, fn_ptr: NodeId) -> usize {
         if let Some(&id) = self.fn_value_nodes.get(&fn_ptr) {
             return id;
         }
@@ -109,7 +109,7 @@ impl UnknownStore {
     }
 
     /// Read-only view of the same anchor.
-    pub(super) fn fn_value_node(&self, fn_ptr: *const Expr) -> Option<usize> {
+    pub(super) fn fn_value_node(&self, fn_ptr: NodeId) -> Option<usize> {
         self.fn_value_nodes.get(&fn_ptr).copied()
     }
 

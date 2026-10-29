@@ -35,7 +35,7 @@
 //! oracle: the only `alm_tbl_new` calls are that name's ctors.
 
 use crate::analysis;
-use crate::ast::{BinOp, Expr, Stmt};
+use crate::ast::{BinOp, Expr, NodeId, Stmt};
 use crate::diag::Diagnostic;
 use crate::lexer;
 use crate::parser::Parser;
@@ -103,11 +103,6 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic".into())
 }
 
-/// Runs the full compile pipeline on `source` and returns the `.ll`
-/// text, or the stage that rejected it with its diagnostics. Panics
-/// inside a phase are caught and reported as their own stage — the
-/// compiler must diagnose, never crash.
-
 /// The failure-report face of the format law: rendered diagnostics,
 /// joined for assert messages only (the pins compare full renders).
 fn diags_text(diags: &[Diagnostic]) -> String {
@@ -118,6 +113,10 @@ fn diags_text(diags: &[Diagnostic]) -> String {
         .join("; ")
 }
 
+/// Runs the full compile pipeline on `source` and returns the `.ll`
+/// text, or the stage that rejected it with its diagnostics. Panics
+/// inside a phase are caught and reported as their own stage — the
+/// compiler must diagnose, never crash.
 fn compile(source: &str) -> Result<String, (Stage, Vec<Diagnostic>)> {
     compile_with(source, true)
 }
@@ -1311,11 +1310,11 @@ fn walk_pins_are_a_pure_subset_over_the_corpus() {
                     "walk pins flipped acceptance for {label}:\n  pins on : {}\n  pins off: {}",
                     match &on {
                         Ok(_) => "accepted".to_string(),
-                        Err((s, d)) => format!("{}: {}", s.name(), diags_text(&d)),
+                        Err((s, d)) => format!("{}: {}", s.name(), diags_text(d)),
                     },
                     match &off {
                         Ok(_) => "accepted".to_string(),
-                        Err((s, d)) => format!("{}: {}", s.name(), diags_text(&d)),
+                        Err((s, d)) => format!("{}: {}", s.name(), diags_text(d)),
                     }
                 );
             }
@@ -1473,7 +1472,7 @@ fn parse_parts(source: &str) -> Vec<Stmt> {
 fn h5_for_desugar_reports_at_the_header_pin() {
     let source = "local t = {}\nfor i = 0, 4 do\n    t[i] = i * 2\nend\nprint(t[2])\n";
     let ast = parse_parts(source);
-    let ctx = analysis::build_context(&ast);
+    let _ctx = analysis::build_context(&ast);
     assert_eq!(ast.len(), 3);
     let Stmt::Do { body, .. } = &ast[1] else {
         panic!("the for-desugar rides a Do block");
@@ -1481,7 +1480,7 @@ fn h5_for_desugar_reports_at_the_header_pin() {
     let Stmt::While { body: wbody, .. } = &body[2] else {
         panic!("desugar shape: the block's third statement is the While");
     };
-    let line_of = |s: &Stmt| ctx.stmt_lines.get(&(s as *const Stmt)).copied();
+    let line_of = |s: &Stmt| Some(s.loc().line as usize);
     for (what, node) in [
         ("block Do", &ast[1] as &Stmt),
         ("counter decl", &body[0]),
@@ -1531,8 +1530,8 @@ else
 end
 ";
     let ast = parse_parts(source);
-    let ctx = analysis::build_context(&ast);
-    let line_of = |s: &Stmt| ctx.stmt_lines.get(&(s as *const Stmt)).copied();
+    let _ctx = analysis::build_context(&ast);
+    let line_of = |s: &Stmt| Some(s.loc().line as usize);
     // D4: `function f(a) … end` is ONE Assignment at line 1; its body's
     // return reports the body's own line 2
     let Stmt::Assignment { expr, .. } = &ast[0] else {
@@ -1594,39 +1593,65 @@ fn h5_census_trips_on_right_count_wrong_line() {
         body: vec![
             Stmt::LocalDecl {
                 names: vec!["i".into()],
-                exprs: vec![Expr::Integer(0)],
+                exprs: vec![Expr::Integer {
+                    value: 0,
+                    id: NodeId::mint(),
+                }],
                 loc: at(2),
+                id: NodeId::mint(),
             },
             Stmt::LocalDecl {
                 names: vec!["for$limit".into()],
-                exprs: vec![Expr::Integer(4)],
+                exprs: vec![Expr::Integer {
+                    value: 4,
+                    id: NodeId::mint(),
+                }],
                 loc: at(2),
+                id: NodeId::mint(),
             },
             Stmt::While {
                 condition: Expr::BinaryOp {
                     op: BinOp::LessThan,
-                    left: Box::new(Expr::Identifier("i".into())),
-                    right: Box::new(Expr::Identifier("for$limit".into())),
+                    left: Box::new(Expr::Identifier {
+                        name: "i".into(),
+                        id: NodeId::mint(),
+                    }),
+                    right: Box::new(Expr::Identifier {
+                        name: "for$limit".into(),
+                        id: NodeId::mint(),
+                    }),
+                    id: NodeId::mint(),
                 },
                 body: vec![
                     Stmt::Do {
                         body: vec![],
                         loc: at(2),
+                        id: NodeId::mint(),
                     },
                     Stmt::Assignment {
                         name: "i".into(),
                         expr: Expr::BinaryOp {
                             op: BinOp::Add,
-                            left: Box::new(Expr::Identifier("i".into())),
-                            right: Box::new(Expr::Integer(1)),
+                            left: Box::new(Expr::Identifier {
+                                name: "i".into(),
+                                id: NodeId::mint(),
+                            }),
+                            right: Box::new(Expr::Integer {
+                                value: 1,
+                                id: NodeId::mint(),
+                            }),
+                            id: NodeId::mint(),
                         },
                         loc: at(9),
+                        id: NodeId::mint(),
                     },
                 ],
                 loc: at(2),
+                id: NodeId::mint(),
             },
         ],
         loc: at(2),
+        id: NodeId::mint(),
     }];
     analysis::build_context(&ast);
 }
@@ -1651,11 +1676,21 @@ fn h8_elaborator_unit_goldens_pin() {
     let for_stmt = elaborate::desugar_numeric_for(
         at,
         "i".into(),
-        Expr::Integer(0),
-        Expr::Integer(4),
+        Expr::Integer {
+            value: 0,
+            id: NodeId::mint(),
+        },
+        Expr::Integer {
+            value: 4,
+            id: NodeId::mint(),
+        },
         vec![Stmt::Expr {
-            expr: Expr::Integer(1),
+            expr: Expr::Integer {
+                value: 1,
+                id: NodeId::mint(),
+            },
             loc: Loc { line: 8, col: 1 },
+            id: NodeId::mint(),
         }],
     );
     let Stmt::Do { body, .. } = &for_stmt else {
@@ -1699,10 +1734,37 @@ fn h8_elaborator_unit_goldens_pin() {
     assert_eq!(ubody[0].loc().line, 8);
 
     let cells = vec![
-        (Expr::Identifier("o".into()), Expr::Integer(0)),
-        (Expr::Identifier("o".into()), Expr::Integer(1)),
+        (
+            Expr::Identifier {
+                name: "o".into(),
+                id: NodeId::mint(),
+            },
+            Expr::Integer {
+                value: 0,
+                id: NodeId::mint(),
+            },
+        ),
+        (
+            Expr::Identifier {
+                name: "o".into(),
+                id: NodeId::mint(),
+            },
+            Expr::Integer {
+                value: 1,
+                id: NodeId::mint(),
+            },
+        ),
     ];
-    let values = vec![Expr::Integer(5), Expr::Integer(6)];
+    let values = vec![
+        Expr::Integer {
+            value: 5,
+            id: NodeId::mint(),
+        },
+        Expr::Integer {
+            value: 6,
+            id: NodeId::mint(),
+        },
+    ];
     let tuple_stmt = elaborate::desugar_tuple_assign(at, cells, values);
     let Stmt::Do { body, .. } = &tuple_stmt else {
         panic!("the tuple desugar rides a Do block");
@@ -1720,10 +1782,10 @@ fn h8_elaborator_unit_goldens_pin() {
         else {
             panic!("tuple statement {} is the cell store", i);
         };
-        assert!(matches!(obj, Expr::Identifier(n) if n == "o"));
-        assert!(matches!(key, Expr::Integer(k) if *k == i as i64));
+        assert!(matches!(obj, Expr::Identifier { name: n, .. } if n == "o"));
+        assert!(matches!(key, Expr::Integer { value: k, .. } if *k == i as i64));
         assert!(
-            matches!(value, Expr::Identifier(v) if v == &format!("tuple$t{i}")),
+            matches!(value, Expr::Identifier { name: v, .. } if v == &format!("tuple$t{i}")),
             "store {i} reads temp {i}"
         );
         assert_eq!(
@@ -1752,8 +1814,8 @@ print(o[0], o[1])
         panic!("the tuple sugar rides a Do block");
     };
     assert_eq!(body.len(), 3);
-    let ctx = analysis::build_context(&ast);
-    let line_of = |s: &Stmt| ctx.stmt_lines.get(&(s as *const Stmt)).copied();
+    let _ctx = analysis::build_context(&ast);
+    let line_of = |s: &Stmt| Some(s.loc().line as usize);
     for (what, node) in [
         ("block Do", &ast[1] as &Stmt),
         ("temp decl", &body[0]),
@@ -1780,22 +1842,43 @@ fn h8_census_trips_on_tuple_wrong_line() {
     use crate::ast::Loc;
     let at = |line: u32| Loc { line, col: 1 };
     let store = |i: usize, line: u32| Stmt::IndexAssign {
-        obj: Expr::Identifier("o".into()),
-        key: Expr::Integer(i as i64),
-        value: Expr::Identifier(format!("tuple$t{i}")),
+        obj: Expr::Identifier {
+            name: "o".into(),
+            id: NodeId::mint(),
+        },
+        key: Expr::Integer {
+            value: i as i64,
+            id: NodeId::mint(),
+        },
+        value: Expr::Identifier {
+            name: format!("tuple$t{i}"),
+            id: NodeId::mint(),
+        },
         loc: at(line),
+        id: NodeId::mint(),
     };
     let ast = vec![Stmt::Do {
         body: vec![
             Stmt::LocalDecl {
                 names: vec!["tuple$t0".into(), "tuple$t1".into()],
-                exprs: vec![Expr::Integer(1), Expr::Integer(2)],
+                exprs: vec![
+                    Expr::Integer {
+                        value: 1,
+                        id: NodeId::mint(),
+                    },
+                    Expr::Integer {
+                        value: 2,
+                        id: NodeId::mint(),
+                    },
+                ],
                 loc: at(2),
+                id: NodeId::mint(),
             },
             store(0, 2),
             store(1, 9),
         ],
         loc: at(2),
+        id: NodeId::mint(),
     }];
     analysis::build_context(&ast);
 }
@@ -1840,6 +1923,7 @@ end
     let Expr::TableCtor {
         entries: t_entries,
         line: t_line,
+        ..
     } = &t_exprs[0]
     else {
         panic!("t's initializer is a ctor");
@@ -1893,7 +1977,7 @@ end
         (*t_line, *nested_line, *u_line, *z_line, *s_line),
         (1, 1, 2, 4, 8)
     );
-    let ctor_at = |e: &Expr| ctx.sites.get(&(e as *const Expr)).copied();
+    let ctor_at = |e: &Expr| ctx.sites.get(&e.id()).copied();
     let pairs = [
         (&t_exprs[0] as &Expr, 0usize, *t_line as usize),
         (&t_entries[1].1, 1, *nested_line as usize),
@@ -1923,17 +2007,14 @@ end
     // carries its stamp (the old loc walk never recursed Field)
     assert_eq!(z_loc.line, 4);
     assert_eq!(
-        ctx.stmt_lines.get(&(&v_body[0] as *const Stmt)).copied(),
+        Some(v_body[0].loc().line as usize),
         Some(4),
         "a fn body under a Field obj is stamped like any other"
     );
     // and the scan half reaches it too: the fn literal has a touched
     // set entry (its body touches nothing outer here — the empty set
     // is the value, the KEY is the law)
-    assert!(
-        ctx.fn_touched
-            .contains_key(&(v_obj.as_ref() as *const Expr))
-    );
+    assert!(ctx.fn_touched.contains_key(&v_obj.as_ref().id()));
 }
 
 /// The fn-touched scan's law, golden: a fn body's TOUCHED names are
@@ -1973,7 +2054,7 @@ end
     let want = ["outer", "t"];
     let touched = ctx
         .fn_touched
-        .get(&(&g_exprs[0] as *const Expr))
+        .get(&(g_exprs[0].id()))
         .expect("the pass records the fn literal's touched set");
     assert_eq!(
         touched.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
@@ -1982,7 +2063,7 @@ end
     );
     let h_touched = ctx
         .fn_touched
-        .get(&(&h_exprs[0] as *const Expr))
+        .get(&(h_exprs[0].id()))
         .expect("nested fns get their own entry");
     assert_eq!(
         h_touched.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
@@ -2009,36 +2090,61 @@ fn h7_census_sees_through_field_pin() {
     let family = vec![
         Stmt::LocalDecl {
             names: vec!["i".into()],
-            exprs: vec![Expr::Integer(0)],
+            exprs: vec![Expr::Integer {
+                value: 0,
+                id: NodeId::mint(),
+            }],
             loc: at(2),
+            id: NodeId::mint(),
         },
         Stmt::LocalDecl {
             names: vec!["for$limit".into()],
-            exprs: vec![Expr::Integer(4)],
+            exprs: vec![Expr::Integer {
+                value: 4,
+                id: NodeId::mint(),
+            }],
             loc: at(2),
+            id: NodeId::mint(),
         },
         Stmt::While {
             condition: Expr::BinaryOp {
                 op: BinOp::LessThan,
-                left: Box::new(Expr::Identifier("i".into())),
-                right: Box::new(Expr::Identifier("for$limit".into())),
+                left: Box::new(Expr::Identifier {
+                    name: "i".into(),
+                    id: NodeId::mint(),
+                }),
+                right: Box::new(Expr::Identifier {
+                    name: "for$limit".into(),
+                    id: NodeId::mint(),
+                }),
+                id: NodeId::mint(),
             },
             body: vec![
                 Stmt::Do {
                     body: vec![],
                     loc: at(2),
+                    id: NodeId::mint(),
                 },
                 Stmt::Assignment {
                     name: "i".into(),
                     expr: Expr::BinaryOp {
                         op: BinOp::Add,
-                        left: Box::new(Expr::Identifier("i".into())),
-                        right: Box::new(Expr::Integer(1)),
+                        left: Box::new(Expr::Identifier {
+                            name: "i".into(),
+                            id: NodeId::mint(),
+                        }),
+                        right: Box::new(Expr::Integer {
+                            value: 1,
+                            id: NodeId::mint(),
+                        }),
+                        id: NodeId::mint(),
                     },
                     loc: at(9),
+                    id: NodeId::mint(),
                 },
             ],
             loc: at(2),
+            id: NodeId::mint(),
         },
     ];
     let ast = vec![Stmt::Expr {
@@ -2048,11 +2154,15 @@ fn h7_census_sees_through_field_pin() {
                 body: vec![Stmt::Do {
                     body: family,
                     loc: at(2),
+                    id: NodeId::mint(),
                 }],
+                id: NodeId::mint(),
             }),
             name: "x".into(),
+            id: NodeId::mint(),
         },
         loc: at(1),
+        id: NodeId::mint(),
     }];
     analysis::build_context(&ast);
 }
@@ -2241,5 +2351,274 @@ fn h11_kinds_and_desync_render_law_pin() {
     assert!(
         desync.with_site(Some(7)).is_desync(),
         "the stamp never changes the class"
+    );
+}
+
+// ---- H6: identity rides the node ----
+//
+// The checker→lowerer contract keyed raw `*const Expr`/`*const Stmt`
+// addresses — an immutability convention ("the AST never moves") with
+// no enforcing type, plus `unsafe` derefs in `FnDef::body` and the
+// `stmt_lines`/`stmt_locs` lookup maps. The fold: `NodeId(u32)`
+// minted at construction rides every node, every fact map keys the
+// id, the FnDef OWNS its body, and the derivation pass censuses id
+// uniqueness over the whole tree. These three pins hold that law.
+
+/// H6 pin 1 — identity is the mint, and the facts outlive the tree.
+/// Ids are born at construction (same-line statements distinguish;
+/// a re-parse re-mints), and because the FnDef owns its body while
+/// every map keys ids, the finished facts are SELF-CONTAINED: the AST
+/// and its context may die, and the recorded decisions stay readable.
+/// Pre-H6 the body read after such a drop was a use-after-free riding
+/// the immutability convention — the exact disease the fold deletes.
+#[test]
+fn h6_identity_rides_the_node_pin() {
+    // construction mints: two statements on ONE line carry distinct
+    // ids (no line-derived key could ever give them that), and two
+    // parses of the same source mint disjoint ids (not positional).
+    let ast = parse_parts("local a = 1 local b = 2");
+    assert_ne!(
+        ast[0].id(),
+        ast[1].id(),
+        "same-line statements carry distinct ids — identity is the mint, not the line"
+    );
+    let again = parse_parts("local a = 1 local b = 2");
+    assert_ne!(
+        ast[0].id(),
+        again[0].id(),
+        "a re-parse re-mints — ids are not positional"
+    );
+
+    // the facts outlive the tree: analyze a fn program, remember the
+    // fn literal's id and its ctor's id, drop BOTH the context and
+    // the AST, then read the fn's owned body and the ctor's site off
+    // the facts alone.
+    let source = "\
+local f = function(n)
+    local acc = { 1 }
+    return acc
+end
+local r = f(2)
+";
+    let ast = parse_parts(source);
+    let ctx = analysis::build_context(&ast);
+    let shape = crate::shape::analyze_with(&ctx, true);
+    assert!(
+        shape.diagnostics.is_empty(),
+        "H6 pin source must analyze clean: {:?}",
+        crate::property_tests::diags_text(&shape.diagnostics)
+    );
+    let Stmt::LocalDecl { exprs: f_exprs, .. } = &ast[0] else {
+        panic!("the first statement declares f");
+    };
+    let Expr::Function { body: f_body, .. } = &f_exprs[0] else {
+        panic!("f's initializer is the fn literal");
+    };
+    let fn_id = f_exprs[0].id();
+    let Stmt::LocalDecl {
+        exprs: acc_exprs, ..
+    } = &f_body[0]
+    else {
+        panic!("the fn's first body statement declares acc");
+    };
+    let Expr::TableCtor {
+        line: ctor_line, ..
+    } = &acc_exprs[0]
+    else {
+        panic!("acc's initializer is a ctor");
+    };
+    let ctor_id = acc_exprs[0].id();
+    let ctor_line = *ctor_line as usize;
+
+    drop(ctx);
+    drop(ast);
+
+    let def = shape
+        .fn_defs
+        .get(&fn_id)
+        .expect("fn_defs keys the fn literal's own id — readable with the tree gone");
+    assert_eq!(
+        def.body()[0].loc().line as usize,
+        2,
+        "the owned body carries the fn's own statements with the tree gone"
+    );
+    let site = shape
+        .sites
+        .get(&ctor_id)
+        .expect("sites keys the ctor's own id — readable with the tree gone")
+        .to_owned();
+    assert_eq!(
+        shape.ctor_lines[site], ctor_line,
+        "the pairing law holds off the facts alone: ctor_lines[site] is the ctor's own line"
+    );
+}
+
+/// H6 pin 2 — the identity census: a cloned node reaching the tree
+/// panics analysis by name. A copy of a node IS the node (the id
+/// copies with it), so re-materializing a subtree means CONSTRUCTING
+/// it; the census keeps that law loud at analysis time instead of
+/// letting two "different" statements silently share one fact entry.
+#[test]
+#[should_panic(expected = "identity census")]
+fn h6_id_census_pin() {
+    use crate::ast::Loc;
+    let at = Loc { line: 1, col: 1 };
+    let orig = Stmt::Break {
+        loc: at,
+        id: NodeId::mint(),
+    };
+    // the tree carries `orig` TWICE — once as the copy, once as the
+    // moved original — so one constructed id reaches it two nodes
+    let ast = vec![
+        Stmt::Break {
+            loc: at,
+            id: NodeId::mint(),
+        },
+        orig.clone(),
+        orig,
+    ];
+    analysis::build_context(&ast);
+}
+
+/// H6 pin 3 — the fact maps key the node's OWN id: the pairing law
+/// (every ctor's id carries its site, and the site's ctor line is the
+/// ctor's own `{` — H7's law, re-keyed), and the expansion pair law
+/// (`call_defs` keys `(call, site)` id pairs; at the top level a call
+/// IS its own site, and the map's VALUE is the callee literal's id).
+#[test]
+fn h6_maps_key_ids_not_addresses_pin() {
+    let source = "\
+local f = function(a)
+    return a
+end
+local x = f(1)
+local y = f(2)
+local t = { 1, 2 }
+local g = function()
+    local z = { 3 }
+    return z
+end
+";
+    let ast = parse_parts(source);
+    let ctx = analysis::build_context(&ast);
+    let shape = crate::shape::analyze_with(&ctx, true);
+    assert!(
+        shape.diagnostics.is_empty(),
+        "H6 pin source must analyze clean: {:?}",
+        crate::property_tests::diags_text(&shape.diagnostics)
+    );
+
+    // the pairing law over EVERY ctor of the tree, keyed by id
+    let mut ctor_count = 0;
+    fn ctors_of_stmt(s: &Stmt, out: &mut Vec<(NodeId, u32)>) {
+        fn ctors_of_expr(e: &Expr, out: &mut Vec<(NodeId, u32)>) {
+            if let Expr::TableCtor { entries, line, .. } = e {
+                out.push((e.id(), *line));
+                for (k, v) in entries {
+                    if let crate::ast::CtorKey::Expr(ke) = k {
+                        ctors_of_expr(ke, out);
+                    }
+                    ctors_of_expr(v, out);
+                }
+            }
+            match e {
+                Expr::Index { obj, key, .. } => {
+                    ctors_of_expr(obj, out);
+                    ctors_of_expr(key, out);
+                }
+                Expr::BinaryOp { left, right, .. } => {
+                    ctors_of_expr(left, out);
+                    ctors_of_expr(right, out);
+                }
+                Expr::UnaryOp { expr, .. } => ctors_of_expr(expr, out),
+                Expr::Call { callee, args, .. } => {
+                    ctors_of_expr(callee, out);
+                    args.iter().for_each(|a| ctors_of_expr(a, out));
+                }
+                Expr::Function { body, .. } => body.iter().for_each(|s| ctors_of_stmt(s, out)),
+                _ => {}
+            }
+        }
+        match s {
+            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
+                exprs.iter().for_each(|e| ctors_of_expr(e, out))
+            }
+            Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => ctors_of_expr(expr, out),
+            Stmt::IndexAssign {
+                obj, key, value, ..
+            } => {
+                ctors_of_expr(obj, out);
+                ctors_of_expr(key, out);
+                ctors_of_expr(value, out);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                ctors_of_expr(condition, out);
+                body.iter().for_each(|s| ctors_of_stmt(s, out));
+            }
+            Stmt::Do { body, .. } => body.iter().for_each(|s| ctors_of_stmt(s, out)),
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                ctors_of_expr(condition, out);
+                then_body
+                    .iter()
+                    .chain(else_body)
+                    .for_each(|s| ctors_of_stmt(s, out));
+            }
+            Stmt::Return { value, .. } => {
+                if let Some(e) = value {
+                    ctors_of_expr(e, out)
+                }
+            }
+            Stmt::Break { .. } => {}
+        }
+    }
+    let mut ctors = Vec::new();
+    ast.iter().for_each(|s| ctors_of_stmt(s, &mut ctors));
+    for (id, line) in &ctors {
+        let site = ctx
+            .sites
+            .get(id)
+            .expect("the ctor's OWN id carries its site — the map keys ids, not addresses");
+        assert_eq!(
+            ctx.ctor_lines[*site], *line as usize,
+            "ctor_lines[site] is the ctor's own line at every id"
+        );
+        ctor_count += 1;
+    }
+    assert_eq!(ctor_count, 2, "the pin's tree carries two ctors");
+
+    // the expansion pair law: each top-level call IS its own site,
+    // the value is the fn literal's id, and no cross key exists
+    let Stmt::LocalDecl { exprs: f_exprs, .. } = &ast[0] else {
+        panic!("the first statement declares f");
+    };
+    let fn_id = f_exprs[0].id();
+    let call_of = |stmt: usize| match &ast[stmt] {
+        Stmt::LocalDecl { exprs, .. } => &exprs[0],
+        _ => panic!("the statement initializes from a call"),
+    };
+    let c1 = call_of(1).id();
+    let c2 = call_of(2).id();
+    assert_ne!(c1, c2, "two call nodes are two identities");
+    for call in [c1, c2] {
+        assert!(
+            shape.call_defs.contains_key(&(call, call)),
+            "a top-level call is its own expansion site — keyed by the node's id on both halves"
+        );
+        assert_eq!(
+            shape.call_defs[&(call, call)],
+            fn_id,
+            "the map's value is the callee literal's id"
+        );
+    }
+    assert!(
+        !shape.call_defs.contains_key(&(c1, c2)),
+        "a cross-site key is unrepresentable: one node, one site, its own id"
     );
 }

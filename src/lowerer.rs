@@ -2,7 +2,7 @@
 
 mod bridges;
 
-use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
+use crate::ast::{BinOp, CtorKey, Expr, NodeId, Stmt, UnOp};
 use crate::diag::Diagnostic;
 use crate::ir::{
     AnyReg, BasicBlock, BlockId, Bool, CellRepr, DbgBind, Instruction, Int, IrProgram, Ptr, Reg,
@@ -110,23 +110,22 @@ pub struct IrLowerer<'a> {
     fills: FillCtxs,
     handles: FreeHandles,
     shape: &'a ShapeFacts,
-    stmt_locs: BTreeMap<*const Stmt, SourceLoc>,
     cur_loc: Option<SourceLoc>,
     ghost_keeps: BTreeMap<usize, Reg<Ptr>>,
-    if_tag_regs: BTreeMap<*const Stmt, Reg<Bool>>,
-    call_tag_regs: BTreeMap<*const Expr, Reg<Bool>>,
+    if_tag_regs: BTreeMap<NodeId, Reg<Bool>>,
+    call_tag_regs: BTreeMap<NodeId, Reg<Bool>>,
 
     ctrl_depth: u32,
     return_ctxs: Vec<ReturnCtx>,
     break_ctxs: Vec<BreakCtx>,
-    inline_stack: Vec<*const Expr>,
+    inline_stack: Vec<NodeId>,
     /// the OUTERMOST call expr of every inline expansion currently being
     /// lowered (bottom = outermost site) — the lowerer's derivation of
     /// the `(call expr, expansion site)` fact keys it shares with the
     /// checker. Derived from this stack alone: both halves walk the
     /// identical AST in the identical order, so the sites agree without
     /// any shared counter.
-    expansion_sites: Vec<*const Expr>,
+    expansion_sites: Vec<NodeId>,
     /// the break-ctx depth each expansion began at — defense in depth:
     /// a break inside an expansion may only bind a loop of its OWN
     /// body, never the caller's (whose ctx would sit below the base).
@@ -145,7 +144,7 @@ pub struct IrLowerer<'a> {
     /// ordinary vars at entry; scalar rebinds write the box back.
     env_ctxs: Vec<EnvCtx>,
     /// the statement currently lowering (the env memo's key).
-    cur_stmt: Option<*const Stmt>,
+    cur_stmt: Option<NodeId>,
 }
 
 /// W3a's env representation: a strkey table whose EVERY cell is a
@@ -155,7 +154,7 @@ pub struct IrLowerer<'a> {
 /// every cell pointer-shaped; boxes carry contains_tables=0 and are
 /// freed as headers, their scalar payloads never chased).
 struct EnvMemo {
-    stmt: *const Stmt,
+    stmt: NodeId,
     reg: Reg<Ptr>,
     stored: BTreeSet<String>,
 }
@@ -174,7 +173,7 @@ impl Clone for EnvCtx {
 }
 
 impl<'a> IrLowerer<'a> {
-    pub fn new(shape: &'a ShapeFacts, stmt_locs: BTreeMap<*const Stmt, SourceLoc>) -> Self {
+    pub fn new(shape: &'a ShapeFacts) -> Self {
         Self {
             blocks: vec![BasicBlock::new(0)],
             diagnostics: Vec::new(),
@@ -185,7 +184,6 @@ impl<'a> IrLowerer<'a> {
                 loop_ctxs: Vec::new(),
             },
             shape,
-            stmt_locs,
             cur_loc: None,
             handles: FreeHandles {
                 site_regs: BTreeMap::new(),
@@ -267,7 +265,7 @@ impl<'a> IrLowerer<'a> {
         r
     }
 
-    fn emit_scope_frees(&mut self, key: (*const Stmt, u8)) -> Result<(), LowerError> {
+    fn emit_scope_frees(&mut self, key: (NodeId, u8)) -> Result<(), LowerError> {
         let frees = self
             .shape
             .do_exit_frees
@@ -451,21 +449,21 @@ impl<'a> IrLowerer<'a> {
     }
 
     fn emit_stmt_temp_frees(&mut self, stmt: &Stmt) {
-        let Some(sites) = self.shape.stmt_temp_frees.get(&(stmt as *const Stmt)) else {
+        let Some(sites) = self.shape.stmt_temp_frees.get(&stmt.id()) else {
             return;
         };
         self.emit_site_frees(sites, trace::TRACE_STMT_TEMP_FREE);
     }
 
     fn emit_cond_temp_frees(&mut self, stmt: &Stmt) {
-        let Some(sites) = self.shape.cond_temp_frees.get(&(stmt as *const Stmt)) else {
+        let Some(sites) = self.shape.cond_temp_frees.get(&stmt.id()) else {
             return;
         };
         self.emit_site_frees(sites, trace::TRACE_COND_TEMP_FREE);
     }
 
     fn emit_arm_temp_frees(&mut self, operand: &Expr) {
-        let Some(sites) = self.shape.arm_temp_frees.get(&(operand as *const Expr)) else {
+        let Some(sites) = self.shape.arm_temp_frees.get(&operand.id()) else {
             return;
         };
         self.emit_site_frees(sites, trace::TRACE_ARM_TEMP_FREE);
@@ -557,7 +555,7 @@ impl<'a> IrLowerer<'a> {
     }
 
     fn null_moves_of(&mut self, stmt: &Stmt) -> Result<(), LowerError> {
-        if let Some(srcs) = self.shape.move_poisons.get(&(stmt as *const Stmt)) {
+        if let Some(srcs) = self.shape.move_poisons.get(&stmt.id()) {
             for src in srcs.clone() {
                 self.null_moved(&src)?;
             }
@@ -591,11 +589,10 @@ impl<'a> IrLowerer<'a> {
                 Ok(_) => {}
                 Err(e) => {
                     let desync = e.is_desync();
-                    // the site-stamp: the stmt's own line from the
-                    // loc-derived map (H5's dividend), one formatter
-                    self.diagnostics.push(
-                        e.0.with_site(self.shape.stmt_lines.get(&(stmt as *const Stmt)).copied()),
-                    );
+                    // the site-stamp: the stmt's own line off its own
+                    // loc (H6: no map — the stamp rides the node)
+                    self.diagnostics
+                        .push(e.0.with_site(Some(stmt.loc().line as usize)));
                     signal!(trace::TRACE_GHOST_BAIL_LOWERER);
                     if desync {
                         signal!(trace::TRACE_ENG_DESYNC);
@@ -726,7 +723,7 @@ impl<'a> IrLowerer<'a> {
     /// exactly as the checker derives them (`fact_site` there): the
     /// OUTERMOST expansion the current expression is being lowered
     /// inside — the expression itself at no expansion.
-    fn fact_site(&self, expr: *const Expr) -> *const Expr {
+    fn fact_site(&self, expr: NodeId) -> NodeId {
         self.expansion_sites.first().copied().unwrap_or(expr)
     }
 
@@ -742,7 +739,7 @@ impl<'a> IrLowerer<'a> {
     /// the checker's recorded decision (`index_key_lanes`, signal 178)
     /// — this walk consumes it, never re-derives it.
     fn lower_index_key(&mut self, key: &Expr) -> Result<TableKey, LowerError> {
-        if let Expr::String(s) = key {
+        if let Expr::String { value: s, .. } = key {
             let r = self.next_reg();
             self.emit(Instruction::StrKeyConst {
                 target: Reg::new(r),
@@ -753,7 +750,7 @@ impl<'a> IrLowerer<'a> {
         let lane = *self
             .shape
             .index_key_lanes
-            .get(&(key as *const Expr, self.fact_site(key as *const Expr)))
+            .get(&(key.id(), self.fact_site(key.id())))
             .ok_or_else(|| {
                 LowerError(Diagnostic::desync(
                     "Lower Error: an index key carries no recorded lane — \
@@ -791,7 +788,7 @@ impl<'a> IrLowerer<'a> {
         let elem = self
             .shape
             .access_elems
-            .get(&(obj as *const Expr, self.fact_site(obj as *const Expr)))
+            .get(&(obj.id(), self.fact_site(obj.id())))
             .cloned()
             .ok_or_else(|| {
                 LowerError(Diagnostic::desync(
@@ -804,11 +801,14 @@ impl<'a> IrLowerer<'a> {
     }
 
     fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), LowerError> {
-        self.cur_loc = self.stmt_locs.get(&(stmt as *const Stmt)).copied();
+        self.cur_loc = Some(SourceLoc {
+            line: stmt.loc().line,
+            col: stmt.loc().col,
+        });
         // W3a: one env per creation statement (sibling sharing) — the
         // memo resets at every statement lowering
         self.env_memo = None;
-        self.cur_stmt = Some(stmt as *const Stmt);
+        self.cur_stmt = Some(stmt.id());
         match stmt {
             Stmt::LocalDecl { names, exprs, .. } => {
                 let mut bindings = Vec::with_capacity(exprs.len());
@@ -824,7 +824,7 @@ impl<'a> IrLowerer<'a> {
                         .shape
                         .local_types
                         .get(&(
-                            stmt as *const Stmt,
+                            stmt.id(),
                             self.expansion_sites.first().copied(),
                             name.clone(),
                         ))
@@ -884,7 +884,7 @@ impl<'a> IrLowerer<'a> {
                     };
                     bindings.push((reg, ty, LayoutVerdict::default()));
                 }
-                if let Some(names) = self.shape.rebind_frees.get(&(stmt as *const Stmt)) {
+                if let Some(names) = self.shape.rebind_frees.get(&stmt.id()) {
                     for (n, keeps) in names {
                         let displaced = self.read_var(n)?;
                         let table = ptr_of(displaced.reg)?;
@@ -905,7 +905,7 @@ impl<'a> IrLowerer<'a> {
                         signal!(trace::TRACE_REBIND_FREE);
                     }
                 }
-                if let Some(arms) = self.shape.arm_rebind_frees.get(&(stmt as *const Stmt)) {
+                if let Some(arms) = self.shape.arm_rebind_frees.get(&stmt.id()) {
                     for e in arms {
                         self.emit_arm_free(e)?;
                     }
@@ -929,14 +929,14 @@ impl<'a> IrLowerer<'a> {
                     self.declare_var(name.clone(), reg, ty, layout);
                     return Ok(());
                 }
-                if matches!(expr, Expr::Nil) {
+                if matches!(expr, Expr::Nil { .. }) {
                     let local = self.read_var(name)?;
                     if self.shape.is_free(stmt) {
                         let table = ptr_of(local.reg)?;
                         let keep_regs = self
                             .shape
                             .free_keeps
-                            .get(&(stmt as *const Stmt))
+                            .get(&stmt.id())
                             .map(|ks| self.resolve_keeps(ks))
                             .transpose()?
                             .unwrap_or_default();
@@ -951,7 +951,7 @@ impl<'a> IrLowerer<'a> {
                             });
                         }
                     }
-                    if let Some(arms) = self.shape.arm_free_sites.get(&(stmt as *const Stmt)) {
+                    if let Some(arms) = self.shape.arm_free_sites.get(&stmt.id()) {
                         for e in arms {
                             self.emit_arm_free(e)?;
                         }
@@ -974,7 +974,7 @@ impl<'a> IrLowerer<'a> {
                     ty,
                 } = self.lower_expr(expr, Some(new_reg))?;
                 let layout = self.lookup_layout_for(expr)?;
-                if let Some(names) = self.shape.rebind_frees.get(&(stmt as *const Stmt)) {
+                if let Some(names) = self.shape.rebind_frees.get(&stmt.id()) {
                     for (n, keeps) in names {
                         let displaced = self.read_var(n)?;
                         let table = ptr_of(displaced.reg)?;
@@ -995,7 +995,7 @@ impl<'a> IrLowerer<'a> {
                         signal!(trace::TRACE_REBIND_FREE);
                     }
                 }
-                if let Some(arms) = self.shape.arm_rebind_frees.get(&(stmt as *const Stmt)) {
+                if let Some(arms) = self.shape.arm_rebind_frees.get(&stmt.id()) {
                     for e in arms {
                         self.emit_arm_free(e)?;
                     }
@@ -1051,7 +1051,7 @@ impl<'a> IrLowerer<'a> {
                     v_reg
                 };
 
-                if let Some(ghosts) = self.shape.store_ghost_keeps.get(&(stmt as *const Stmt)) {
+                if let Some(ghosts) = self.shape.store_ghost_keeps.get(&stmt.id()) {
                     let row_ptr = ptr_of(v_reg)?;
                     for &g in ghosts {
                         self.ghost_keeps.insert(g, row_ptr);
@@ -1129,7 +1129,7 @@ impl<'a> IrLowerer<'a> {
                         // dense verdict must match this lowering's depth
                         self.shape
                             .fill_loops
-                            .get(&(stmt as *const Stmt))
+                            .get(&stmt.id())
                             .map(|plan| {
                                 let depth = self.scopes.len();
                                 let mut names = Vec::new();
@@ -1262,7 +1262,7 @@ impl<'a> IrLowerer<'a> {
                     for s in body {
                         an.lower_stmt(s)?;
                     }
-                    an.emit_scope_frees((stmt as *const Stmt, 0))
+                    an.emit_scope_frees((stmt.id(), 0))
                 })?;
                 if conv.is_some() {
                     self.fills.loop_ctxs.pop();
@@ -1318,7 +1318,7 @@ impl<'a> IrLowerer<'a> {
                 for s in body {
                     an.lower_stmt(s)?;
                 }
-                an.emit_scope_frees((stmt as *const Stmt, 0))
+                an.emit_scope_frees((stmt.id(), 0))
             })?,
 
             Stmt::Print { exprs, .. } => {
@@ -1365,7 +1365,7 @@ impl<'a> IrLowerer<'a> {
                 let frees = self
                     .shape
                     .break_path_frees
-                    .get(&(stmt as *const Stmt))
+                    .get(&stmt.id())
                     .cloned()
                     .unwrap_or_default();
                 self.emit_frees(&frees)?;
@@ -1383,7 +1383,7 @@ impl<'a> IrLowerer<'a> {
                 );
                 let val_reg = if boundary {
                     match value {
-                        None | Some(Expr::Nil) => {
+                        None | Some(Expr::Nil { .. }) => {
                             let r = self.next_reg();
                             self.emit(Instruction::LoadNull {
                                 target: Reg::new(r),
@@ -1397,7 +1397,7 @@ impl<'a> IrLowerer<'a> {
                     }
                 } else {
                     match value {
-                        Some(expr) if !matches!(expr, Expr::Nil) => {
+                        Some(expr) if !matches!(expr, Expr::Nil { .. }) => {
                             self.lower_expr(expr, None)?.reg
                         }
                         _ => {
@@ -1424,13 +1424,13 @@ impl<'a> IrLowerer<'a> {
                 let keep_frees = self
                     .shape
                     .ret_path_keep_frees
-                    .get(&(stmt as *const Stmt))
+                    .get(&stmt.id())
                     .cloned()
                     .unwrap_or_default();
                 let keep_temps = self
                     .shape
                     .ret_path_keep_temps
-                    .get(&(stmt as *const Stmt))
+                    .get(&stmt.id())
                     .cloned()
                     .unwrap_or_default();
                 if (!keep_frees.is_empty() || !keep_temps.is_empty())
@@ -1472,7 +1472,7 @@ impl<'a> IrLowerer<'a> {
                 let frees = self
                     .shape
                     .ret_path_frees
-                    .get(&(stmt as *const Stmt))
+                    .get(&stmt.id())
                     .cloned()
                     .unwrap_or_default();
                 if !frees.is_empty() {
@@ -1530,7 +1530,7 @@ impl<'a> IrLowerer<'a> {
                     for s in then_body {
                         an.lower_stmt(s)?;
                     }
-                    an.emit_scope_frees((stmt as *const Stmt, 0))
+                    an.emit_scope_frees((stmt.id(), 0))
                 })?;
                 let then_end = self.current_block;
                 let then_regs: Vec<(String, AnyReg, Ty, LayoutVerdict)> = phi_order
@@ -1541,7 +1541,7 @@ impl<'a> IrLowerer<'a> {
                     })
                     .collect::<Result<Vec<_>, LowerError>>()?;
                 let mut then_tag: Option<Reg<Bool>> = None;
-                if self.shape.join_tags.contains_key(&(stmt as *const Stmt)) {
+                if self.shape.join_tags.contains_key(&stmt.id()) {
                     let r = self.next_reg();
                     self.emit(Instruction::LoadBool {
                         target: Reg::new(r),
@@ -1557,7 +1557,7 @@ impl<'a> IrLowerer<'a> {
                     for s in else_body {
                         an.lower_stmt(s)?;
                     }
-                    an.emit_scope_frees((stmt as *const Stmt, 1))
+                    an.emit_scope_frees((stmt.id(), 1))
                 })?;
                 let else_end = self.current_block;
                 let else_regs: Vec<(String, AnyReg, Ty, LayoutVerdict)> = phi_order
@@ -1568,7 +1568,7 @@ impl<'a> IrLowerer<'a> {
                     })
                     .collect::<Result<Vec<_>, LowerError>>()?;
                 let mut else_tag: Option<Reg<Bool>> = None;
-                if self.shape.join_tags.contains_key(&(stmt as *const Stmt)) {
+                if self.shape.join_tags.contains_key(&stmt.id()) {
                     let r = self.next_reg();
                     self.emit(Instruction::LoadBool {
                         target: Reg::new(r),
@@ -1587,8 +1587,7 @@ impl<'a> IrLowerer<'a> {
                         vec![(then_end, AnyReg::Bool(t)), (else_end, AnyReg::Bool(e))],
                     )?;
                     self.emit(Instruction::Phi(phi));
-                    self.if_tag_regs
-                        .insert(stmt as *const Stmt, Reg::new(tag_reg));
+                    self.if_tag_regs.insert(stmt.id(), Reg::new(tag_reg));
                 }
                 for (i, (name, _)) in phi_order.iter().enumerate() {
                     let phi_reg = self.next_reg();
@@ -1611,13 +1610,13 @@ impl<'a> IrLowerer<'a> {
     fn lookup_layout_for(&self, expr: &Expr) -> Result<LayoutVerdict, LowerError> {
         match expr {
             Expr::TableCtor { .. } => {
-                if let Some(&site_id) = self.shape.sites.get(&(expr as *const Expr)) {
+                if let Some(&site_id) = self.shape.sites.get(&expr.id()) {
                     Ok(self.shape.layouts[site_id])
                 } else {
                     Ok(LayoutVerdict::default())
                 }
             }
-            Expr::Identifier(name) => Ok(self.read_var(name)?.layout),
+            Expr::Identifier { name, .. } => Ok(self.read_var(name)?.layout),
             Expr::Index { obj, .. } => self.lookup_layout_for(obj),
             _ => Ok(LayoutVerdict::default()),
         }
@@ -1639,7 +1638,7 @@ impl<'a> IrLowerer<'a> {
         let verb = self
             .shape
             .ffi_verbs
-            .get(&(call as *const Expr))
+            .get(&call.id())
             .cloned()
             .ok_or_else(|| {
                 LowerError(Diagnostic::desync(
@@ -1772,7 +1771,7 @@ impl<'a> IrLowerer<'a> {
     /// root-exit deep free is sound on the whole tree at once. Tables
     /// MOVE in (the sources poison through the walk-booked
     /// move_poisons — the existing move law); scalars copy at mint.
-    fn mint_env(&mut self, ptr: *const Expr) -> Result<Reg<Ptr>, LowerError> {
+    fn mint_env(&mut self, ptr: NodeId) -> Result<Reg<Ptr>, LowerError> {
         let faces: BTreeMap<String, Ty> =
             self.shape.env_faces.get(&ptr).cloned().unwrap_or_default();
         let stmt = self
@@ -1806,7 +1805,7 @@ impl<'a> IrLowerer<'a> {
         Ok(env)
     }
 
-    fn take_env_memo_for(&mut self, stmt: *const Stmt) -> Option<EnvMemo> {
+    fn take_env_memo_for(&mut self, stmt: NodeId) -> Option<EnvMemo> {
         if let Some(memo) = &self.env_memo
             && memo.stmt == stmt
         {
@@ -1873,7 +1872,7 @@ impl<'a> IrLowerer<'a> {
     /// cells) so the body's own lowering needs no further plumbing;
     /// scalar rebinds write the box back (the Assignment arm consults
     /// `env_ctxs`).
-    fn enter_env_ctx(&mut self, env: Reg<Ptr>, ptr: *const Expr) -> Result<(), LowerError> {
+    fn enter_env_ctx(&mut self, env: Reg<Ptr>, ptr: NodeId) -> Result<(), LowerError> {
         let faces: BTreeMap<String, Ty> =
             self.shape.env_faces.get(&ptr).cloned().unwrap_or_default();
         for (name, ty) in faces.clone() {
@@ -1943,7 +1942,7 @@ impl<'a> IrLowerer<'a> {
         let reg = target.unwrap_or_else(|| self.next_reg());
 
         match expr {
-            Expr::Integer(val) => {
+            Expr::Integer { value: val, .. } => {
                 self.emit(Instruction::LoadInt {
                     target: Reg::new(reg),
                     val: *val,
@@ -1953,7 +1952,7 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Int,
                 })
             }
-            Expr::Float(val) => {
+            Expr::Float { value: val, .. } => {
                 self.emit(Instruction::LoadFloat {
                     target: Reg::new(reg),
                     val: *val,
@@ -1963,7 +1962,7 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Flt,
                 })
             }
-            Expr::Boolean(val) => {
+            Expr::Boolean { value: val, .. } => {
                 self.emit(Instruction::LoadBool {
                     target: Reg::new(reg),
                     val: *val,
@@ -1973,7 +1972,7 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Bool,
                 })
             }
-            Expr::String(val) => {
+            Expr::String { value: val, .. } => {
                 self.emit(Instruction::LoadString {
                     target: Reg::new(reg),
                     val: val.clone(),
@@ -1983,10 +1982,10 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Str,
                 })
             }
-            Expr::Nil => {
+            Expr::Nil { .. } => {
                 unreachable!("nil outside a table release")
             }
-            Expr::SysAllocCount => {
+            Expr::SysAllocCount { .. } => {
                 self.emit(Instruction::SysAllocCount {
                     target: Reg::new(reg),
                 });
@@ -1995,7 +1994,7 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Int,
                 })
             }
-            Expr::SysExecCount => {
+            Expr::SysExecCount { .. } => {
                 self.emit(Instruction::SysExecCount {
                     target: Reg::new(reg),
                 });
@@ -2004,7 +2003,7 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Int,
                 })
             }
-            Expr::FfiModule => {
+            Expr::FfiModule { .. } => {
                 self.emit(Instruction::LoadNull {
                     target: Reg::new(reg),
                 });
@@ -2013,7 +2012,7 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Ffi,
                 })
             }
-            Expr::CoroModule => {
+            Expr::CoroModule { .. } => {
                 self.emit(Instruction::LoadNull {
                     target: Reg::new(reg),
                 });
@@ -2031,11 +2030,11 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Unknown(0),
                 })
             }
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 // the per-instantiation fact key, derived exactly as the
                 // checker derives it: the OUTERMOST expansion this call
                 // is lowered inside (the call itself at no expansion)
-                let call_ptr = expr as *const Expr;
+                let call_ptr = expr.id();
                 let site = self.expansion_sites.first().copied().unwrap_or(call_ptr);
                 // D4 precedence, lower half: a Field callee is a module
                 // surface call UNLESS the checker resolved it as an
@@ -2065,11 +2064,11 @@ impl<'a> IrLowerer<'a> {
                 // recorded a closure dispatch — a D4 dot-ns expansion
                 // call rides the same callee shape and reads nothing.
                 let call_env: Option<Reg<Ptr>> = match callee.as_ref() {
-                    Expr::Identifier(n) => match self.read_var(n) {
+                    Expr::Identifier { name: n, .. } => match self.read_var(n) {
                         Ok(local) if matches!(local.ty, Ty::Closure(_)) => Some(ptr_of(local.reg)?),
                         _ => None,
                     },
-                    Expr::Field { obj, name }
+                    Expr::Field { obj, name, .. }
                         if self.shape.closure_calls.contains(&(call_ptr, site)) =>
                     {
                         let t_any = self.lower_expr(obj, None)?.reg;
@@ -2113,7 +2112,7 @@ impl<'a> IrLowerer<'a> {
                         ))
                     })?;
                 let scope_key = self.shape.fn_scope_keys.get(&fn_ptr).copied();
-                let body = unsafe { def.body() };
+                let body = def.body();
 
                 let mut arg_regs = Vec::with_capacity(args.len());
                 for a in args {
@@ -2156,7 +2155,7 @@ impl<'a> IrLowerer<'a> {
                          the checker and the lowerer disagree",
                     ))
                 })?;
-                if let Some(classes) = self.shape.call_tags.get(&(expr as *const Expr)).cloned() {
+                if let Some(classes) = self.shape.call_tags.get(&expr.id()).cloned() {
                     let exit = self.current_block;
                     let edge_blocks: Vec<BlockId> = self.blocks[exit]
                         .instrs
@@ -2187,8 +2186,7 @@ impl<'a> IrLowerer<'a> {
                     let tag_reg = self.next_reg();
                     let phi = phi_of(RegKind::Bool, tag_reg, tag_args)?;
                     self.emit(Instruction::Phi(phi));
-                    self.call_tag_regs
-                        .insert(expr as *const Expr, Reg::new(tag_reg));
+                    self.call_tag_regs.insert(expr.id(), Reg::new(tag_reg));
                 }
                 self.inline_stack.pop();
                 self.expansion_sites.pop();
@@ -2203,7 +2201,7 @@ impl<'a> IrLowerer<'a> {
             }
             Expr::TableCtor { entries, .. } => {
                 let elem = self.shape.elem_of(expr);
-                let ctor_site = self.shape.sites.get(&(expr as *const Expr)).copied();
+                let ctor_site = self.shape.sites.get(&expr.id()).copied();
 
                 // W3a, R3: which fields carry closure faces — their
                 // stores ride the Ptr lane and the table's own cells go
@@ -2257,7 +2255,7 @@ impl<'a> IrLowerer<'a> {
                     elem_regs.push(r);
                 }
 
-                if let Some(pairs) = self.shape.ctor_ghost_keeps.get(&(expr as *const Expr)) {
+                if let Some(pairs) = self.shape.ctor_ghost_keeps.get(&expr.id()) {
                     for &(ei, g) in pairs {
                         if let Some(&r) = elem_regs.get(ei)
                             && let Ok(ptr) = ptr_of(r)
@@ -2286,7 +2284,7 @@ impl<'a> IrLowerer<'a> {
                     elem: new_elem,
                     flags,
                 });
-                if let Some(&site) = self.shape.sites.get(&(expr as *const Expr)) {
+                if let Some(&site) = self.shape.sites.get(&expr.id()) {
                     self.handles.site_regs.insert(site, (tbl, self.ctrl_depth));
                 }
                 for ((key, _), v_reg) in entries.iter().zip(elem_regs) {
@@ -2328,7 +2326,7 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Tbl(Box::new(elem)),
                 })
             }
-            Expr::Index { obj, key } => {
+            Expr::Index { obj, key, .. } => {
                 let t_any = self.lower_expr(obj, None)?.reg;
                 let key = self.lower_index_key(key)?;
                 let target_ty = self.elem_face_of(obj)?;
@@ -2339,7 +2337,7 @@ impl<'a> IrLowerer<'a> {
                     ty: target_ty,
                 })
             }
-            Expr::Field { obj, name } => {
+            Expr::Field { obj, name, .. } => {
                 // Non-callee dot access is a record read: identical to
                 // t["name"]. Inlined rather than delegated to a synthetic
                 // Index expr, whose clone would allocate a fresh operand
@@ -2365,12 +2363,12 @@ impl<'a> IrLowerer<'a> {
                     ty: target_ty,
                 })
             }
-            Expr::Identifier(name) => {
+            Expr::Identifier { name, .. } => {
                 // W3a's creation: a fn name read as a value mints (or
                 // joins) this statement's env and answers the env
                 // pointer — a closure value's register IS its env.
-                let site = self.fact_site(expr as *const Expr);
-                if let Some(&ptr) = self.shape.creation_envs.get(&(expr as *const Expr, site)) {
+                let site = self.fact_site(expr.id());
+                if let Some(&ptr) = self.shape.creation_envs.get(&(expr.id(), site)) {
                     let reg = self.mint_env(ptr)?;
                     return Ok(TypedReg {
                         reg: AnyReg::Ptr(reg),
@@ -2395,6 +2393,7 @@ impl<'a> IrLowerer<'a> {
                 op: op @ (BinOp::And | BinOp::Or),
                 left,
                 right,
+                ..
             } => {
                 let l_reg = bool_of(self.lower_expr(left, None)?.reg)?;
                 self.emit_arm_temp_frees(left);
@@ -2441,7 +2440,9 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Bool,
                 })
             }
-            Expr::BinaryOp { op, left, right } => {
+            Expr::BinaryOp {
+                op, left, right, ..
+            } => {
                 let TypedReg {
                     reg: l_any,
                     ty: l_ty,
@@ -2588,7 +2589,7 @@ impl<'a> IrLowerer<'a> {
                     ty,
                 })
             }
-            Expr::UnaryOp { op, expr } => match op {
+            Expr::UnaryOp { op, expr, .. } => match op {
                 UnOp::Neg => {
                     let TypedReg {
                         reg: x_any,
@@ -2618,7 +2619,7 @@ impl<'a> IrLowerer<'a> {
                     })
                 }
                 UnOp::Len => {
-                    if let Expr::String(s) = expr.as_ref() {
+                    if let Expr::String { value: s, .. } = expr.as_ref() {
                         self.emit(Instruction::LoadInt {
                             target: Reg::new(reg),
                             val: s.len() as i64,
@@ -2676,7 +2677,7 @@ impl<'a> IrLowerer<'a> {
 
 fn const_of(expr: &Expr) -> Option<i64> {
     match expr {
-        Expr::Integer(v) => Some(*v),
+        Expr::Integer { value: v, .. } => Some(*v),
         _ => None,
     }
 }
@@ -2684,7 +2685,7 @@ fn const_of(expr: &Expr) -> Option<i64> {
 fn find_moved_names(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
     let mut moved = BTreeSet::new();
     for stmt in stmts {
-        if let Some(names) = shape.move_poisons.get(&(stmt as *const Stmt)) {
+        if let Some(names) = shape.move_poisons.get(&stmt.id()) {
             moved.extend(names.iter().cloned());
         }
         match stmt {
@@ -2708,15 +2709,15 @@ fn find_moved_names(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
 
 fn calls_touched(expr: &Expr, shape: &ShapeFacts, out: &mut BTreeSet<String>) {
     match expr {
-        Expr::Call { callee, args } => {
+        Expr::Call { callee, args, .. } => {
             // union read: every instantiation of this call expr (all its
             // expansion sites) contributes its fn's touched names — the
             // order-insensitive consumer the per-instantiation keys were
             // designed to leave alone
-            let key = expr as *const Expr;
+            let key = expr.id();
             for (_, &fn_ptr) in shape
                 .call_defs
-                .range((key, std::ptr::null::<Expr>())..=(key, usize::MAX as *const Expr))
+                .range((key, NodeId(0))..=(key, NodeId(u32::MAX)))
             {
                 if let Some(touched) = shape.fn_touched.get(&fn_ptr) {
                     out.extend(touched.iter().cloned());
@@ -2732,7 +2733,7 @@ fn calls_touched(expr: &Expr, shape: &ShapeFacts, out: &mut BTreeSet<String>) {
             calls_touched(right, shape, out);
         }
         Expr::UnaryOp { expr, .. } => calls_touched(expr, shape, out),
-        Expr::Index { obj, key } => {
+        Expr::Index { obj, key, .. } => {
             calls_touched(obj, shape, out);
             calls_touched(key, shape, out);
         }
@@ -2778,14 +2779,14 @@ fn find_mutated_vars(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
 
 fn as_ident(expr: &Expr) -> Option<&str> {
     match expr {
-        Expr::Identifier(name) => Some(name),
+        Expr::Identifier { name, .. } => Some(name),
         _ => None,
     }
 }
 
 fn get_base_identifier(expr: &Expr) -> Option<&String> {
     match expr {
-        Expr::Identifier(name) => Some(name),
+        Expr::Identifier { name, .. } => Some(name),
         Expr::Index { obj, .. } => get_base_identifier(obj),
         _ => None,
     }
@@ -2862,7 +2863,7 @@ mod desync_class_tests {
 #[cfg(test)]
 mod break_gate_tests {
     use crate::ast::has_break;
-    use crate::ast::{Expr, Loc, Stmt};
+    use crate::ast::{Expr, Loc, NodeId, Stmt};
 
     fn at() -> Loc {
         Loc { line: 1, col: 1 }
@@ -2871,45 +2872,68 @@ mod break_gate_tests {
     fn assign_i() -> Stmt {
         Stmt::Assignment {
             name: "i".to_string(),
-            expr: Expr::Integer(1),
+            expr: Expr::Integer {
+                value: 1,
+                id: NodeId::mint(),
+            },
             loc: at(),
+            id: NodeId::mint(),
         }
     }
 
     #[test]
     fn flat_break_is_this_loops() {
-        assert!(has_break(&[Stmt::Break { loc: at() }]));
+        assert!(has_break(&[Stmt::Break {
+            loc: at(),
+            id: NodeId::mint()
+        }]));
         assert!(!has_break(&[assign_i()]));
     }
 
     #[test]
     fn break_through_do_and_if_counts() {
-        let cond = Expr::Boolean(true);
-        let brk = vec![Stmt::Break { loc: at() }];
+        let cond = Expr::Boolean {
+            value: true,
+            id: NodeId::mint(),
+        };
+        let brk = vec![Stmt::Break {
+            loc: at(),
+            id: NodeId::mint(),
+        }];
         assert!(has_break(&[Stmt::Do {
             body: brk.clone(),
             loc: at(),
+            id: NodeId::mint()
         }]));
         assert!(has_break(&[Stmt::If {
             condition: cond.clone(),
             then_body: brk.clone(),
             else_body: vec![],
             loc: at(),
+            id: NodeId::mint()
         }]));
         assert!(has_break(&[Stmt::If {
             condition: cond,
             then_body: vec![],
             else_body: brk,
             loc: at(),
+            id: NodeId::mint()
         }]));
     }
 
     #[test]
     fn break_inside_nested_while_binds_to_the_inner_loop() {
         let nested = vec![Stmt::While {
-            condition: Expr::Boolean(true),
-            body: vec![Stmt::Break { loc: at() }],
+            condition: Expr::Boolean {
+                value: true,
+                id: NodeId::mint(),
+            },
+            body: vec![Stmt::Break {
+                loc: at(),
+                id: NodeId::mint(),
+            }],
             loc: at(),
+            id: NodeId::mint(),
         }];
         assert!(!has_break(&nested));
     }
@@ -2924,9 +2948,14 @@ mod break_gate_tests {
             names: vec!["f".to_string()],
             exprs: vec![Expr::Function {
                 params: vec![],
-                body: vec![Stmt::Break { loc: at() }],
+                body: vec![Stmt::Break {
+                    loc: at(),
+                    id: NodeId::mint(),
+                }],
+                id: NodeId::mint(),
             }],
             loc: at(),
+            id: NodeId::mint(),
         };
         assert!(!has_break(&[fn_with_break]));
 
@@ -2935,12 +2964,21 @@ mod break_gate_tests {
             exprs: vec![Expr::Function {
                 params: vec![],
                 body: vec![Stmt::While {
-                    condition: Expr::Boolean(true),
-                    body: vec![Stmt::Break { loc: at() }],
+                    condition: Expr::Boolean {
+                        value: true,
+                        id: NodeId::mint(),
+                    },
+                    body: vec![Stmt::Break {
+                        loc: at(),
+                        id: NodeId::mint(),
+                    }],
                     loc: at(),
+                    id: NodeId::mint(),
                 }],
+                id: NodeId::mint(),
             }],
             loc: at(),
+            id: NodeId::mint(),
         };
         assert!(!has_break(&[fn_with_own_loop]));
     }

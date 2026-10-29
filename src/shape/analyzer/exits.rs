@@ -10,7 +10,7 @@ impl Analyzer {
         &mut self,
         rec: Gate,
         depth: usize,
-        key: (*const Stmt, u8),
+        key: (NodeId, u8),
     ) -> Result<
         (
             Vec<super::facts::DoExitFree>,
@@ -241,7 +241,7 @@ impl Analyzer {
     pub(super) fn decide_scope_exit(
         &mut self,
         rec: Gate,
-        key: (*const Stmt, u8),
+        key: (NodeId, u8),
     ) -> Result<(), ShapeError> {
         if !rec.on() {
             return Ok(());
@@ -260,7 +260,7 @@ impl Analyzer {
         &mut self,
         value: Option<(&Expr, &Ty)>,
         reach: &BTreeSet<usize>,
-        stmt: *const Stmt,
+        stmt: NodeId,
     ) {
         let entry = self.fn_scope_entries.last().copied().unwrap_or(0);
         let boundary = self.fn_scope_entries.is_empty();
@@ -328,7 +328,7 @@ impl Analyzer {
     /// itself (or a wrapping Do) cleans them up on normal exit. Splits nothing
     /// (compute_scope_frees(depth, false) folds arm frees in — breaks carry no
     /// kept value, so there is no arm-split need).
-    pub(super) fn plan_break_exits(&mut self, stmt: *const Stmt) {
+    pub(super) fn plan_break_exits(&mut self, stmt: NodeId) {
         self.own.break_path_frees.remove(&stmt);
         let Some(&entry) = self.loop_scope_entries.last() else {
             return;
@@ -366,7 +366,7 @@ impl Analyzer {
             return Ok(());
         }
 
-        let (frees, arms) = self.scope_exit_frees(rec, 0, (std::ptr::null_mut(), 0))?;
+        let (frees, arms) = self.scope_exit_frees(rec, 0, (NodeId(u32::MAX), 0))?;
         for _ in &frees {
             signal!(rec.on(), trace::TRACE_ROOT_EXIT_FREE_SITE);
         }
@@ -439,7 +439,7 @@ impl Analyzer {
                 self.prune_deepfree_children(&mut sites);
                 if !sites.is_empty() {
                     signal!(true, trace::TRACE_STMT_TEMP_FREE_SITE);
-                    self.own.stmt_temp_frees.insert(s as *const Stmt, sites);
+                    self.own.stmt_temp_frees.insert(s.id(), sites);
                 }
             }
             self.plan_fn_bodies_in_stmt(s);
@@ -453,7 +453,7 @@ impl Analyzer {
         self.prune_deepfree_children(&mut sites);
         if !sites.is_empty() {
             signal!(true, trace::TRACE_COND_TEMP_FREE_SITE);
-            self.own.cond_temp_frees.insert(stmt as *const Stmt, sites);
+            self.own.cond_temp_frees.insert(stmt.id(), sites);
         }
     }
 
@@ -513,6 +513,7 @@ impl Analyzer {
                 op: BinOp::And | BinOp::Or,
                 left,
                 right,
+                ..
             } => {
                 for operand in [left.as_ref(), right.as_ref()] {
                     let mut sites = Vec::new();
@@ -520,9 +521,7 @@ impl Analyzer {
                     self.prune_deepfree_children(&mut sites);
                     if !sites.is_empty() {
                         signal!(true, trace::TRACE_ARM_TEMP_FREE_SITE);
-                        self.own
-                            .arm_temp_frees
-                            .insert(operand as *const Expr, sites);
+                        self.own.arm_temp_frees.insert(operand.id(), sites);
                     }
                 }
                 self.plan_arm_temp_frees_in_expr(left);
@@ -536,7 +535,7 @@ impl Analyzer {
                     self.plan_arm_temp_frees_in_expr(v);
                 }
             }
-            Expr::Index { obj, key } => {
+            Expr::Index { obj, key, .. } => {
                 self.plan_arm_temp_frees_in_expr(obj);
                 self.plan_arm_temp_frees_in_expr(key);
             }
@@ -545,7 +544,7 @@ impl Analyzer {
                 self.plan_arm_temp_frees_in_expr(right);
             }
             Expr::UnaryOp { expr, .. } => self.plan_arm_temp_frees_in_expr(expr),
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 self.plan_arm_temp_frees_in_expr(callee);
                 for a in args {
                     self.plan_arm_temp_frees_in_expr(a);
@@ -559,7 +558,7 @@ impl Analyzer {
         match e {
             Expr::TableCtor { entries, .. } => {
                 if fate == Fate::Dies
-                    && let Some(&site) = self.lattice.sites.get(&(e as *const Expr))
+                    && let Some(&site) = self.lattice.sites.get(&e.id())
                 {
                     out.push(site);
                 }
@@ -567,8 +566,8 @@ impl Analyzer {
                     self.collect_temp_sites(v, fate, out);
                 }
             }
-            Expr::Call { callee, args } => {
-                if let Expr::Identifier(name) = callee.as_ref()
+            Expr::Call { callee, args, .. } => {
+                if let Expr::Identifier { name, .. } = callee.as_ref()
                     && let Some(fn_ptr) = self.resolve_fn(name)
                 {
                     if fate == Fate::Dies
@@ -593,7 +592,7 @@ impl Analyzer {
                         let arg_fate = if is_moved {
                             Fate::Escapes
                         } else if is_ret {
-                            if fate == Fate::Dies && !matches!(a, Expr::Identifier(_)) {
+                            if fate == Fate::Dies && !matches!(a, Expr::Identifier { .. }) {
                                 Fate::Dies
                             } else {
                                 Fate::Escapes
@@ -609,7 +608,7 @@ impl Analyzer {
                     }
                 }
             }
-            Expr::Index { obj, key } => {
+            Expr::Index { obj, key, .. } => {
                 self.collect_temp_sites(obj, Fate::Dies, out);
                 self.collect_temp_sites(key, Fate::Dies, out);
             }
@@ -623,19 +622,19 @@ impl Analyzer {
             }
             Expr::UnaryOp { expr, .. } => self.collect_temp_sites(expr, Fate::Dies, out),
             Expr::Function { .. } => {}
-            Expr::FfiModule => {}
-            Expr::CoroModule => {}
+            Expr::FfiModule { .. } => {}
+            Expr::CoroModule { .. } => {}
             Expr::Field { obj, .. } => {
                 self.collect_temp_sites(obj, Fate::Dies, out);
             }
-            Expr::Integer(_)
-            | Expr::Float(_)
-            | Expr::Boolean(_)
-            | Expr::String(_)
-            | Expr::Nil
-            | Expr::Identifier(_)
-            | Expr::SysAllocCount
-            | Expr::SysExecCount => {}
+            Expr::Integer { .. }
+            | Expr::Float { .. }
+            | Expr::Boolean { .. }
+            | Expr::String { .. }
+            | Expr::Nil { .. }
+            | Expr::Identifier { .. }
+            | Expr::SysAllocCount { .. }
+            | Expr::SysExecCount { .. } => {}
         }
     }
 
@@ -679,7 +678,7 @@ impl Analyzer {
                     self.plan_fn_bodies_in_expr(v);
                 }
             }
-            Expr::Index { obj, key } => {
+            Expr::Index { obj, key, .. } => {
                 self.plan_fn_bodies_in_expr(obj);
                 self.plan_fn_bodies_in_expr(key);
             }
@@ -688,7 +687,7 @@ impl Analyzer {
                 self.plan_fn_bodies_in_expr(right);
             }
             Expr::UnaryOp { expr, .. } => self.plan_fn_bodies_in_expr(expr),
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 self.plan_fn_bodies_in_expr(callee);
                 for a in args {
                     self.plan_fn_bodies_in_expr(a);

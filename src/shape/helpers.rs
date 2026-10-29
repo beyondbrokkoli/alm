@@ -4,8 +4,10 @@ use std::collections::BTreeMap;
 
 pub fn const_key_value(e: &Expr) -> Option<i64> {
     match e {
-        Expr::Integer(i) => Some(*i),
-        Expr::BinaryOp { op, left, right } => {
+        Expr::Integer { value: i, .. } => Some(*i),
+        Expr::BinaryOp {
+            op, left, right, ..
+        } => {
             let (l, r) = (const_key_value(left)?, const_key_value(right)?);
             match op {
                 BinOp::Add => l.checked_add(r),
@@ -17,6 +19,7 @@ pub fn const_key_value(e: &Expr) -> Option<i64> {
         Expr::UnaryOp {
             op: UnOp::Neg,
             expr,
+            ..
         } => const_key_value(expr).and_then(|v| v.checked_neg()),
         _ => None,
     }
@@ -31,9 +34,10 @@ pub fn extract_guard(condition: &Expr) -> Option<(&str, &Expr)> {
         op: BinOp::LessThan,
         left,
         right,
+        ..
     } = condition
     {
-        if let Expr::Identifier(name) = left.as_ref() {
+        if let Expr::Identifier { name, .. } = left.as_ref() {
             Some((name.as_str(), right))
         } else {
             None

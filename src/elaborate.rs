@@ -20,7 +20,7 @@
 //! pure function here plus its census family plus its pins — parser
 //! entanglement and whole-tree hand-sync do not regrow.
 
-use crate::ast::{BinOp, Expr, Loc, Stmt};
+use crate::ast::{BinOp, Expr, Loc, NodeId, Stmt};
 
 /// `for i = a, b do B end` is half-open (a ..< b) and becomes
 /// Do[ local i = a, local for$limit = b,
@@ -34,7 +34,7 @@ use crate::ast::{BinOp, Expr, Loc, Stmt};
 /// scope: a `local i` in B shadows the counter only inside B, so the
 /// synthetic increment after it still reaches the counter (without
 /// the wrap it would increment the shadow — an infinite loop).
-/// Analysis walks the desugared tree, so *const Stmt keys stay
+/// Analysis walks the desugared tree, and identity rides the node
 /// consistent. All six statements (block Do, counter decl, latch
 /// decl, While, inner Do, increment) carry the header's `at`.
 pub fn desugar_numeric_for(
@@ -49,10 +49,18 @@ pub fn desugar_numeric_for(
         name: var.clone(),
         expr: Expr::BinaryOp {
             op: BinOp::Add,
-            left: Box::new(Expr::Identifier(var.clone())),
-            right: Box::new(Expr::Integer(1)),
+            left: Box::new(Expr::Identifier {
+                name: var.clone(),
+                id: NodeId::mint(),
+            }),
+            right: Box::new(Expr::Integer {
+                value: 1,
+                id: NodeId::mint(),
+            }),
+            id: NodeId::mint(),
         },
         loc: at,
+        id: NodeId::mint(),
     };
     Stmt::Do {
         body: vec![
@@ -60,23 +68,41 @@ pub fn desugar_numeric_for(
                 names: vec![var.clone()],
                 exprs: vec![start],
                 loc: at,
+                id: NodeId::mint(),
             },
             Stmt::LocalDecl {
                 names: vec![limit_slot.clone()],
                 exprs: vec![limit],
                 loc: at,
+                id: NodeId::mint(),
             },
             Stmt::While {
                 condition: Expr::BinaryOp {
                     op: BinOp::LessThan,
-                    left: Box::new(Expr::Identifier(var)),
-                    right: Box::new(Expr::Identifier(limit_slot)),
+                    left: Box::new(Expr::Identifier {
+                        name: var,
+                        id: NodeId::mint(),
+                    }),
+                    right: Box::new(Expr::Identifier {
+                        name: limit_slot,
+                        id: NodeId::mint(),
+                    }),
+                    id: NodeId::mint(),
                 },
-                body: vec![Stmt::Do { body, loc: at }, increment],
+                body: vec![
+                    Stmt::Do {
+                        body,
+                        loc: at,
+                        id: NodeId::mint(),
+                    },
+                    increment,
+                ],
                 loc: at,
+                id: NodeId::mint(),
             },
         ],
         loc: at,
+        id: NodeId::mint(),
     }
 }
 
@@ -122,14 +148,23 @@ pub fn desugar_tuple_assign(at: Loc, cells: Vec<(Expr, Expr)>, values: Vec<Expr>
         .map(|(i, (obj, key))| Stmt::IndexAssign {
             obj,
             key,
-            value: Expr::Identifier(format!("tuple$t{i}")),
+            value: Expr::Identifier {
+                name: format!("tuple$t{i}"),
+                id: NodeId::mint(),
+            },
             loc: at,
+            id: NodeId::mint(),
         });
     let mut body = vec![Stmt::LocalDecl {
         names,
         exprs: values,
         loc: at,
+        id: NodeId::mint(),
     }];
     body.extend(stores);
-    Stmt::Do { body, loc: at }
+    Stmt::Do {
+        body,
+        loc: at,
+        id: NodeId::mint(),
+    }
 }

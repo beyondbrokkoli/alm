@@ -24,9 +24,14 @@
 //! truth), not format; `render` adds no prefix over them. H12's 7c
 //! deletes the variant with the class it names.
 //!
-//! `site` is the birth LINE today, looked up from the loc-derived maps;
-//! H6 re-keys it from a looked-up line to the node's own id, and H12's
-//! instances key straight into it — sites become ids, not lookups.
+//! `site` is the birth LINE, read off the node's own `loc` at the
+//! stamp sites (H6 killed the `stmt_lines`/`stmt_locs` lookup maps —
+//! the line was always H5's stamp on the node; the map was the
+//! duplicate representation). Re-keying site to the node's ID is
+//! deliberately H12-7a's first move, not H6's: a parse refusal has no
+//! node to key (the parser stamps off its token stream), and the
+//! renderer stays pure — the socket widens when `InstanceId` exists
+//! to key into it.
 
 use std::fmt;
 

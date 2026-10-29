@@ -331,7 +331,7 @@ impl Analyzer {
 
     pub(super) fn check_row_housing(&self, g: usize, value: &Expr) -> Result<(), ShapeError> {
         let skip = match value {
-            Expr::Identifier(n) => Some(n.as_str()),
+            Expr::Identifier { name: n, .. } => Some(n.as_str()),
             _ => None,
         };
         for scope in &self.walk.scopes {

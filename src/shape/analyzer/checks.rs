@@ -1,7 +1,7 @@
 use super::*;
 impl Analyzer {
     pub(super) fn check_table_use(&mut self, rec: Gate, obj: &Expr) -> Result<(), ShapeError> {
-        if let Expr::Identifier(name) = obj {
+        if let Expr::Identifier { name, .. } = obj {
             signal!(rec.on(), trace::TRACE_CHK_TBL_IDENT);
             let (_, bind) = self.resolve(rec, name)?;
             if bind.aliases.contains(&NULL_ROOT) && rec.on() {
@@ -23,7 +23,7 @@ impl Analyzer {
     }
 
     pub(super) fn check_len_operand(&mut self, rec: Gate, expr: &Expr) -> Result<(), ShapeError> {
-        if let Expr::Identifier(name) = expr {
+        if let Expr::Identifier { name, .. } = expr {
             let (_, bind) = self.resolve(rec, name)?;
             if matches!(bind.ty, Str) {
                 return Ok(());
@@ -40,7 +40,7 @@ impl Analyzer {
 
     pub(super) fn check_uses(&mut self, rec: Gate, expr: &Expr) -> Result<(), ShapeError> {
         match expr {
-            Expr::Identifier(name) => {
+            Expr::Identifier { name, .. } => {
                 if let Ok((_, bind)) = self.resolve(rec, name)
                     && bind.aliases.contains(&NULL_ROOT)
                 {
@@ -69,13 +69,13 @@ impl Analyzer {
                     self.check_uses(rec, val)?;
                 }
             }
-            Expr::Index { obj, key } => {
+            Expr::Index { obj, key, .. } => {
                 signal!(rec.on(), trace::TRACE_CHK_USE_IDX);
                 self.check_table_use(rec, obj)?;
                 self.check_uses(rec, obj)?;
                 self.check_uses(rec, key)?;
             }
-            Expr::UnaryOp { op, expr } => {
+            Expr::UnaryOp { op, expr, .. } => {
                 if matches!(op, UnOp::Len) {
                     self.check_table_use(rec, expr)?;
                     self.check_len_operand(rec, expr)?;

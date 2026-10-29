@@ -60,11 +60,11 @@ impl Analyzer {
     /// resolution; `scalar_view` resolves.
     fn node_view(&self, expr: &Expr) -> Option<usize> {
         match expr {
-            Expr::Identifier(name) => self.name_node(name),
+            Expr::Identifier { name, .. } => self.name_node(name),
             // a cell read: the base's elem rides the seed, a pending
             // site, or a pending-table function return
             Expr::Index { obj, .. } | Expr::Field { obj, .. } => match obj.as_ref() {
-                Expr::Identifier(_) => self.read_elem_node(obj),
+                Expr::Identifier { .. } => self.read_elem_node(obj),
                 Expr::Call { .. } => self.call_read_node(obj),
                 _ => None,
             },
@@ -107,7 +107,7 @@ impl Analyzer {
     /// The elem unknown of a read off a named base — the exact node the
     /// checker's scope entry for that name carries.
     fn read_elem_node(&self, base: &Expr) -> Option<usize> {
-        let Expr::Identifier(name) = base else {
+        let Expr::Identifier { name, .. } = base else {
             return None;
         };
         let Ok((_, bind)) = self.resolve(None, name) else {
@@ -158,11 +158,11 @@ impl Analyzer {
         }
     }
 
-    fn call_shape(&self, expr: &Expr) -> Option<(*const Expr, &TableShape)> {
+    fn call_shape(&self, expr: &Expr) -> Option<(NodeId, &TableShape)> {
         let Expr::Call { callee, .. } = expr else {
             return None;
         };
-        let Expr::Identifier(name) = callee.as_ref() else {
+        let Expr::Identifier { name, .. } = callee.as_ref() else {
             return None;
         };
         let fn_ptr = self.resolve_fn(name)?;

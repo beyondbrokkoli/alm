@@ -61,7 +61,7 @@ fn collect_creation_reads_stmt(stmt: &Stmt, out: &mut Vec<String>) {
 
 fn collect_creation_reads_expr(expr: &Expr, out: &mut Vec<String>) {
     match expr {
-        Expr::Identifier(n) => out.push(n.clone()),
+        Expr::Identifier { name: n, .. } => out.push(n.clone()),
         Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
@@ -70,7 +70,7 @@ fn collect_creation_reads_expr(expr: &Expr, out: &mut Vec<String>) {
                 collect_creation_reads_expr(v, out);
             }
         }
-        Expr::Index { obj, key } => {
+        Expr::Index { obj, key, .. } => {
             collect_creation_reads_expr(obj, out);
             collect_creation_reads_expr(key, out);
         }
@@ -80,8 +80,8 @@ fn collect_creation_reads_expr(expr: &Expr, out: &mut Vec<String>) {
             collect_creation_reads_expr(right, out);
         }
         Expr::UnaryOp { expr, .. } => collect_creation_reads_expr(expr, out),
-        Expr::Call { callee, args } => {
-            if !matches!(callee.as_ref(), Expr::Identifier(_)) {
+        Expr::Call { callee, args, .. } => {
+            if !matches!(callee.as_ref(), Expr::Identifier { .. }) {
                 collect_creation_reads_expr(callee, out);
             }
             for a in args {
@@ -89,15 +89,15 @@ fn collect_creation_reads_expr(expr: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::Function { .. } => {}
-        Expr::Integer(_)
-        | Expr::Float(_)
-        | Expr::Boolean(_)
-        | Expr::String(_)
-        | Expr::Nil
-        | Expr::SysAllocCount
-        | Expr::SysExecCount
-        | Expr::FfiModule
-        | Expr::CoroModule => {}
+        Expr::Integer { .. }
+        | Expr::Float { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Nil { .. }
+        | Expr::SysAllocCount { .. }
+        | Expr::SysExecCount { .. }
+        | Expr::FfiModule { .. }
+        | Expr::CoroModule { .. } => {}
     }
 }
 
@@ -186,12 +186,16 @@ fn free_of_stmt(stmt: &Stmt, bound: &mut BTreeSet<String>, out: &mut BTreeSet<St
 
 fn free_of_expr(expr: &Expr, bound: &BTreeSet<String>, out: &mut BTreeSet<String>) {
     match expr {
-        Expr::Identifier(n) => {
+        Expr::Identifier { name: n, .. } => {
             if !bound.contains(n) {
                 out.insert(n.clone());
             }
         }
-        Expr::Integer(_) | Expr::Float(_) | Expr::Boolean(_) | Expr::String(_) | Expr::Nil => {}
+        Expr::Integer { .. }
+        | Expr::Float { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Nil { .. } => {}
         Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
@@ -200,7 +204,7 @@ fn free_of_expr(expr: &Expr, bound: &BTreeSet<String>, out: &mut BTreeSet<String
                 free_of_expr(v, bound, out);
             }
         }
-        Expr::Index { obj, key } => {
+        Expr::Index { obj, key, .. } => {
             free_of_expr(obj, bound, out);
             free_of_expr(key, bound, out);
         }
@@ -210,18 +214,18 @@ fn free_of_expr(expr: &Expr, bound: &BTreeSet<String>, out: &mut BTreeSet<String
             free_of_expr(right, bound, out);
         }
         Expr::UnaryOp { expr, .. } => free_of_expr(expr, bound, out),
-        Expr::Call { callee, args } => {
+        Expr::Call { callee, args, .. } => {
             // the callee is a NAME read, not a value read — a free
             // callee resolves through the expansion maps at each site
             // (P1 discipline); only the args are value positions
-            if !matches!(callee.as_ref(), Expr::Identifier(_)) {
+            if !matches!(callee.as_ref(), Expr::Identifier { .. }) {
                 free_of_expr(callee, bound, out);
             }
             for a in args {
                 free_of_expr(a, bound, out);
             }
         }
-        Expr::Function { params, body } => {
+        Expr::Function { params, body, .. } => {
             // the hole: its params bind inside it, its body's frees
             // bubble up to the enclosing level's set
             let mut hole = bound.clone();
@@ -230,12 +234,15 @@ fn free_of_expr(expr: &Expr, bound: &BTreeSet<String>, out: &mut BTreeSet<String
                 free_of_stmt(s, &mut hole, out);
             }
         }
-        Expr::SysAllocCount | Expr::SysExecCount | Expr::FfiModule | Expr::CoroModule => {}
+        Expr::SysAllocCount { .. }
+        | Expr::SysExecCount { .. }
+        | Expr::FfiModule { .. }
+        | Expr::CoroModule { .. } => {}
     }
 }
 
 impl Analyzer {
-    pub(super) fn resolve_fn(&self, name: &str) -> Option<*const Expr> {
+    pub(super) fn resolve_fn(&self, name: &str) -> Option<NodeId> {
         for scope in self.walk.fn_scopes.iter().rev() {
             if let Some(entry) = scope.get(name) {
                 return *entry;
@@ -244,7 +251,7 @@ impl Analyzer {
         None
     }
 
-    pub(super) fn declare_fn_binding(&mut self, name: &str, ptr: Option<*const Expr>) {
+    pub(super) fn declare_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
         self.walk
             .fn_scopes
             .last_mut()
@@ -252,7 +259,7 @@ impl Analyzer {
             .insert(name.to_string(), ptr);
     }
 
-    pub(super) fn assign_fn_binding(&mut self, name: &str, ptr: Option<*const Expr>) {
+    pub(super) fn assign_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
         let depth = self
             .walk
             .fn_scopes
@@ -265,10 +272,10 @@ impl Analyzer {
     pub(super) fn walk_fn_def(
         &mut self,
         rec: Gate,
-        fn_ptr: *const Expr,
+        fn_ptr: NodeId,
         params: &[String],
         body: &[Stmt],
-        key: (*const Stmt, u8),
+        key: (NodeId, u8),
     ) -> Result<(), ShapeError> {
         self.fn_scope_keys.insert(fn_ptr, key);
         // THE HYGIENE LAW, definition half: snapshot the defining-scope
@@ -280,7 +287,7 @@ impl Analyzer {
         // read late, at each call site's own textual position. The
         // checking half resolves an expansion's free names through this
         // snapshot — the caller's lexical state never participates.
-        let mut chain: BTreeMap<String, Option<*const Expr>> = BTreeMap::new();
+        let mut chain: BTreeMap<String, Option<NodeId>> = BTreeMap::new();
         for scope in self.walk.fn_scopes.iter().skip(1) {
             for (n, p) in scope {
                 chain.insert(n.clone(), *p);
@@ -401,11 +408,7 @@ impl Analyzer {
             self.poison_moved(*d, cap);
         }
         if rec.on() {
-            let entry = self
-                .own
-                .move_poisons
-                .entry(stmt as *const Stmt)
-                .or_default();
+            let entry = self.own.move_poisons.entry(stmt.id()).or_default();
             for (_, cap) in &severed {
                 entry.insert(cap.clone());
             }
@@ -414,9 +417,11 @@ impl Analyzer {
 
     pub(super) fn return_reaches_param(&self, expr: &Expr, params: &[String]) -> BTreeSet<usize> {
         match expr {
-            Expr::Identifier(n) => params.iter().position(|p| p == n).into_iter().collect(),
-            Expr::Call { callee, args } => match callee.as_ref() {
-                Expr::Identifier(name) => {
+            Expr::Identifier { name: n, .. } => {
+                params.iter().position(|p| p == n).into_iter().collect()
+            }
+            Expr::Call { callee, args, .. } => match callee.as_ref() {
+                Expr::Identifier { name, .. } => {
                     let Some(fn_ptr) = self.resolve_fn(name) else {
                         return BTreeSet::new();
                     };
@@ -464,15 +469,15 @@ impl Analyzer {
 
     pub(super) fn ret_reach_sites(&self, e: &Expr, out: &mut BTreeSet<usize>) {
         match e {
-            Expr::Identifier(n) => {
+            Expr::Identifier { name: n, .. } => {
                 if let Ok((_, bind)) = self.resolve(None, n) {
                     out.extend(bind.aliases.iter().copied().filter(|s| !is_root(s)));
                     out.extend(bind.lineage.keys().copied().filter(|s| !is_root(s)));
                 }
             }
             Expr::Index { obj, .. } => self.ret_reach_sites(obj, out),
-            Expr::Call { callee, args } => {
-                if let Expr::Identifier(name) = callee.as_ref()
+            Expr::Call { callee, args, .. } => {
+                if let Expr::Identifier { name, .. } = callee.as_ref()
                     && let Some(fn_ptr) = self.resolve_fn(name)
                 {
                     if let Some(reach) = self.fn_ret_reach.get(&fn_ptr) {
@@ -495,12 +500,12 @@ impl Analyzer {
         if let Expr::Index { obj, .. } = e {
             match obj.as_ref() {
                 Expr::TableCtor { .. } => {
-                    if let Some(&site) = self.lattice.sites.get(&(obj.as_ref() as *const Expr)) {
+                    if let Some(&site) = self.lattice.sites.get(&obj.as_ref().id()) {
                         out.push(site);
                     }
                 }
                 Expr::Call { callee, .. } => {
-                    if let Expr::Identifier(name) = callee.as_ref()
+                    if let Expr::Identifier { name, .. } = callee.as_ref()
                         && let Some(fn_ptr) = self.resolve_fn(name)
                         && let Some(shape) = self.fn_ret_shapes.get(&fn_ptr)
                     {

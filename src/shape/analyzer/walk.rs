@@ -41,10 +41,9 @@ impl Analyzer {
         for s in stmts {
             if let Err(err) = self.walk_stmt(rec, s) {
                 signal!(rec.on(), trace::TRACE_GHOST_BAIL);
-                self.ledger.diagnostics.push(
-                    err.0
-                        .with_site(self.stmt_lines.get(&(s as *const Stmt)).copied()),
-                );
+                self.ledger
+                    .diagnostics
+                    .push(err.0.with_site(Some(s.loc().line as usize)));
                 return;
             }
         }
@@ -70,7 +69,7 @@ impl Analyzer {
                 let mut moved_srcs: Vec<(usize, String)> = Vec::new();
                 for (name, expr) in names.iter().zip(exprs.iter()) {
                     let ptr = match expr {
-                        Expr::Function { .. } => Some(expr as *const Expr),
+                        Expr::Function { .. } => Some(expr.id()),
                         _ => None,
                     };
                     self.declare_fn_binding(name, ptr);
@@ -101,7 +100,7 @@ impl Analyzer {
                     Ok(())
                 };
                 for (name, expr) in names.iter().zip(exprs.iter()) {
-                    if let Expr::Identifier(src) = expr {
+                    if let Expr::Identifier { name: src, .. } = expr {
                         note_move(self, src, name, &mut moved_srcs)?;
                     }
                 }
@@ -111,7 +110,7 @@ impl Analyzer {
                     // (bare alias, boundary cell, pending-site read, fn
                     // return) binds that node to the name
                     self.note_decl_scalar_node(&names[idx], expr);
-                    if matches!(expr, Expr::Nil) {
+                    if matches!(expr, Expr::Nil { .. }) {
                         signal!(rec.on(), trace::TRACE_BIND_SCALAR);
                         sets.push(TableShape {
                             ty: Pending,
@@ -119,14 +118,8 @@ impl Analyzer {
                             aliases: BTreeSet::from([NULL_ROOT]),
                             lineage: BTreeMap::new(),
                         });
-                    } else if let Expr::Function { params, body } = expr {
-                        self.walk_fn_def(
-                            rec,
-                            expr as *const Expr,
-                            params,
-                            body,
-                            (stmt as *const Stmt, 2 + idx as u8),
-                        )?;
+                    } else if let Expr::Function { params, body, .. } = expr {
+                        self.walk_fn_def(rec, expr.id(), params, body, (stmt.id(), 2 + idx as u8))?;
                         sets.push(TableShape {
                             ty: Pending,
                             layout: LayoutVerdict::default(),
@@ -199,11 +192,7 @@ impl Analyzer {
                     self.poison_moved(*d, src);
                 }
                 if rec.on() {
-                    let entry = self
-                        .own
-                        .move_poisons
-                        .entry(stmt as *const Stmt)
-                        .or_default();
+                    let entry = self.own.move_poisons.entry(stmt.id()).or_default();
                     for (_, src) in &moved_srcs {
                         entry.insert(src.clone());
                     }
@@ -216,19 +205,13 @@ impl Analyzer {
                 if !entry.contains(&shape) {
                     entry.push(shape);
                 }
-                if let Expr::Function { params, body } = expr {
-                    self.assign_fn_binding(name, Some(expr as *const Expr));
-                    self.walk_fn_def(
-                        rec,
-                        expr as *const Expr,
-                        params,
-                        body,
-                        (stmt as *const Stmt, 2),
-                    )?;
+                if let Expr::Function { params, body, .. } = expr {
+                    self.assign_fn_binding(name, Some(expr.id()));
+                    self.walk_fn_def(rec, expr.id(), params, body, (stmt.id(), 2))?;
                 } else {
                     self.assign_fn_binding(name, None);
                 }
-                if matches!(expr, Expr::Nil) {
+                if matches!(expr, Expr::Nil { .. }) {
                     signal!(rec.on(), trace::TRACE_STMT_ASSIGN_NIL);
                     self.note_assign_scalar_node(name, expr);
                     self.drop_reference(rec, name, stmt)?;
@@ -238,7 +221,7 @@ impl Analyzer {
                 self.note_assign_scalar_node(name, expr);
                 self.check_uses(rec, expr)?;
                 let mut moved_srcs: Vec<(usize, String)> = Vec::new();
-                if let Expr::Identifier(src) = expr {
+                if let Expr::Identifier { name: src, .. } = expr {
                     if src != name {
                         self.record_moved_param(src);
                         self.check_boundary_pin(&bind, src)?;
@@ -265,7 +248,7 @@ impl Analyzer {
                             incoming = join_ty(&incoming, &self.lattice.site_elem[*s]);
                         }
                     }
-                    let line = self.stmt_lines.get(&(stmt as *const Stmt)).copied();
+                    let line = Some(stmt.loc().line as usize);
                     let mut old: BTreeSet<usize> = self
                         .resolve_aliases(rec, name)?
                         .into_iter()
@@ -369,11 +352,7 @@ impl Analyzer {
                         self.poison_moved(*d, src);
                     }
                     if rec.on() {
-                        let entry = self
-                            .own
-                            .move_poisons
-                            .entry(stmt as *const Stmt)
-                            .or_default();
+                        let entry = self.own.move_poisons.entry(stmt.id()).or_default();
                         for (_, src) in &moved_srcs {
                             entry.insert(src.clone());
                         }
@@ -602,7 +581,7 @@ impl Analyzer {
                 };
                 if matches!(vt, Tbl(_)) && !matches!(value, Expr::TableCtor { .. }) {
                     let value_name = match value {
-                        Expr::Identifier(n) => n.clone(),
+                        Expr::Identifier { name: n, .. } => n.clone(),
                         _ => "<row>".to_string(),
                     };
                     for &s in &base_sites {
@@ -618,10 +597,10 @@ impl Analyzer {
                                 .cloned()
                                 .unwrap_or_else(|| "<row>".to_string());
                             cyclic_sites.insert(s);
-                            self.holds.cyclic_stores.entry(base_name).or_insert((
-                                value_name.clone(),
-                                self.stmt_lines[&(stmt as *const Stmt)],
-                            ));
+                            self.holds
+                                .cyclic_stores
+                                .entry(base_name)
+                                .or_insert((value_name.clone(), stmt.loc().line as usize));
                         } else {
                             for &v in &value_sites {
                                 self.holds.hold_edges.entry(s).or_default().insert(v);
@@ -639,16 +618,13 @@ impl Analyzer {
                             self.holds
                                 .cyclic_stores
                                 .entry(base_name.clone())
-                                .or_insert((
-                                    "<constructor>".to_string(),
-                                    self.stmt_lines[&(stmt as *const Stmt)],
-                                ));
+                                .or_insert(("<constructor>".to_string(), stmt.loc().line as usize));
                         }
                     }
                 }
 
                 let mut moved_srcs: Vec<(usize, String)> = Vec::new();
-                if let Expr::Identifier(src) = value {
+                if let Expr::Identifier { name: src, .. } = value {
                     self.record_moved_param(src);
                     let (d, bind) = self.resolve(rec, src)?;
                     self.check_boundary_pin(&bind, src)?;
@@ -662,11 +638,7 @@ impl Analyzer {
                     self.poison_moved(*d, src);
                 }
                 if rec.on() {
-                    let entry = self
-                        .own
-                        .move_poisons
-                        .entry(stmt as *const Stmt)
-                        .or_default();
+                    let entry = self.own.move_poisons.entry(stmt.id()).or_default();
                     for (_, src) in &moved_srcs {
                         entry.insert(src.clone());
                     }
@@ -679,7 +651,7 @@ impl Analyzer {
                         .copied()
                         .filter_map(|x| self.proj_node(x))
                         .collect();
-                    let line = self.stmt_lines.get(&(stmt as *const Stmt)).copied();
+                    let line = Some(stmt.loc().line as usize);
                     if matches!(expected_ty, Conflict) {
                         crate::alm_dbgln!(
                             "[idxassign] line {line:?}: storing Conflict into sites {proj_bases:?} (vt={:?})",
@@ -727,7 +699,7 @@ impl Analyzer {
                         if rec.on() {
                             self.own
                                 .store_ghost_keeps
-                                .entry(stmt as *const Stmt)
+                                .entry(stmt.id())
                                 .or_default()
                                 .push(g);
                             signal!(rec.on(), trace::TRACE_ROW_HOUSED);
@@ -749,12 +721,12 @@ impl Analyzer {
                     && let Some((guard, bound)) = extract_guard(condition)
                 {
                     signal!(rec.on(), trace::TRACE_STMT_WHILE_FILL);
-                    self.detect_fill_loop(rec, stmt as *const Stmt, guard, bound, body);
+                    self.detect_fill_loop(rec, stmt.id(), guard, bound, body);
                 }
 
                 let entry = self.walk.scopes.clone();
                 let mut head = entry.clone();
-                let scope_key = (stmt as *const Stmt, 0);
+                let scope_key = (stmt.id(), 0);
                 // the loop BODY scope index plan_break_exits unwinds down to:
                 // with_scope pushes body scopes onto walk.scopes, so entries
                 // must be taken BEFORE the first with_scope of the fixpoint.
@@ -805,14 +777,14 @@ impl Analyzer {
                 let prov_snapshot = self.walk.prov.clone();
                 self.with_scope(|an| {
                     an.walk_stmts(rec, then_body);
-                    an.decide_scope_exit(rec, (stmt as *const Stmt, 0))
+                    an.decide_scope_exit(rec, (stmt.id(), 0))
                 })?;
                 let then_exit = self.walk.scopes.clone();
                 self.walk.scopes = snapshot;
                 self.walk.prov = prov_snapshot.clone();
                 self.with_scope(|an| {
                     an.walk_stmts(rec, else_body);
-                    an.decide_scope_exit(rec, (stmt as *const Stmt, 1))
+                    an.decide_scope_exit(rec, (stmt.id(), 1))
                 })?;
                 let else_exit = self.walk.scopes.clone();
                 merge_table_scopes(&mut self.walk.scopes, &then_exit, &else_exit);
@@ -833,11 +805,9 @@ impl Analyzer {
                             && joined.aliases.iter().any(|x| !is_root(x) && !is_ghost(x));
                         let cur = self.walk.prov[depth].get(&name).copied().flatten();
                         let new_prov = if mixed && cur.is_none() {
-                            self.join_arm_shapes.insert(
-                                (stmt as *const Stmt, name.clone()),
-                                (tt.clone(), et.clone()),
-                            );
-                            Some(Prov::If(stmt as *const Stmt))
+                            self.join_arm_shapes
+                                .insert((stmt.id(), name.clone()), (tt.clone(), et.clone()));
+                            Some(Prov::If(stmt.id()))
                         } else {
                             None
                         };
@@ -850,7 +820,7 @@ impl Analyzer {
                 signal!(rec.on(), trace::TRACE_STMT_DO);
                 self.with_scope(|an| {
                     an.walk_stmts(rec, body);
-                    an.decide_scope_exit(rec, (stmt as *const Stmt, 0))
+                    an.decide_scope_exit(rec, (stmt.id(), 0))
                 })?
             }
 
@@ -887,7 +857,7 @@ impl Analyzer {
                     )));
                 }
                 if rec.on() {
-                    self.plan_break_exits(stmt as *const Stmt);
+                    self.plan_break_exits(stmt.id());
                 }
             }
 
@@ -913,7 +883,7 @@ impl Analyzer {
                         slot.extend(reach.iter().copied());
                     }
                     if rec.on() {
-                        self.plan_return_exits(Some((v, &ty)), &reach, stmt as *const Stmt);
+                        self.plan_return_exits(Some((v, &ty)), &reach, stmt.id());
                     }
                     if let Some(slot) = self.fn_rets.last_mut() {
                         if let Some(&entry) = self.fn_scope_entries.last() {
@@ -943,7 +913,7 @@ impl Analyzer {
                     }
                 } else if rec.on() {
                     let no_reach = BTreeSet::new();
-                    self.plan_return_exits(None, &no_reach, stmt as *const Stmt);
+                    self.plan_return_exits(None, &no_reach, stmt.id());
                 }
             }
         }
@@ -1006,8 +976,8 @@ impl Analyzer {
             return None;
         }
         match expr {
-            Some(e @ Expr::Call { .. }) => Some(Prov::Call(e as *const Expr)),
-            Some(Expr::Identifier(src)) => self
+            Some(e @ Expr::Call { .. }) => Some(Prov::Call(e.id())),
+            Some(Expr::Identifier { name: src, .. }) => self
                 .resolve(None, src)
                 .ok()
                 .and_then(|(d, _)| self.walk.prov.get(d)?.get(src).copied().flatten()),
@@ -1017,7 +987,7 @@ impl Analyzer {
 
     pub(super) fn expr_named_sites(&self, rec: Gate, expr: &Expr, out: &mut BTreeSet<usize>) {
         match expr {
-            Expr::Identifier(n) => {
+            Expr::Identifier { name: n, .. } => {
                 if let Ok((_, b)) = self.resolve(rec, n) {
                     out.extend(b.aliases.iter().copied().filter(|&s| !is_root(&s)));
                 }

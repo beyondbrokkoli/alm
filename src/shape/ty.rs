@@ -28,12 +28,12 @@ pub enum Ty {
     /// env pointer rides a Ptr register at runtime. Atomic in the
     /// lattice: two ids never join (the Dispatch Law — divergent
     /// expansions cannot meet at one call), one id joins itself.
-    Closure(*const Expr),
+    Closure(NodeId),
     Unknown(usize),
     Conflict,
 }
 
-use crate::ast::Expr;
+use crate::ast::NodeId;
 use Ty::{Any, Bool, Conflict, Flt, Int, Pending, Str, Tbl};
 
 pub fn pinned_scalar(t: &Ty) -> bool {

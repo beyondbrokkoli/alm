@@ -145,7 +145,7 @@ fn post_front(ast: Vec<Stmt>, opts: &PipelineOpts) -> Result<String, (Stage, Vec
         return Err((Stage::Analyze, shape.diagnostics));
     }
 
-    let mut ir_lowerer = lowerer::IrLowerer::new(&shape, ctx.stmt_locs);
+    let mut ir_lowerer = lowerer::IrLowerer::new(&shape);
     let mut ir_program = ir_lowerer.lower_program(&ast);
     if !ir_lowerer.diagnostics.is_empty() {
         return Err((Stage::Lower, ir_lowerer.diagnostics));
@@ -164,24 +164,24 @@ fn post_front(ast: Vec<Stmt>, opts: &PipelineOpts) -> Result<String, (Stage, Vec
 fn references_arg(stmts: &[Stmt]) -> bool {
     fn expr(e: &ast::Expr) -> bool {
         match e {
-            ast::Expr::Identifier(name) => name == "arg",
+            ast::Expr::Identifier { name, .. } => name == "arg",
             ast::Expr::TableCtor { entries, .. } => entries
                 .iter()
                 .any(|(k, v)| matches!(k, ast::CtorKey::Expr(ke) if expr(ke)) || expr(v)),
-            ast::Expr::Index { obj, key } => expr(obj) || expr(key),
+            ast::Expr::Index { obj, key, .. } => expr(obj) || expr(key),
             ast::Expr::BinaryOp { left, right, .. } => expr(left) || expr(right),
             ast::Expr::UnaryOp { expr: inner, .. } => expr(inner),
-            ast::Expr::Call { callee, args } => expr(callee) || args.iter().any(expr),
+            ast::Expr::Call { callee, args, .. } => expr(callee) || args.iter().any(expr),
             ast::Expr::Function { body, .. } => go(body),
-            ast::Expr::Integer(_)
-            | ast::Expr::Float(_)
-            | ast::Expr::Boolean(_)
-            | ast::Expr::String(_)
-            | ast::Expr::Nil
-            | ast::Expr::SysAllocCount
-            | ast::Expr::SysExecCount
-            | ast::Expr::FfiModule
-            | ast::Expr::CoroModule => false,
+            ast::Expr::Integer { .. }
+            | ast::Expr::Float { .. }
+            | ast::Expr::Boolean { .. }
+            | ast::Expr::String { .. }
+            | ast::Expr::Nil { .. }
+            | ast::Expr::SysAllocCount { .. }
+            | ast::Expr::SysExecCount { .. }
+            | ast::Expr::FfiModule { .. }
+            | ast::Expr::CoroModule { .. } => false,
             ast::Expr::Field { obj, .. } => expr(obj),
         }
     }
@@ -213,25 +213,25 @@ fn references_arg(stmts: &[Stmt]) -> bool {
 fn uses_ffi(stmts: &[Stmt]) -> bool {
     fn expr(e: &ast::Expr) -> bool {
         match e {
-            ast::Expr::FfiModule => true,
+            ast::Expr::FfiModule { .. } => true,
             ast::Expr::Field { obj, .. } => expr(obj),
             ast::Expr::TableCtor { entries, .. } => entries
                 .iter()
                 .any(|(k, v)| matches!(k, ast::CtorKey::Expr(ke) if expr(ke)) || expr(v)),
-            ast::Expr::Index { obj, key } => expr(obj) || expr(key),
+            ast::Expr::Index { obj, key, .. } => expr(obj) || expr(key),
             ast::Expr::BinaryOp { left, right, .. } => expr(left) || expr(right),
             ast::Expr::UnaryOp { expr: inner, .. } => expr(inner),
-            ast::Expr::Call { callee, args } => expr(callee) || args.iter().any(expr),
+            ast::Expr::Call { callee, args, .. } => expr(callee) || args.iter().any(expr),
             ast::Expr::Function { body, .. } => go(body),
-            ast::Expr::Integer(_)
-            | ast::Expr::Float(_)
-            | ast::Expr::Boolean(_)
-            | ast::Expr::String(_)
-            | ast::Expr::Nil
-            | ast::Expr::SysAllocCount
-            | ast::Expr::SysExecCount
-            | ast::Expr::CoroModule
-            | ast::Expr::Identifier(_) => false,
+            ast::Expr::Integer { .. }
+            | ast::Expr::Float { .. }
+            | ast::Expr::Boolean { .. }
+            | ast::Expr::String { .. }
+            | ast::Expr::Nil { .. }
+            | ast::Expr::SysAllocCount { .. }
+            | ast::Expr::SysExecCount { .. }
+            | ast::Expr::CoroModule { .. }
+            | ast::Expr::Identifier { .. } => false,
         }
     }
     fn go(stmts: &[Stmt]) -> bool {

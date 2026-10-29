@@ -33,7 +33,7 @@ use super::super::{is_ghost, is_root, join_ty};
 use super::WalkState;
 use super::constraints::UnknownStore;
 use super::{calls_through_fn_var_msg, dotted_callee, value_call_msg};
-use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
+use crate::ast::{BinOp, CtorKey, Expr, NodeId, Stmt, UnOp};
 use crate::diag::Diagnostic;
 use crate::shape::ty::Ty;
 use alm_rt::{signal, trace};
@@ -64,7 +64,7 @@ enum ReturnCtx {
 /// and inlined call bodies (parameters and locals under check).
 struct Frame {
     types: BTreeMap<String, Ty>,
-    fns: BTreeMap<String, Option<*const Expr>>,
+    fns: BTreeMap<String, Option<NodeId>>,
 }
 
 /// The walk's top-level state at one moment, cloned by the driver: `pre`
@@ -80,7 +80,7 @@ struct Frame {
 pub(super) struct WalkSnap {
     binds: BTreeMap<String, TableShape>,
     scalars: BTreeMap<String, usize>,
-    fns: BTreeMap<String, Option<*const Expr>>,
+    fns: BTreeMap<String, Option<NodeId>>,
     severed: BTreeMap<String, BTreeSet<usize>>,
 }
 
@@ -88,37 +88,36 @@ pub(super) struct WalkSnap {
 /// single elem table the assembled facts carry (cloned in, so the driver
 /// can interleave `&mut Analyzer` walks between checker statements).
 pub(super) struct CheckCtx {
-    pub stmt_lines: BTreeMap<*const Stmt, usize>,
     pub adopt_lines: BTreeMap<String, usize>,
-    pub sites: BTreeMap<*const Expr, usize>,
+    pub sites: BTreeMap<NodeId, usize>,
     pub elems: Vec<Ty>,
     /// the Hygiene Law's definition-side record: per fn literal, the
     /// defining-scope chain snapshot the walk took at its definition
     /// (names below top level, None = a non-fn shadow). The call arm
     /// resolves an expansion's free names through it — never through
     /// the caller's frames.
-    pub fn_def_sites: BTreeMap<*const Expr, BTreeMap<String, Option<*const Expr>>>,
+    pub fn_def_sites: BTreeMap<NodeId, BTreeMap<String, Option<NodeId>>>,
     /// W3a's walk-side capture sets (the invariance argument at
     /// `fn_captures` in facts.rs) — the checker reads them at creation
     /// sites (the env face) and at call arms (the capture guard).
-    pub fn_captures: BTreeMap<*const Expr, BTreeSet<String>>,
+    pub fn_captures: BTreeMap<NodeId, BTreeSet<String>>,
 }
 
 /// Everything the checker records for the lowerer, handed to `analyze` at
 /// assembly time. The substitutions are NOT here — they live in the
 /// lattice's `UnknownStore` and ride out of it at assembly.
 pub(super) struct CheckFacts {
-    pub local_types: BTreeMap<(*const Stmt, Option<*const Expr>, String), Ty>,
-    pub fn_defs: BTreeMap<*const Expr, FnDef>,
-    pub call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
-    pub call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
-    pub env_faces: BTreeMap<*const Expr, BTreeMap<String, Ty>>,
-    pub creation_envs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
-    pub closure_calls: BTreeSet<(*const Expr, *const Expr)>,
-    pub closure_fields: BTreeMap<(usize, String), *const Expr>,
-    pub ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
-    pub index_key_lanes: BTreeMap<(*const Expr, *const Expr), KeyLane>,
-    pub access_elems: BTreeMap<(*const Expr, *const Expr), Ty>,
+    pub local_types: BTreeMap<(NodeId, Option<NodeId>, String), Ty>,
+    pub fn_defs: BTreeMap<NodeId, FnDef>,
+    pub call_defs: BTreeMap<(NodeId, NodeId), NodeId>,
+    pub call_rets: BTreeMap<(NodeId, NodeId), Ty>,
+    pub env_faces: BTreeMap<NodeId, BTreeMap<String, Ty>>,
+    pub creation_envs: BTreeMap<(NodeId, NodeId), NodeId>,
+    pub closure_calls: BTreeSet<(NodeId, NodeId)>,
+    pub closure_fields: BTreeMap<(usize, String), NodeId>,
+    pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,
+    pub index_key_lanes: BTreeMap<(NodeId, NodeId), KeyLane>,
+    pub access_elems: BTreeMap<(NodeId, NodeId), Ty>,
     pub boundary_elem: Option<Ty>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -141,13 +140,13 @@ pub(super) struct Checker {
     decl_snap: WalkSnap,
     ctx: CheckCtx,
     return_ctxs: Vec<ReturnCtx>,
-    inline_stack: Vec<*const Expr>,
+    inline_stack: Vec<NodeId>,
     /// the OUTERMOST call expr of every inline expansion currently being
     /// checked (bottom = outermost site). The pair `(call expr,
     /// first-of-this-stack or the call itself)` is the per-instantiation
     /// fact key both halves share — see the KEYING DISCIPLINE note at
     /// `call_defs` in facts.rs.
-    expansion_sites: Vec<*const Expr>,
+    expansion_sites: Vec<NodeId>,
     /// the checker frame depth each expansion began at: frames BELOW the
     /// innermost boundary belong to the caller — the Hygiene Law keeps
     /// them out of fn resolution.
@@ -157,26 +156,27 @@ pub(super) struct Checker {
     expansion_params: Vec<Vec<String>>,
     seed_read: bool,
     len_deferrals: Vec<(Ty, Option<usize>)>,
-    cur_stmt: Option<*const Stmt>,
+    cur_stmt: Option<NodeId>,
+    cur_stmt_line: Option<usize>,
     loop_depth: usize,
-    fn_defs: BTreeMap<*const Expr, FnDef>,
-    call_defs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
-    call_rets: BTreeMap<(*const Expr, *const Expr), Ty>,
+    fn_defs: BTreeMap<NodeId, FnDef>,
+    call_defs: BTreeMap<(NodeId, NodeId), NodeId>,
+    call_rets: BTreeMap<(NodeId, NodeId), Ty>,
     /// W3a: the per-fn env faces (creation sites record, later sites
     /// unify — monomorphism of the enclosing signature pins the kinds;
     /// the keying discipline at `env_faces` in facts.rs).
-    env_faces: BTreeMap<*const Expr, BTreeMap<String, Ty>>,
+    env_faces: BTreeMap<NodeId, BTreeMap<String, Ty>>,
     /// W3a: the creation sites themselves — `(fn-name identifier,
     /// expansion site) → fn literal` (the lowerer mints here).
-    creation_envs: BTreeMap<(*const Expr, *const Expr), *const Expr>,
+    creation_envs: BTreeMap<(NodeId, NodeId), NodeId>,
     /// W3a: which resolved calls dispatch through a closure value (the
     /// lowerer's env-cell read rides this — a D4 dot-ns call lowers
     /// with no read).
-    closure_calls: BTreeSet<(*const Expr, *const Expr)>,
+    closure_calls: BTreeSet<(NodeId, NodeId)>,
     /// W3a: R3's record-face rule — `(ctor site, field name) → fn
     /// literal` (a record's closure cells dispatch by field, the elem
     /// stays the non-closure join).
-    closure_fields: BTreeMap<(usize, String), *const Expr>,
+    closure_fields: BTreeMap<(usize, String), NodeId>,
     /// W3a: per ACTIVE expansion, Some(env face) at call-throughs (the
     /// closure's captures resolve through it), None at direct
     /// expansions (the defining scope's frames ARE live — P2's
@@ -194,10 +194,10 @@ pub(super) struct Checker {
     /// documented in the archived W3a closure record (V1 rows) and
     /// pinned by escape_cond_mint_rejected.
     cond_depth: usize,
-    ffi_verbs: BTreeMap<*const Expr, FfiVerb>,
-    index_key_lanes: BTreeMap<(*const Expr, *const Expr), KeyLane>,
-    access_elems: BTreeMap<(*const Expr, *const Expr), Ty>,
-    local_types: BTreeMap<(*const Stmt, Option<*const Expr>, String), Ty>,
+    ffi_verbs: BTreeMap<NodeId, FfiVerb>,
+    index_key_lanes: BTreeMap<(NodeId, NodeId), KeyLane>,
+    access_elems: BTreeMap<(NodeId, NodeId), Ty>,
+    local_types: BTreeMap<(NodeId, Option<NodeId>, String), Ty>,
     /// the bare declarations the CHECKER declared, keyed
     /// `(stmt, expansion site, name)` — the B3 (fold d) ruling: the
     /// identity node is PER-EXPANSION (a fresh mint at each site's
@@ -206,7 +206,7 @@ pub(super) struct Checker {
     /// the lattice's definition-view `bare_nodes` map is retired —
     /// its ids had no readers left). Finish resolves each node
     /// through the final store into `local_types` under the same key.
-    bare_sites: BTreeMap<(*const Stmt, Option<*const Expr>, String), usize>,
+    bare_sites: BTreeMap<(NodeId, Option<NodeId>, String), usize>,
     boundary_elem: Option<Ty>,
     diagnostics: Vec<Diagnostic>,
     /// R15 (owner ruling 2026-10-26): true only while checking the
@@ -244,6 +244,7 @@ impl Checker {
             seed_read: false,
             len_deferrals: Vec::new(),
             cur_stmt: None,
+            cur_stmt_line: None,
             loop_depth: 0,
             fn_defs: BTreeMap::new(),
             call_defs: BTreeMap::new(),
@@ -289,11 +290,11 @@ impl Checker {
     /// one elem table (`static_elems`), resolved through the constraint
     /// pins the lattice's unknown store carries.
     fn elem_of(&self, lat: &mut UnknownStore, ctor: &Expr) -> Ty {
-        let id = self.ctx.sites[&(ctor as *const Expr)];
+        let id = self.ctx.sites[&ctor.id()];
         lat.resolve(&self.ctx.elems[id].clone())
     }
 
-    fn declare_fn_binding(&mut self, name: &str, ptr: Option<*const Expr>) {
+    fn declare_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
         // top level: the walk maintains the identical binding — the view
         // reads it; only checker frames (blocks, inlined bodies) carry
         // their own
@@ -302,7 +303,7 @@ impl Checker {
         }
     }
 
-    fn assign_fn_binding(&mut self, name: &str, ptr: Option<*const Expr>) {
+    fn assign_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
         let Some(depth) = self.frames.iter().rposition(|f| f.fns.contains_key(name)) else {
             return; // top level: the walk's own fn binding is the truth
         };
@@ -318,7 +319,7 @@ impl Checker {
     /// expansion boundary are the caller's and never participate.
     /// Returns the innermost HIT (Some(ptr) = an expansion binding,
     /// Some(None) = a shadowing non-fn binding, None = no binding).
-    fn resolve_fn_binding(&self, name: &str) -> Option<Option<*const Expr>> {
+    fn resolve_fn_binding(&self, name: &str) -> Option<Option<NodeId>> {
         let base = self.expansion_frame_bases.last().copied().unwrap_or(0);
         self.frames[base..]
             .iter()
@@ -339,19 +340,19 @@ impl Checker {
     }
 
     fn bind_function(&mut self, lat: &mut UnknownStore, name: &str, expr: &Expr) -> Ty {
-        let Expr::Function { params, body } = expr else {
+        let Expr::Function { params, body, .. } = expr else {
             unreachable!("bind_function on a non-function");
         };
         // both nodes are lattice anchors now: the return node by the walk
         // (`walk_fn_def`), the binding's own value by the definition —
         // the name→type view derives a fn binding's type from it without
         // the checker holding an entry
-        let ret = Ty::Unknown(lat.ensure_fn_ret(expr as *const Expr));
+        let ret = Ty::Unknown(lat.ensure_fn_ret(expr.id()));
         self.fn_defs.insert(
-            expr as *const Expr,
+            expr.id(),
             FnDef {
                 params: params.clone(),
-                body: body.as_slice(),
+                body: body.to_vec(),
                 ret: ret.clone(),
                 signature: None,
             },
@@ -363,8 +364,8 @@ impl Checker {
         // the nested literals now — a read of the rebound name must
         // compile whether or not the container is ever called.
         self.collect_nested_fn_defs(lat, body);
-        self.declare_fn_binding(name, Some(expr as *const Expr));
-        Ty::Unknown(lat.ensure_fn_value(expr as *const Expr))
+        self.declare_fn_binding(name, Some(expr.id()));
+        Ty::Unknown(lat.ensure_fn_value(expr.id()))
     }
 
     /// Registers every fn literal bound inside `body` — lexically, at
@@ -375,13 +376,13 @@ impl Checker {
         for stmt in body {
             match stmt {
                 Stmt::Assignment { expr, .. } => {
-                    if let Expr::Function { params, body } = expr {
+                    if let Expr::Function { params, body, .. } = expr {
                         self.register_collected_fn(lat, expr, params, body);
                     }
                 }
                 Stmt::LocalDecl { exprs, .. } => {
                     for expr in exprs {
-                        if let Expr::Function { params, body } = expr {
+                        if let Expr::Function { params, body, .. } = expr {
                             self.register_collected_fn(lat, expr, params, body);
                         }
                     }
@@ -409,7 +410,7 @@ impl Checker {
         params: &[String],
         body: &[Stmt],
     ) {
-        let ptr = expr as *const Expr;
+        let ptr = expr.id();
         if self.fn_defs.contains_key(&ptr) {
             return;
         }
@@ -418,7 +419,7 @@ impl Checker {
             ptr,
             FnDef {
                 params: params.to_vec(),
-                body: body as *const [Stmt],
+                body: body.to_vec(),
                 ret,
                 signature: None,
             },
@@ -566,7 +567,7 @@ impl Checker {
             let resolved = lat.resolve(&Ty::Unknown(id));
             self.local_types.insert((stmt, site, name), resolved);
         }
-        let resolved: Vec<((*const Expr, *const Expr), Ty)> = self
+        let resolved: Vec<((NodeId, NodeId), Ty)> = self
             .access_elems
             .iter()
             .map(|(&k, v)| (k, lat.resolve(v)))
@@ -839,7 +840,8 @@ impl Checker {
         lat: &mut UnknownStore,
         stmt: &Stmt,
     ) -> Result<(), Diagnostic> {
-        self.cur_stmt = Some(stmt as *const Stmt);
+        self.cur_stmt = Some(stmt.id());
+        self.cur_stmt_line = Some(stmt.loc().line as usize);
         // the presence window for top-level declarations (frames cover
         // every nested call)
         if self.frames.is_empty() {
@@ -883,8 +885,7 @@ impl Checker {
                         Ty::Unknown(id) => id,
                         _ => unreachable!("fresh mints an Unknown node"),
                     };
-                    self.bare_sites
-                        .insert((stmt as *const Stmt, site, name.clone()), id);
+                    self.bare_sites.insert((stmt.id(), site, name.clone()), id);
                     self.declare_var(lat, name.clone(), Ty::Unknown(id))?;
                 }
             }
@@ -940,7 +941,7 @@ impl Checker {
                         )));
                     }
                 }
-                if matches!(expr, Expr::Nil) {
+                if matches!(expr, Expr::Nil { .. }) {
                     if !matches!(expected, Ty::Tbl(_) | Ty::Unknown(_)) {
                         return Err(Diagnostic::ty(format!(
                             "'nil' releases tables — '{}' is of type {}",
@@ -1106,7 +1107,7 @@ impl Checker {
             }
             Stmt::Return { value, .. } => match self.return_ctxs.last().cloned() {
                 Some(ReturnCtx::Boundary) => match value {
-                    None | Some(Expr::Nil) => {}
+                    None | Some(Expr::Nil { .. }) => {}
                     Some(expr) => match self.check_expr(lat, expr)? {
                         Ty::Tbl(_) => {
                             // W3a, W3-R5 (the Data Transfer Contract): the
@@ -1131,7 +1132,7 @@ impl Checker {
                 },
                 Some(ReturnCtx::Internal(expected)) => {
                     let expr = match value {
-                        Some(expr) if !matches!(expr, Expr::Nil) => expr,
+                        Some(expr) if !matches!(expr, Expr::Nil { .. }) => expr,
                         _ => {
                             return Err(Diagnostic::ty(
                                 "an internal 'return' carries a value — \
@@ -1161,7 +1162,7 @@ impl Checker {
     /// its pair keys; the lowerer mirrors this from its own stack.
     /// Pinned at depth two by fn_nested_site_keys (an expansion inside
     /// an expansion: key lane, elem face, closure-call env).
-    fn fact_site(&self, expr: *const Expr) -> *const Expr {
+    fn fact_site(&self, expr: NodeId) -> NodeId {
         self.expansion_sites.first().copied().unwrap_or(expr)
     }
 
@@ -1179,9 +1180,8 @@ impl Checker {
                 // type-walk re-derivation was the elem seam (two views of
                 // one cell kind disagreeing on adoption-bridged names)
                 signal!(trace::TRACE_CHK_ELEM_FACE);
-                let site = self.fact_site(obj as *const Expr);
-                self.access_elems
-                    .insert((obj as *const Expr, site), (*elem).clone());
+                let site = self.fact_site(obj.id());
+                self.access_elems.insert((obj.id(), site), (*elem).clone());
                 Ok((*elem, desc))
             }
             _ => Err(Diagnostic::ty(format!(
@@ -1226,9 +1226,8 @@ impl Checker {
         } else {
             KeyLane::Int
         };
-        let site = self.fact_site(key as *const Expr);
-        self.index_key_lanes
-            .insert((key as *const Expr, site), lane);
+        let site = self.fact_site(key.id());
+        self.index_key_lanes.insert((key.id(), site), lane);
         Ok(key_ty)
     }
 
@@ -1238,7 +1237,7 @@ impl Checker {
     /// surface this replaces).
     fn record_verb(&mut self, call: &Expr, verb: FfiVerb) {
         signal!(trace::TRACE_CHK_FFI_VERB);
-        self.ffi_verbs.insert(call as *const Expr, verb);
+        self.ffi_verbs.insert(call.id(), verb);
     }
 
     fn check_ffi_call(
@@ -1250,7 +1249,7 @@ impl Checker {
         args: &[Expr],
     ) -> Result<Ty, Diagnostic> {
         let base = match obj {
-            Expr::Identifier(n) => n.clone(),
+            Expr::Identifier { name: n, .. } => n.clone(),
             _ => {
                 return Err(Diagnostic::ty(
                     "the ffi surface's '.' base must be a name — a bound \
@@ -1464,13 +1463,13 @@ impl Checker {
     }
 
     fn check_ffi_verb(&mut self, lat: &mut UnknownStore, expr: &Expr) -> Result<bool, Diagnostic> {
-        let Expr::Call { callee, args } = expr else {
+        let Expr::Call { callee, args, .. } = expr else {
             return Ok(false);
         };
-        let Expr::Field { obj, name } = callee.as_ref() else {
+        let Expr::Field { obj, name, .. } = callee.as_ref() else {
             return Ok(false);
         };
-        let Expr::Identifier(base) = obj.as_ref() else {
+        let Expr::Identifier { name: base, .. } = obj.as_ref() else {
             return Ok(false);
         };
         let raw = self.check_expr(lat, obj)?;
@@ -1567,7 +1566,7 @@ impl Checker {
         lat: &mut UnknownStore,
         expr: &Expr,
         name: &str,
-        ptr: *const Expr,
+        ptr: NodeId,
     ) -> Result<Ty, Diagnostic> {
         if self.inline_stack.contains(&ptr) {
             return Err(Diagnostic::ty(format!(
@@ -1607,8 +1606,8 @@ impl Checker {
                 }
             }
         }
-        let site = self.fact_site(expr as *const Expr);
-        self.creation_envs.insert((expr as *const Expr, site), ptr);
+        let site = self.fact_site(expr.id());
+        self.creation_envs.insert((expr.id(), site), ptr);
         Ok(Ty::Closure(ptr))
     }
 
@@ -1635,8 +1634,8 @@ impl Checker {
     /// block-local receiver answers no singleton and the dotted call
     /// falls to the module-surface reject — pinned by
     /// escape_block_local_dispatch_rejected.
-    fn closure_field_fn(&self, obj: &Expr, field: &str) -> Option<*const Expr> {
-        let Expr::Identifier(n) = obj else {
+    fn closure_field_fn(&self, obj: &Expr, field: &str) -> Option<NodeId> {
+        let Expr::Identifier { name: n, .. } = obj else {
             return None;
         };
         let bind = self.snap.binds.get(n)?;
@@ -1660,7 +1659,7 @@ impl Checker {
     /// behind the driver's exe-only gate, out of the .so corpus's
     /// reach).
     fn carries_closure(&self, expr: &Expr) -> bool {
-        if let Expr::Identifier(n) = expr
+        if let Expr::Identifier { name: n, .. } = expr
             && let Some(bind) = self.snap.binds.get(n)
         {
             return bind.aliases.iter().any(|s| {
@@ -1672,11 +1671,11 @@ impl Checker {
 
     fn check_expr(&mut self, lat: &mut UnknownStore, expr: &Expr) -> Result<Ty, Diagnostic> {
         match expr {
-            Expr::Integer(_) => Ok(Ty::Int),
-            Expr::Float(_) => Ok(Ty::Flt),
-            Expr::Boolean(_) => Ok(Ty::Bool),
-            Expr::String(_) => Ok(Ty::Str),
-            Expr::Nil => {
+            Expr::Integer { .. } => Ok(Ty::Int),
+            Expr::Float { .. } => Ok(Ty::Flt),
+            Expr::Boolean { .. } => Ok(Ty::Bool),
+            Expr::String { .. } => Ok(Ty::Str),
+            Expr::Nil { .. } => {
                 signal!(trace::TRACE_CHK_NIL_EXPR);
                 Err(Diagnostic::ty(
                     "'nil' is only valid as the right-hand side of 't = nil' — \
@@ -1719,7 +1718,7 @@ impl Checker {
                     if let Ty::Closure(ptr) = ty {
                         match key {
                             CtorKey::Str(field) => {
-                                let Some(&site) = self.ctx.sites.get(&(expr as *const Expr)) else {
+                                let Some(&site) = self.ctx.sites.get(&expr.id()) else {
                                     return Err(Diagnostic::desync(
                                         "Type Error: a closure field's constructor carries no \
                                          site — the checker and the analyzer disagree",
@@ -1789,7 +1788,7 @@ impl Checker {
                 let has_closure_field = self
                     .ctx
                     .sites
-                    .get(&(expr as *const Expr))
+                    .get(&expr.id())
                     .is_some_and(|s| self.closure_fields.keys().any(|(cs, _)| cs == s));
                 if has_closure_field {
                     match lat.resolve(&elem) {
@@ -1805,12 +1804,12 @@ impl Checker {
                 }
                 Ok(Ty::Tbl(Box::new(elem)))
             }
-            Expr::Index { obj, key } => {
+            Expr::Index { obj, key, .. } => {
                 let (elem, _) = self.check_index_base(lat, obj)?;
                 let _key_ty = self.check_index_key(lat, key)?;
                 Ok(elem)
             }
-            Expr::Identifier(name) => {
+            Expr::Identifier { name, .. } => {
                 // THE ESCAPE LAW (W3a, amending law #1): a fn name read
                 // as a VALUE is a CREATION — the value is an owned env
                 // store naming the expansion. The blanket reject
@@ -1827,7 +1826,9 @@ impl Checker {
                 }
                 self.var_type(lat, name)
             }
-            Expr::BinaryOp { op, left, right } => {
+            Expr::BinaryOp {
+                op, left, right, ..
+            } => {
                 let l = self.check_expr(lat, left)?;
                 let r = self.check_expr(lat, right)?;
                 match op {
@@ -1912,7 +1913,7 @@ impl Checker {
                     }
                 }
             }
-            Expr::UnaryOp { op, expr } => {
+            Expr::UnaryOp { op, expr, .. } => {
                 let t = self.check_expr(lat, expr)?;
                 match op {
                     UnOp::Neg => {
@@ -1942,9 +1943,7 @@ impl Checker {
                             Ok(Ty::Int)
                         }
                         unknown @ Ty::Unknown(_) => {
-                            let line = self
-                                .cur_stmt
-                                .and_then(|s| self.ctx.stmt_lines.get(&s).copied());
+                            let line = self.cur_stmt_line;
                             self.len_deferrals.push((unknown, line));
                             Ok(Ty::Int)
                         }
@@ -1955,10 +1954,10 @@ impl Checker {
                     },
                 }
             }
-            Expr::SysAllocCount | Expr::SysExecCount => Ok(Ty::Int),
-            Expr::FfiModule => Ok(Ty::Ffi),
-            Expr::CoroModule => Ok(Ty::Coro),
-            Expr::Field { obj, name } => {
+            Expr::SysAllocCount { .. } | Expr::SysExecCount { .. } => Ok(Ty::Int),
+            Expr::FfiModule { .. } => Ok(Ty::Ffi),
+            Expr::CoroModule { .. } => Ok(Ty::Coro),
+            Expr::Field { obj, name, .. } => {
                 // non-callee dot access is a record read; the ffi verbs
                 // dispatch in the Call arm before check_expr sees them
                 let ty = self.check_expr(lat, obj)?;
@@ -1970,9 +1969,8 @@ impl Checker {
                         // singleton answers the singleton here (the
                         // elem stays the non-closure join)
                         if let Some(ptr) = self.closure_field_fn(obj, name) {
-                            let site = self.fact_site(obj.as_ref() as *const Expr);
-                            self.access_elems
-                                .insert((obj.as_ref() as *const Expr, site), Ty::Closure(ptr));
+                            let site = self.fact_site(obj.id());
+                            self.access_elems.insert((obj.id(), site), Ty::Closure(ptr));
                             return Ok(Ty::Closure(ptr));
                         }
                         // the dispatch: a Table receiver desugars the dot
@@ -1981,9 +1979,8 @@ impl Checker {
                         // a record read answers the table's elem — the
                         // same elem face fact the bracket accesses record
                         signal!(trace::TRACE_CHK_ELEM_FACE);
-                        let site = self.fact_site(obj.as_ref() as *const Expr);
-                        self.access_elems
-                            .insert((obj.as_ref() as *const Expr, site), (*elem).clone());
+                        let site = self.fact_site(obj.id());
+                        self.access_elems.insert((obj.id(), site), (*elem).clone());
                         Ok(*elem)
                     }
                     other => Err(Diagnostic::ty(format!(
@@ -1996,10 +1993,10 @@ impl Checker {
                 "a function value binds directly to a variable — \
                  'local f = function(a, b) ... end'",
             )),
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 let name = match callee.as_ref() {
-                    Expr::Identifier(n) => n.clone(),
-                    Expr::Field { obj, name } => {
+                    Expr::Identifier { name: n, .. } => n.clone(),
+                    Expr::Field { obj, name, .. } => {
                         // D4 call precedence: a dotted callee chain
                         // ("A.b", "A.B.c") that resolves through the fn
                         // maps is an expansion call — the expansion map
@@ -2016,15 +2013,11 @@ impl Checker {
                             // cell read lands on the Ptr lane, and the
                             // dispatch kind so a D4 dot-ns call never
                             // reads a cell.
-                            let site = self.fact_site(obj.as_ref() as *const Expr);
-                            self.access_elems
-                                .insert((obj.as_ref() as *const Expr, site), Ty::Closure(ptr));
-                            let call_site = self
-                                .expansion_sites
-                                .first()
-                                .copied()
-                                .unwrap_or(expr as *const Expr);
-                            self.closure_calls.insert((expr as *const Expr, call_site));
+                            let site = self.fact_site(obj.id());
+                            self.access_elems.insert((obj.id(), site), Ty::Closure(ptr));
+                            let call_site =
+                                self.expansion_sites.first().copied().unwrap_or(expr.id());
+                            self.closure_calls.insert((expr.id(), call_site));
                             return self.expand_call(lat, expr, obj, name, ptr, true, args);
                         } else {
                             return self.check_ffi_call(lat, expr, obj, name, args);
@@ -2084,7 +2077,7 @@ impl Checker {
         expr: &Expr,
         callee: &Expr,
         name: &str,
-        fn_ptr: *const Expr,
+        fn_ptr: NodeId,
         call_through: bool,
         args: &[Expr],
     ) -> Result<Ty, Diagnostic> {
@@ -2166,7 +2159,7 @@ impl Checker {
             }
         }
 
-        let body = unsafe { def.body() };
+        let body = def.body();
 
         // R15 (owner ruling 2026-10-26): an expansion with NO
         // valued return produces no value — consuming its result
@@ -2185,7 +2178,7 @@ impl Checker {
         // this call is checked inside (the call itself at no
         // expansion). One call expr may be checked once per site;
         // the pair key keeps every site's resolution its own.
-        let call_ptr = expr as *const Expr;
+        let call_ptr = expr.id();
         let site = self.expansion_sites.first().copied().unwrap_or(call_ptr);
 
         // W3a: the call-through's env face — recorded at the creation
@@ -2258,7 +2251,7 @@ impl Checker {
                     signal!(trace::TRACE_ENG_DESYNC);
                 }
                 self.diagnostics
-                    .push(msg.with_site(self.ctx.stmt_lines.get(&(stmt as *const Stmt)).copied()));
+                    .push(msg.with_site(Some(stmt.loc().line as usize)));
                 return;
             }
         }
@@ -2373,9 +2366,9 @@ impl Checker {
             return None;
         }
         let name = match expr {
-            Expr::Identifier(n) => n,
+            Expr::Identifier { name: n, .. } => n,
             Expr::Index { obj, .. } => match obj.as_ref() {
-                Expr::Identifier(n) => n,
+                Expr::Identifier { name: n, .. } => n,
                 _ => return None,
             },
             _ => return None,
