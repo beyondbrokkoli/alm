@@ -2035,6 +2035,25 @@ impl<'a> IrLowerer<'a> {
                 // is lowered inside (the call itself at no expansion)
                 let call_ptr = expr.id();
                 let site = self.expansion_sites.first().copied().unwrap_or(call_ptr);
+                // H12/7a, ruling R1 (two-writer shadow): the instance
+                // record's break_base is the checker's ABSOLUTE loop
+                // depth at ITS expansion entry — the arithmetic twin of
+                // the base this arm is about to push. The two worlds
+                // must agree every compile; debug-only and graceful so a
+                // checker/lowerer site desync still reaches the fact-site
+                // guard below, and release bytes are untouched.
+                if let Some(&owner) = self.shape.instance_of.get(&(call_ptr, site))
+                    && let Some(owner_rec) = self.shape.instances.get(&owner)
+                    && let Some(kids) = owner_rec.children.get(&call_ptr)
+                    && let Some(&kid) = kids.iter().next()
+                    && let Some(rec) = self.shape.instances.get(&kid)
+                {
+                    debug_assert_eq!(
+                        rec.break_base,
+                        self.break_ctxs.len(),
+                        "the shadow (7a): the lowerer's break base disagrees with the instance record"
+                    );
+                }
                 // D4 precedence, lower half: a Field callee is a module
                 // surface call UNLESS the checker resolved it as an
                 // expansion (call_defs carries the decision — the lowerer

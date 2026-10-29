@@ -656,7 +656,233 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
     facts.fn_touched = ctx.fn_touched.clone();
     // the row-read discipline is the analysis's final acceptance gate
     facts.check_row_reads();
+    // H12/7a — THE SHADOW: the instance view must equal the pair view
+    // on EVERY compile (assembly-side, over the self-contained facts —
+    // H6's dividend; never in the lowerer, whose replacement this is).
+    // Third of the census breed (desugar attribution, identity, this).
+    assert_instance_shadow(&facts);
     facts
+}
+
+/// H12/7a's every-compile shadow: the instance-keyed view (minted
+/// ALONGSIDE every pair-keyed insert by the checker) must equal the
+/// pair-keyed view, every compile, clean or rejected — 7b consumes
+/// the instance view, 7c kills the pair view, and this assert is the
+/// dual-run oracle that keeps the two halves honest in between (the
+/// H5 playbook, worked twice). The laws, each loud by name:
+///
+/// - OWNERSHIP: every bridge entry `(expr, site) → owner` names the
+///   instance minted for `site`'s own expansion (a top-level
+///   self-pair — `expr == site` — owns to ROOT; every nested pair
+///   owns to the outermost expansion's instance, whatever the
+///   lexical depth — the site law).
+/// - AGREEMENT: for every pair present in a pair map, the owner's (or
+///   child's) instance view carries the SAME truth — call_defs →
+///   fn_node, call_rets → ret, index_key_lanes / access_elems /
+///   creation_envs / closure_calls → the owner's shadow maps.
+/// - REVERSE: no shadow entry without its pair (the instance view
+///   invents nothing).
+/// - TOTALITY: every pair key is bridged, every bridge key has its
+///   pair, every instance is reachable from ROOT through the children
+///   maps. Exact on CLEAN compiles only: a rejected program stops
+///   mid-stream by design, and a post-mint reject (a parameter
+///   unification refusing after the entry mint) leaves a minted but
+///   unbRIDged instance — allowed exactly when diagnostics exist.
+fn assert_instance_shadow(facts: &ShapeFacts) {
+    let root = facts::InstanceId::ROOT;
+    // R2's convention, held every compile: ROOT is nobody's call and
+    // nobody's callee, the top level's bases are zero, and it owns no
+    // params or body (7c rules the root's face when `local_types`
+    // re-keys — until then the emptiness IS the convention).
+    if let Some(root_rec) = facts.instances.get(&root) {
+        assert!(
+            root_rec.call.is_none()
+                && root_rec.fn_node.is_none()
+                && root_rec.ret.is_none()
+                && root_rec.env_face.is_none(),
+            "the shadow (7a): ROOT is nobody's call — the top-level convention"
+        );
+        assert_eq!(
+            (root_rec.frame_base, root_rec.break_base),
+            (0, 0),
+            "the shadow (7a): the top level's bases are zero"
+        );
+        assert!(
+            root_rec.params.is_empty() && root_rec.body.is_empty(),
+            "the shadow (7a): ROOT owns no params or body"
+        );
+    }
+    for ((expr, site), &owner) in &facts.instance_of {
+        let owner_rec = facts.instances.get(&owner).unwrap_or_else(|| {
+            panic!("the shadow (7a): the bridge names instance {owner:?} with no record")
+        });
+        // OWNERSHIP: the owner is `site`'s own instance (ROOT for a
+        // top-level self-pair — an expr cannot sit inside its own
+        // expansion, so `expr == site` names top level and nothing
+        // else ever does).
+        assert_eq!(
+            owner_rec.call,
+            if *expr == *site { None } else { Some(*site) },
+            "the shadow (7a): pair ({expr:?}, {site:?}) bridged to the wrong owner"
+        );
+        // AGREEMENT, map by map, for the maps that carry this pair.
+        if let Some(&fn_ptr) = facts.call_defs.get(&(*expr, *site)) {
+            let kids = owner_rec.children.get(expr).unwrap_or_else(|| {
+                panic!("the shadow (7a): call pair ({expr:?}, {site:?}) has no child instance")
+            });
+            assert!(
+                !kids.is_empty(),
+                "the shadow (7a): call pair ({expr:?}, {site:?}) has an empty children set"
+            );
+            for &kid in kids {
+                let krec = facts.instances.get(&kid).unwrap_or_else(|| {
+                    panic!("the shadow (7a): children names instance {kid:?} with no record")
+                });
+                assert_eq!(
+                    krec.call,
+                    Some(*expr),
+                    "the shadow (7a): a child of ({expr:?}, {site:?}) mints a different call"
+                );
+                assert_eq!(
+                    krec.fn_node,
+                    Some(fn_ptr),
+                    "the shadow (7a): the instance view of call_defs ({expr:?}, {site:?}) disagrees"
+                );
+                assert_eq!(
+                    krec.ret.as_ref(),
+                    facts.call_rets.get(&(*expr, *site)),
+                    "the shadow (7a): the instance view of call_rets ({expr:?}, {site:?}) disagrees"
+                );
+            }
+        }
+        if let Some(&lane) = facts.index_key_lanes.get(&(*expr, *site)) {
+            assert_eq!(
+                owner_rec.index_key_lanes.get(expr),
+                Some(&lane),
+                "the shadow (7a): the instance view of index_key_lanes ({expr:?}, {site:?}) disagrees"
+            );
+        }
+        if let Some(face) = facts.access_elems.get(&(*expr, *site)) {
+            assert_eq!(
+                owner_rec.access_elems.get(expr),
+                Some(face),
+                "the shadow (7a): the instance view of access_elems ({expr:?}, {site:?}) disagrees"
+            );
+        }
+        if let Some(&lit) = facts.creation_envs.get(&(*expr, *site)) {
+            assert_eq!(
+                owner_rec.creation_envs.get(expr),
+                Some(&lit),
+                "the shadow (7a): the instance view of creation_envs ({expr:?}, {site:?}) disagrees"
+            );
+        }
+        if facts.closure_calls.contains(&(*expr, *site)) {
+            assert!(
+                owner_rec.closure_calls.contains(expr),
+                "the shadow (7a): the instance view of closure_calls ({expr:?}, {site:?}) disagrees"
+            );
+        }
+    }
+    // REVERSE + TOTALITY over the records: every shadow entry has its
+    // pair (keyed by the record's own call expr — the site law), every
+    // children value is a real instance.
+    for (&inst, rec) in &facts.instances {
+        let pair_of = |e: NodeId| match rec.call {
+            None => (e, e),
+            Some(call) => (e, call),
+        };
+        for (&e, &lane) in &rec.index_key_lanes {
+            assert_eq!(
+                facts.index_key_lanes.get(&pair_of(e)),
+                Some(&lane),
+                "the shadow (7a): instance {inst:?} carries a lane with no pair"
+            );
+        }
+        for (&e, face) in &rec.access_elems {
+            assert_eq!(
+                facts.access_elems.get(&pair_of(e)),
+                Some(face),
+                "the shadow (7a): instance {inst:?} carries an elem face with no pair"
+            );
+        }
+        for (&e, &lit) in &rec.creation_envs {
+            assert_eq!(
+                facts.creation_envs.get(&pair_of(e)),
+                Some(&lit),
+                "the shadow (7a): instance {inst:?} carries a creation site with no pair"
+            );
+        }
+        for &e in &rec.closure_calls {
+            assert!(
+                facts.closure_calls.contains(&pair_of(e)),
+                "the shadow (7a): instance {inst:?} carries a closure call with no pair"
+            );
+        }
+        for (&e, kids) in &rec.children {
+            assert!(
+                facts.call_defs.contains_key(&pair_of(e)),
+                "the shadow (7a): instance {inst:?} names child call {e:?} with no call_defs pair"
+            );
+            for &kid in kids {
+                assert!(
+                    facts.instances.contains_key(&kid),
+                    "the shadow (7a): instance {inst:?} names child instance {kid:?} with no record"
+                );
+            }
+        }
+    }
+    // TOTALITY, forward: every pair key in the six maps is bridged.
+    for (expr, site) in facts.call_defs.keys() {
+        assert!(
+            facts.instance_of.contains_key(&(*expr, *site)),
+            "the shadow (7a): call_defs pair ({expr:?}, {site:?}) has no bridge entry"
+        );
+    }
+    for (expr, site) in facts.call_rets.keys() {
+        assert!(
+            facts.instance_of.contains_key(&(*expr, *site)),
+            "the shadow (7a): call_rets pair ({expr:?}, {site:?}) has no bridge entry"
+        );
+    }
+    for (expr, site) in facts.index_key_lanes.keys() {
+        assert!(
+            facts.instance_of.contains_key(&(*expr, *site)),
+            "the shadow (7a): index_key_lanes pair ({expr:?}, {site:?}) has no bridge entry"
+        );
+    }
+    for (expr, site) in facts.access_elems.keys() {
+        assert!(
+            facts.instance_of.contains_key(&(*expr, *site)),
+            "the shadow (7a): access_elems pair ({expr:?}, {site:?}) has no bridge entry"
+        );
+    }
+    for (expr, site) in facts.creation_envs.keys() {
+        assert!(
+            facts.instance_of.contains_key(&(*expr, *site)),
+            "the shadow (7a): creation_envs pair ({expr:?}, {site:?}) has no bridge entry"
+        );
+    }
+    for (expr, site) in &facts.closure_calls {
+        assert!(
+            facts.instance_of.contains_key(&(*expr, *site)),
+            "the shadow (7a): closure_calls pair ({expr:?}, {site:?}) has no bridge entry"
+        );
+    }
+    // TOTALITY, clean-compile leg: every instance is reachable from
+    // ROOT through the children maps (a rejected program may stop
+    // mid-stream past a mint — that is the diagnostics gate below).
+    if facts.diagnostics.is_empty() {
+        let mut reached = BTreeSet::from([root]);
+        for rec in facts.instances.values() {
+            reached.extend(rec.children.values().flatten().copied());
+        }
+        for &inst in facts.instances.keys() {
+            assert!(
+                reached.contains(&inst),
+                "the shadow (7a): instance {inst:?} is unreachable from ROOT on a clean compile"
+            );
+        }
+    }
 }
 
 struct Recorded {
@@ -836,6 +1062,8 @@ impl Recorded {
             ffi_verbs: self.chk.ffi_verbs,
             index_key_lanes: self.chk.index_key_lanes,
             access_elems: self.chk.access_elems,
+            instances: self.chk.instances,
+            instance_of: self.chk.instance_of,
             ctor_lines: self.ctor_lines,
             adopt_lines: self.adopt_lines,
             diagnostics,

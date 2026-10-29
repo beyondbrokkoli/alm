@@ -28,7 +28,7 @@
 //! fact set.
 
 use super::super::core::{BOUNDARY_ROOT, MOVED_ROOT, TableShape};
-use super::super::facts::{FfiVerb, FnDef, KeyLane};
+use super::super::facts::{FfiVerb, FnDef, InstanceId, InstanceInfo, KeyLane};
 use super::super::{is_ghost, is_root, join_ty};
 use super::WalkState;
 use super::constraints::UnknownStore;
@@ -38,6 +38,19 @@ use crate::diag::Diagnostic;
 use crate::shape::ty::Ty;
 use alm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// The one instance minter (H12/7a), PRIVATE to the checker: one
+/// writer — `expand_call`, at expansion ENTRY. One construction mints
+/// one instance; the counter starts at 1 because `InstanceId::ROOT`
+/// (the checker's top level, ruling R2) is never drawn from it. Twin
+/// of `NodeId::mint` (relaxed atomic; single-threaded compiler, and
+/// the harness's parallel tests only widen uniqueness — the safe
+/// direction).
+fn mint_instance() -> InstanceId {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    InstanceId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
 
 fn snap_of(walk: &WalkState, severed: &BTreeMap<String, BTreeSet<usize>>) -> WalkSnap {
     WalkSnap {
@@ -118,6 +131,12 @@ pub(super) struct CheckFacts {
     pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,
     pub index_key_lanes: BTreeMap<(NodeId, NodeId), KeyLane>,
     pub access_elems: BTreeMap<(NodeId, NodeId), Ty>,
+    /// H12/7a: the materialized instances and the pair→owner bridge —
+    /// built ALONGSIDE the pair-keyed maps above, consumed by nobody
+    /// yet; the assembly-side shadow assert (analyze_with's finish)
+    /// holds the two views equal every compile.
+    pub instances: BTreeMap<InstanceId, InstanceInfo>,
+    pub instance_of: BTreeMap<(NodeId, NodeId), InstanceId>,
     pub boundary_elem: Option<Ty>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -154,6 +173,21 @@ pub(super) struct Checker {
     /// the params of the fn each expansion is inlining — a parameter
     /// shadows every fn name (fn values are never arguments).
     expansion_params: Vec<Vec<String>>,
+    /// H12/7a: the instance minted for each ACTIVE expansion, parallel
+    /// to `expansion_sites` index-for-index (bottom = outermost,
+    /// EMPTY at top level — ROOT is the default owner when no
+    /// expansion is active, not a stack level). `first()` is the
+    /// OUTERMOST expansion's instance — the owner every pair-keyed
+    /// insert's shadow lands in (the site law at `InstanceInfo` in
+    /// facts.rs).
+    instance_stack: Vec<InstanceId>,
+    /// H12/7a, ruling R1: the ABSOLUTE loop depth each expansion began
+    /// at (enclosing absolute base + the body-relative `loop_depth` at
+    /// entry) — the arithmetic twin of the lowerer's
+    /// `expansion_break_bases` push (`break_ctxs.len()`); the recorded
+    /// `InstanceInfo::break_base` reads the same number, and the
+    /// lowerer's Call arm debug-asserts the two worlds agree.
+    expansion_break_bases: Vec<usize>,
     seed_read: bool,
     len_deferrals: Vec<(Ty, Option<usize>)>,
     cur_stmt: Option<NodeId>,
@@ -197,6 +231,14 @@ pub(super) struct Checker {
     ffi_verbs: BTreeMap<NodeId, FfiVerb>,
     index_key_lanes: BTreeMap<(NodeId, NodeId), KeyLane>,
     access_elems: BTreeMap<(NodeId, NodeId), Ty>,
+    /// H12/7a: the materialized expansion instances (minted at entry
+    /// by the one minter above) and the pair→owner bridge (every
+    /// pair-keyed insert rides its shadow twin — see the shadow maps
+    /// inside `InstanceInfo`). Nothing consumes them in 7a; the
+    /// assembly-side assert holds them equal to the pair view every
+    /// compile.
+    instances: BTreeMap<InstanceId, InstanceInfo>,
+    instance_of: BTreeMap<(NodeId, NodeId), InstanceId>,
     local_types: BTreeMap<(NodeId, Option<NodeId>, String), Ty>,
     /// the bare declarations the CHECKER declared, keyed
     /// `(stmt, expansion site, name)` — the B3 (fold d) ruling: the
@@ -253,10 +295,31 @@ impl Checker {
             closure_fields: BTreeMap::new(),
             expansion_envs: Vec::new(),
             env_overrides: Vec::new(),
+            instance_stack: Vec::new(),
+            expansion_break_bases: Vec::new(),
             cond_depth: 0,
             ffi_verbs: BTreeMap::new(),
             index_key_lanes: BTreeMap::new(),
             access_elems: BTreeMap::new(),
+            instances: BTreeMap::from([(
+                InstanceId::ROOT,
+                InstanceInfo {
+                    call: None,
+                    fn_node: None,
+                    params: Vec::new(),
+                    body: Vec::new(),
+                    frame_base: 0,
+                    break_base: 0,
+                    env_face: None,
+                    ret: None,
+                    children: BTreeMap::new(),
+                    creation_envs: BTreeMap::new(),
+                    closure_calls: BTreeSet::new(),
+                    index_key_lanes: BTreeMap::new(),
+                    access_elems: BTreeMap::new(),
+                },
+            )]),
+            instance_of: BTreeMap::new(),
             local_types: BTreeMap::new(),
             bare_sites: BTreeMap::new(),
             boundary_elem: None,
@@ -452,6 +515,8 @@ impl Checker {
             ffi_verbs,
             index_key_lanes,
             access_elems,
+            instances,
+            instance_of,
             boundary_elem,
             diagnostics,
             ..
@@ -468,6 +533,8 @@ impl Checker {
             ffi_verbs,
             index_key_lanes,
             access_elems,
+            instances,
+            instance_of,
             boundary_elem,
             diagnostics,
         }
@@ -538,6 +605,20 @@ impl Checker {
         for ret in self.call_rets.values_mut() {
             *ret = lat.resolve(ret);
         }
+        // H12/7a: the instance shadow rides the same Store Window
+        // discipline — the recorded ret and env face are resolved to
+        // the one final truth exactly as their pair-keyed twins above
+        // are, so the assembly-side assert compares finals.
+        for rec in self.instances.values_mut() {
+            if let Some(ret) = &mut rec.ret {
+                *ret = lat.resolve(ret);
+            }
+            if let Some(face) = &mut rec.env_face {
+                for ty in face.values_mut() {
+                    *ty = lat.resolve(ty);
+                }
+            }
+        }
         // W3a: the env faces ride the same Store Window discipline —
         // recorded early (still-Unknown cells are rewound by later
         // bindings), resolved once here to the one final truth.
@@ -572,6 +653,18 @@ impl Checker {
             .collect();
         for (k, v) in resolved {
             self.access_elems.insert(k, v);
+        }
+        // H12/7a: the instance shadow's elem faces resolve through the
+        // same final store — the assert compares finals.
+        for rec in self.instances.values_mut() {
+            let resolved: Vec<(NodeId, Ty)> = rec
+                .access_elems
+                .iter()
+                .map(|(&k, v)| (k, lat.resolve(v)))
+                .collect();
+            for (k, v) in resolved {
+                rec.access_elems.insert(k, v);
+            }
         }
     }
 
@@ -1164,6 +1257,27 @@ impl Checker {
         self.expansion_sites.first().copied().unwrap_or(expr)
     }
 
+    /// H12/7a — THE SHADOW: the instance-keyed view, minted ALONGSIDE
+    /// every pair-keyed insert. The bridge names the pair's OWNER (the
+    /// OUTERMOST expansion's instance — `instance_stack.first()`, ROOT
+    /// at top level, derived at the same stack state `fact_site`
+    /// derived the site at, so the two cannot disagree); the returned
+    /// record's shadow map carries the same truth under the expr's own
+    /// id. The assembly-side assert (`analyze_with`'s finish) holds
+    /// the instance view equal to the pair view every compile; 7b
+    /// consumes the instance view; 7c kills the pair view.
+    fn shadow_pair(&mut self, expr: NodeId, site: NodeId) -> &mut InstanceInfo {
+        let owner = self
+            .instance_stack
+            .first()
+            .copied()
+            .unwrap_or(InstanceId::ROOT);
+        self.instance_of.insert((expr, site), owner);
+        self.instances
+            .get_mut(&owner)
+            .expect("ROOT seeded at construction; every mint records itself")
+    }
+
     fn check_index_base(
         &mut self,
         lat: &mut UnknownStore,
@@ -1180,6 +1294,9 @@ impl Checker {
                 signal!(trace::TRACE_CHK_ELEM_FACE);
                 let site = self.fact_site(obj.id());
                 self.access_elems.insert((obj.id(), site), (*elem).clone());
+                self.shadow_pair(obj.id(), site)
+                    .access_elems
+                    .insert(obj.id(), (*elem).clone());
                 Ok((*elem, desc))
             }
             _ => Err(Diagnostic::ty(format!(
@@ -1226,6 +1343,9 @@ impl Checker {
         };
         let site = self.fact_site(key.id());
         self.index_key_lanes.insert((key.id(), site), lane);
+        self.shadow_pair(key.id(), site)
+            .index_key_lanes
+            .insert(key.id(), lane);
         Ok(key_ty)
     }
 
@@ -1606,6 +1726,9 @@ impl Checker {
         }
         let site = self.fact_site(expr.id());
         self.creation_envs.insert((expr.id(), site), ptr);
+        self.shadow_pair(expr.id(), site)
+            .creation_envs
+            .insert(expr.id(), ptr);
         Ok(Ty::Closure(ptr))
     }
 
@@ -1969,6 +2092,9 @@ impl Checker {
                         if let Some(ptr) = self.closure_field_fn(obj, name) {
                             let site = self.fact_site(obj.id());
                             self.access_elems.insert((obj.id(), site), Ty::Closure(ptr));
+                            self.shadow_pair(obj.id(), site)
+                                .access_elems
+                                .insert(obj.id(), Ty::Closure(ptr));
                             return Ok(Ty::Closure(ptr));
                         }
                         // the dispatch: a Table receiver desugars the dot
@@ -1979,6 +2105,9 @@ impl Checker {
                         signal!(trace::TRACE_CHK_ELEM_FACE);
                         let site = self.fact_site(obj.id());
                         self.access_elems.insert((obj.id(), site), (*elem).clone());
+                        self.shadow_pair(obj.id(), site)
+                            .access_elems
+                            .insert(obj.id(), (*elem).clone());
                         Ok(*elem)
                     }
                     other => Err(Diagnostic::ty(format!(
@@ -2013,9 +2142,15 @@ impl Checker {
                             // reads a cell.
                             let site = self.fact_site(obj.id());
                             self.access_elems.insert((obj.id(), site), Ty::Closure(ptr));
+                            self.shadow_pair(obj.id(), site)
+                                .access_elems
+                                .insert(obj.id(), Ty::Closure(ptr));
                             let call_site =
                                 self.expansion_sites.first().copied().unwrap_or(expr.id());
                             self.closure_calls.insert((expr.id(), call_site));
+                            self.shadow_pair(expr.id(), call_site)
+                                .closure_calls
+                                .insert(expr.id());
                             return self.expand_call(lat, expr, obj, name, ptr, true, args);
                         } else {
                             return self.check_ffi_call(lat, expr, obj, name, args);
@@ -2203,6 +2338,42 @@ impl Checker {
         self.expansion_sites.push(call_ptr);
         self.expansion_frame_bases.push(self.frames.len());
         self.expansion_params.push(def.params.clone());
+        // H12/7a — THE MINT: one id per expansion EVENT, at entry (not
+        // at call resolution, not per pair — the pair is truth-keyed,
+        // instances are event-minted; the same body expanded twice
+        // inside one extent mints twice). The record copies FnDef's
+        // owned-body shape (H6): identity rides the node id, the facts
+        // are self-contained. R1: break_base is the ABSOLUTE loop
+        // depth at entry — the arithmetic twin of the lowerer's
+        // `break_ctxs.len()` push (its `expansion_break_bases`), same
+        // AST, same count; the lowerer's Call arm debug-asserts the
+        // two worlds agree.
+        let instance = mint_instance();
+        let break_base = self.expansion_break_bases.last().copied().unwrap_or(0) + self.loop_depth;
+        self.expansion_break_bases.push(break_base);
+        self.instances.insert(
+            instance,
+            InstanceInfo {
+                call: Some(call_ptr),
+                fn_node: Some(fn_ptr),
+                params: def.params.clone(),
+                body: body.to_vec(),
+                frame_base: self.frames.len(),
+                break_base,
+                env_face: if call_through {
+                    Some(env_face.clone())
+                } else {
+                    None
+                },
+                ret: None,
+                children: BTreeMap::new(),
+                creation_envs: BTreeMap::new(),
+                closure_calls: BTreeSet::new(),
+                index_key_lanes: BTreeMap::new(),
+                access_elems: BTreeMap::new(),
+            },
+        );
+        self.instance_stack.push(instance);
         self.expansion_envs
             .push(if call_through { Some(env_face) } else { None });
         self.env_overrides.push(BTreeMap::new());
@@ -2225,6 +2396,8 @@ impl Checker {
         self.expansion_sites.pop();
         self.expansion_frame_bases.pop();
         self.expansion_params.pop();
+        self.instance_stack.pop();
+        self.expansion_break_bases.pop();
         self.expansion_envs.pop();
         self.env_overrides.pop();
 
@@ -2234,6 +2407,29 @@ impl Checker {
         // monomorphic law is per-definition)
         self.call_rets.insert((call_ptr, site), ret.clone());
         self.call_defs.insert((call_ptr, site), fn_ptr);
+        // H12/7a — the call family's shadow, ALONGSIDE the pair
+        // inserts: the bridge names the pair's OWNER (the outermost
+        // expansion's instance; ROOT at top level — uniform with the
+        // five expr-fact bridges), the owner's children set names this
+        // mint (R4 — set-valued: one expr may mint many instances
+        // under one owner), and the instance carries the pair's two
+        // value faces. The assembly-side assert holds the views equal.
+        let owner = self
+            .instance_stack
+            .first()
+            .copied()
+            .unwrap_or(InstanceId::ROOT);
+        self.instance_of.insert((call_ptr, site), owner);
+        if let Some(owner_rec) = self.instances.get_mut(&owner) {
+            owner_rec
+                .children
+                .entry(call_ptr)
+                .or_default()
+                .insert(instance);
+        }
+        if let Some(rec) = self.instances.get_mut(&instance) {
+            rec.ret = Some(ret.clone());
+        }
         let _ = callee;
         Ok(ret)
     }

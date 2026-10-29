@@ -88,6 +88,95 @@ impl FnDef {
     }
 }
 
+/// One materialized expansion instance (H12/7a): the checker's
+/// `expand_call` mints one id per EXPANSION EVENT, at entry — not per
+/// resolved pair. Analysis-world, deliberately type-distinct from
+/// `NodeId` (the fold's tooth: an instance id can never be confused
+/// with a node id). The mint is PRIVATE to the checker (one writer,
+/// one atomic counter twin to `NodeId::mint` — "one construction
+/// mints one instance"); `ROOT` is the one non-minted id, the
+/// checker's top level (ruling R2 — 7c re-keys `local_types`' site
+/// onto it so the `Option` dies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InstanceId(pub u32);
+
+impl InstanceId {
+    /// The checker's top level, minted at `Checker` construction
+    /// (never drawn from the counter — the mint starts at 1). Top-level
+    /// self-pairs `(expr, expr)` are the root instance's dynamic
+    /// extent, exactly as an expansion's pairs are its own.
+    pub const ROOT: InstanceId = InstanceId(0);
+}
+
+/// The instance record (H12/7a): everything one expansion event knows,
+/// recorded at the checker's expansion entry and filled beside the
+/// pair-keyed inserts. `body` copies `FnDef`'s OWNED-body shape (H6's
+/// dividend: identity rides the node id, the facts are self-contained).
+/// The shadow maps (`children`, `creation_envs`, `closure_calls`,
+/// `index_key_lanes`, `access_elems`) are the instance-keyed view of
+/// the six pair-keyed maps, built ALONGSIDE them (never consumed in
+/// 7a); the assembly-side assert in `analyze_with`'s finish holds the
+/// two views equal every compile. 7b consumes; 7c kills the pair view.
+///
+/// KEYING DISCIPLINE (the site law): the instance that owns a pair
+/// `(expr, site)` is the OUTERMOST expansion's instance — the one
+/// minted for `site`'s own expansion — at ANY nesting depth inside it
+/// (`fact_site` = `expansion_sites.first()`). A nested instance's five
+/// shadow maps are therefore EMPTY by law: facts checked inside it key
+/// against the outermost site, and only the outermost instance's
+/// record carries them.
+///
+/// R4's note: `children` is SET-valued because one call expr may mint
+/// MANY instances under one owner (the same body expanded twice inside
+/// one extent — g called twice from f's body); the pair stays
+/// truth-keyed (one entry — monomorphism forces the events to agree),
+/// instances are event-minted. The assert verifies every event's view
+/// equals the pair truth.
+#[derive(Clone, Debug)]
+pub struct InstanceInfo {
+    /// the call expr whose expansion minted this instance; None = ROOT
+    /// (the top level is nobody's call).
+    pub call: Option<NodeId>,
+    /// the callee fn literal this expansion inlines; None = ROOT.
+    pub fn_node: Option<NodeId>,
+    pub params: Vec<String>,
+    /// the inlined body, OWNED (H6 shape); empty for ROOT in 7a (7c
+    /// rules the root's face when `local_types` re-keys).
+    pub body: Vec<Stmt>,
+    /// the checker's frame depth at entry (`frames.len()` — the
+    /// Hygiene Law's caller-frame boundary; checker-world fact).
+    pub frame_base: usize,
+    /// the ABSOLUTE loop depth at entry: the caller's absolute base
+    /// plus this body-relative depth (ruling R1 — the arithmetic twin
+    /// of the lowerer's `break_ctxs.len()` push, same AST, same
+    /// count).
+    pub break_base: usize,
+    /// R3: the call-through env face at entry (Some only for closure
+    /// dispatches — the same face `expansion_envs` pushes);
+    /// `env_overrides` stays checker-local sequential state.
+    pub env_face: Option<BTreeMap<String, Ty>>,
+    /// the expansion's resolved return, filled beside `call_rets`'
+    /// pair insert; None until that insert lands (a post-mint reject
+    /// can leave a minted instance unbRIDged — allowed only on
+    /// rejected compiles, see the shadow's totality gate).
+    pub ret: Option<Ty>,
+    /// R4: the call exprs that minted child instances during this
+    /// instance's DYNAMIC EXTENT (any depth — the site law above),
+    /// each mapping to every instance it minted here. 7b's D4
+    /// precedence asks membership of this map.
+    pub children: BTreeMap<NodeId, BTreeSet<InstanceId>>,
+    /// the instance view of `creation_envs` (creation sites minted in
+    /// this extent — value: the fn literal the value names).
+    pub creation_envs: BTreeMap<NodeId, NodeId>,
+    /// the instance view of `closure_calls` (calls dispatching through
+    /// a closure value in this extent).
+    pub closure_calls: BTreeSet<NodeId>,
+    /// the instance view of `index_key_lanes`.
+    pub index_key_lanes: BTreeMap<NodeId, KeyLane>,
+    /// the instance view of `access_elems`.
+    pub access_elems: BTreeMap<NodeId, Ty>,
+}
+
 /// The one fill-loop acceptance predicate's recorded decision (H9):
 /// which tables a `guard < bound` loop fills at the guard key, split by
 /// store depth — `fills` are direct bases (`t[i] = …`), `nested_fills`
@@ -289,6 +378,21 @@ pub struct ShapeFacts {
     /// (a late-bound callee's return elem differs per site); the pair
     /// key keeps each expansion's lowering on its own face.
     pub access_elems: BTreeMap<(NodeId, NodeId), Ty>,
+    /// H12/7a — the materialized expansion instances, minted at the
+    /// checker's `expand_call` ENTRY (one id per expansion EVENT) with
+    /// the instance-keyed shadow maps built ALONGSIDE the pair-keyed
+    /// maps above (the KEYING DISCIPLINE at `InstanceInfo`); consumed
+    /// by nobody yet. The assembly-side shadow assert
+    /// (`analyze_with`'s finish) holds the instance view equal to the
+    /// pair view every compile; 7b consumes, 7c kills the pair view.
+    pub instances: BTreeMap<InstanceId, InstanceInfo>,
+    /// H12/7a — the bridge: every pair key `(expr, site)` → the
+    /// OWNING instance (the outermost expansion's instance; ROOT for
+    /// top-level self-pairs — uniform over all six pair-keyed maps;
+    /// a call pair's own instances hang off the owner's children
+    /// set). Rides every pair-keyed insert; dies with the pair maps
+    /// in 7c (or at 7b, if the consumption fold makes it redundant).
+    pub instance_of: BTreeMap<(NodeId, NodeId), InstanceId>,
     pub ctor_lines: Vec<usize>,
     #[allow(dead_code)]
     pub adopt_lines: BTreeMap<String, usize>,
