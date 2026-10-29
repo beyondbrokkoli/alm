@@ -16,7 +16,9 @@ mod pipeline;
 mod property_tests;
 mod shape;
 
-// The boundary type, shared by construction: the same #[repr(C)] struct
+// The boundary type, shared by construction: the same #[repr(C)]
+// AlmTable the runtime owns (rt.rs) — one definition, both sides of
+// the ABI.
 use alm_rt::rt::AlmTable;
 
 type AlmExec = unsafe extern "C" fn(args: *mut AlmTable) -> *mut AlmTable;

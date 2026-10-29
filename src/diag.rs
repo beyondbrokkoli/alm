@@ -1,37 +1,27 @@
-//! Typed diagnostics (H11). Until this fold every phase minted its
-//! rejections as pre-formatted strings — `format!("line {n}: Kind: text")`
-//! hand-stamped at ~a dozen boundary sites, the kind prefix hand-embedded
-//! in ~a hundred message literals, and the walk-desync protocol a
-//! SUBSTRING check (`text.contains("disagree")`) re-run over the finished
-//! text by every consumer (the lowerer's bail arms, the checker's, the
-//! property harness's desync filter) — desync-ness riding the message
-//! bytes instead of the type. One representation, three hand-maintained
-//! agreements on its shape: the same disease the arc kills everywhere.
+//! Typed diagnostics (H11). A diagnostic is MINTED as
+//! `{ site, kind, text }` where it is discovered — kind names the
+//! face once (the variant replaces the embedded prefix), text
+//! carries only the message body, and the site is stamped by the
+//! phase that knows the birth line. ONE formatter (`render`)
+//! derives the `"line N: Kind: text"` bytes; nothing else in the
+//! tree formats a diagnostic, so the rendered shape cannot drift
+//! between mints. The rendered bytes are pinned byte-stable (the
+//! corpus EXPECTs and the harness compare them).
 //!
-//! The law now: a diagnostic is MINTED as `{ site, kind, text }` where it
-//! is discovered — kind names the face once (the variant replaces the
-//! embedded prefix), text carries only the message body, and the site is
-//! stamped by the phase that knows the birth line. ONE formatter
-//! (`render`) derives the `"line N: Kind: text"` bytes; nothing else in
-//! the tree formats a diagnostic, so the rendered shape cannot drift
-//! between mints. The rendered bytes are pinned byte-stable (the corpus
-//! EXPECTs and the harness compare them).
-//!
-//! The desync protocol is the `Desync` variant: the halves' disagreement
-//! is a KIND, detected by construction instead of by sniffing the text.
-//! A desync's text keeps its face and its "— … disagree" tail inline —
-//! the disagreeing halves are message CONTENT (which half owns the
-//! truth), not format; `render` adds no prefix over them. H12's 7c
-//! deletes the variant with the class it names.
+//! The desync protocol is the `Desync` variant: the halves'
+//! disagreement is a KIND, detected by construction instead of by
+//! sniffing the text. A desync's text keeps its face and its "— …
+//! disagree" tail inline — the disagreeing halves are message
+//! CONTENT (which half owns the truth), not format; `render` adds
+//! no prefix over them. H12's 7c deletes the variant with the class
+//! it names.
 //!
 //! `site` is the birth LINE, read off the node's own `loc` at the
-//! stamp sites (H6 killed the `stmt_lines`/`stmt_locs` lookup maps —
-//! the line was always H5's stamp on the node; the map was the
-//! duplicate representation). Re-keying site to the node's ID is
-//! deliberately H12-7a's first move, not H6's: a parse refusal has no
-//! node to key (the parser stamps off its token stream), and the
-//! renderer stays pure — the socket widens when `InstanceId` exists
-//! to key into it.
+//! stamp sites. Re-keying site to the node's ID is deliberately
+//! H12-7a's first move, not H6's: a parse refusal has no node to
+//! key (the parser stamps off its token stream), and the renderer
+//! stays pure — the socket widens when `InstanceId` exists to key
+//! into it.
 
 use std::fmt;
 

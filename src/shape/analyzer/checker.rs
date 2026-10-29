@@ -202,10 +202,8 @@ pub(super) struct Checker {
     /// `(stmt, expansion site, name)` — the B3 (fold d) ruling: the
     /// identity node is PER-EXPANSION (a fresh mint at each site's
     /// declare; None = the checker's top level, itself a single
-    /// site). The walk anchors no competing node (H8, 2026-10-26:
-    /// the lattice's definition-view `bare_nodes` map is retired —
-    /// its ids had no readers left). Finish resolves each node
-    /// through the final store into `local_types` under the same key.
+    /// site). Finish resolves each node through the final store
+    /// into `local_types` under the same key.
     bare_sites: BTreeMap<(NodeId, Option<NodeId>, String), usize>,
     boundary_elem: Option<Ty>,
     diagnostics: Vec<Diagnostic>,
@@ -1175,10 +1173,10 @@ impl Checker {
         match ty {
             Ty::Tbl(elem) => {
                 let desc = type_name(&Ty::Tbl(elem.clone()));
-                // the elem face fact: this one resolved view is what every
-                // lowering of this access consumes — the lowerer's own
-                // type-walk re-derivation was the elem seam (two views of
-                // one cell kind disagreeing on adoption-bridged names)
+                // the elem face fact: this one resolved view is what
+                // every lowering of this access consumes — one view
+                // of one cell kind everywhere, including
+                // adoption-bridged names
                 signal!(trace::TRACE_CHK_ELEM_FACE);
                 let site = self.fact_site(obj.id());
                 self.access_elems.insert((obj.id(), site), (*elem).clone());
@@ -1231,10 +1229,10 @@ impl Checker {
         Ok(key_ty)
     }
 
-    /// Records the checker's verdict for one dotted call site — the fact
-    /// the lowerer lowers straight from (member, arity, and operand types
-    /// were all decided HERE; re-deriving them downstream was the desync
-    /// surface this replaces).
+    /// Records the checker's verdict for one dotted call site — the
+    /// fact the lowerer lowers straight from (member, arity, and
+    /// operand types are decided HERE; nothing downstream
+    /// re-derives them).
     fn record_verb(&mut self, call: &Expr, verb: FfiVerb) {
         signal!(trace::TRACE_CHK_FFI_VERB);
         self.ffi_verbs.insert(call.id(), verb);

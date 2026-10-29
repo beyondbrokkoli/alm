@@ -1,16 +1,12 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// A node's identity, minted at construction (H6). Until this fold the
-/// checker→lowerer contract keyed its fact maps on raw
-/// `*const Expr`/`*const Stmt` addresses — an immutability convention
-/// ("the AST never moves") with no enforcing type, plus `unsafe`
-/// derefs (`FnDef::body`). Identity now rides the node: one
-/// construction mints one id, every fact map keys the id, and a
-/// node's ADDRESS is nobody's business. A copy of a node IS the node
-/// (the id copies with it) — so re-materializing a subtree means
-/// CONSTRUCTING, never cloning; the derivation pass's identity census
-/// (analysis.rs) panics on any duplicate id reaching the tree, which
-/// keeps the law loud instead of conventional.
+/// A node's identity, minted at construction (H6): one construction
+/// mints one id, every fact map keys the id, and a node's ADDRESS is
+/// nobody's business. A copy of a node IS the node (the id copies
+/// with it) — so re-materializing a subtree means CONSTRUCTING, never
+/// cloning; the derivation pass's identity census (analysis.rs)
+/// panics on any duplicate id reaching the tree, which keeps the law
+/// loud instead of conventional.
 ///
 /// `u32` headroom: ~4e9 nodes per process; the mint is a relaxed
 /// atomic fetch-add (the compiler is single-threaded; the property

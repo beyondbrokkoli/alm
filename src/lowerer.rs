@@ -1,4 +1,5 @@
-// AST -> SSA IR lowering. The fill-loop conversion (EC/HR) and its
+// AST -> SSA IR lowering. Every acceptance decision rides facts
+// (ShapeFacts); this walk lowers and never re-derives.
 
 mod bridges;
 
@@ -18,8 +19,8 @@ use bridges::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A lowering rejection — minted typed (H11); the desync protocol is
-/// the `Desync` variant on the payload, no longer the message bytes.
+/// A lowering rejection — a typed `Diagnostic` (H11); desync-ness is
+/// the `Desync` variant on the payload, matched by kind.
 pub struct LowerError(pub Diagnostic);
 
 impl LowerError {
@@ -780,10 +781,8 @@ impl<'a> IrLowerer<'a> {
 
     /// The elem face of one access base, consumed straight from the
     /// checker's recorded decision (signal 180's fact) — the lowerer
-    /// never re-derives the elem from its own type walk. That
-    /// re-derivation was the last elem seam: on adoption-bridged names
-    /// the two walks could answer different kinds, and only the runtime
-    /// caught up with them.
+    /// never re-derives the elem from its own type walk: one view of
+    /// one cell kind everywhere, including adoption-bridged names.
     fn elem_face_of(&self, obj: &Expr) -> Result<Ty, LowerError> {
         let elem = self
             .shape

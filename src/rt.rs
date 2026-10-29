@@ -20,7 +20,9 @@ pub enum TableMode {
     Sparse = 1,
 }
 
-/// #[repr(C)] header. Field layout (offset: type), ABI-pinned by the
+/// The table header. Field layout (offset: type) is ABI-pinned by the
+/// C boundary (interop_port consumes this shape) — order, widths, and
+/// kinds must not drift.
 #[repr(C)]
 pub struct AlmTable {
     pub data: *mut u8,
