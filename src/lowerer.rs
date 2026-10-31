@@ -2713,27 +2713,41 @@ fn const_of(expr: &Expr) -> Option<i64> {
 fn find_moved_names(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
     let mut moved = BTreeSet::new();
     let mut seen = BTreeSet::new();
+    find_moved_names_into(stmts, shape, &mut moved, &mut seen);
+    moved
+}
+
+/// The recursion threads the accumulator and `seen` through nested
+/// blocks (the `fn_stmts_touched` shape): one query, one `seen` — a fn
+/// body walked in a sibling branch is not walked again. The union is
+/// idempotent, so the result is identical to the per-block recursion;
+/// only the re-walk and the per-block allocations die.
+fn find_moved_names_into(
+    stmts: &[Stmt],
+    shape: &ShapeFacts,
+    out: &mut BTreeSet<String>,
+    seen: &mut BTreeSet<NodeId>,
+) {
     for stmt in stmts {
         if let Some(names) = shape.move_poisons.get(&stmt.id()) {
-            moved.extend(names.iter().cloned());
+            out.extend(names.iter().cloned());
         }
-        stmt_call_touched(stmt, shape, &mut moved, &mut seen);
+        stmt_call_touched(stmt, shape, out, seen);
         match stmt {
             Stmt::While { body, .. } | Stmt::Do { body, .. } => {
-                moved.extend(find_moved_names(body, shape));
+                find_moved_names_into(body, shape, out, seen);
             }
             Stmt::If {
                 then_body,
                 else_body,
                 ..
             } => {
-                moved.extend(find_moved_names(then_body, shape));
-                moved.extend(find_moved_names(else_body, shape));
+                find_moved_names_into(then_body, shape, out, seen);
+                find_moved_names_into(else_body, shape, out, seen);
             }
             _ => {}
         }
     }
-    moved
 }
 
 fn calls_touched(
@@ -2871,30 +2885,41 @@ fn stmt_call_touched(
 fn find_mutated_vars(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
     let mut mutated = BTreeSet::new();
     let mut seen = BTreeSet::new();
+    find_mutated_names_into(stmts, shape, &mut mutated, &mut seen);
+    mutated
+}
+
+/// `find_moved_names_into`'s twin: the assigned-name face rides the
+/// same threaded recursion.
+fn find_mutated_names_into(
+    stmts: &[Stmt],
+    shape: &ShapeFacts,
+    out: &mut BTreeSet<String>,
+    seen: &mut BTreeSet<NodeId>,
+) {
     for stmt in stmts {
-        stmt_call_touched(stmt, shape, &mut mutated, &mut seen);
+        stmt_call_touched(stmt, shape, out, seen);
         match stmt {
             Stmt::Assignment { name, .. } => {
-                mutated.insert(name.clone());
+                out.insert(name.clone());
             }
             Stmt::While { body, .. } => {
-                mutated.extend(find_mutated_vars(body, shape));
+                find_mutated_names_into(body, shape, out, seen);
             }
             Stmt::Do { body, .. } => {
-                mutated.extend(find_mutated_vars(body, shape));
+                find_mutated_names_into(body, shape, out, seen);
             }
             Stmt::If {
                 then_body,
                 else_body,
                 ..
             } => {
-                mutated.extend(find_mutated_vars(then_body, shape));
-                mutated.extend(find_mutated_vars(else_body, shape));
+                find_mutated_names_into(then_body, shape, out, seen);
+                find_mutated_names_into(else_body, shape, out, seen);
             }
             _ => {}
         }
     }
-    mutated
 }
 
 fn as_ident(expr: &Expr) -> Option<&str> {
