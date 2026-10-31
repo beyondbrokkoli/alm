@@ -923,6 +923,9 @@ impl Analyzer {
         if has_break(body) {
             return;
         }
+        if body_has_call(body) {
+            return;
+        }
         if !guard_provably_nonneg(&self.holds.num_assigns, guard) {
             return;
         }
@@ -1122,4 +1125,57 @@ fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
         }
     }
     stored
+}
+
+/// Does this expression contain a call anywhere?
+fn expr_has_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { .. } => true,
+        Expr::BinaryOp { left, right, .. } => expr_has_call(left) || expr_has_call(right),
+        Expr::UnaryOp { expr, .. } => expr_has_call(expr),
+        Expr::Index { obj, key, .. } => expr_has_call(obj) || expr_has_call(key),
+        Expr::Field { obj, .. } => expr_has_call(obj),
+        Expr::TableCtor { entries, .. } => entries
+            .iter()
+            .any(|(k, v)| matches!(k, CtorKey::Expr(ke) if expr_has_call(ke)) || expr_has_call(v)),
+        _ => false,
+    }
+}
+
+/// The fill-stability law's walk-time face of the call-touch law: a
+/// call ANYWHERE in a fill candidate's body (any statement face —
+/// values, inits, args, keys, conditions, returns) refuses the
+/// conversion. The stability scan runs at WALK time, before the
+/// checker mints `call_defs`, so a callee's outer touches are
+/// invisible here (`collect_mutated_names` never saw them in any
+/// position — the same blind spot that cost the loop-phi collectors
+/// their value-position faces); a bound name mutated through a call
+/// would pass the exclusion and the reserve would size once against a
+/// bound the body mutates — a silent wrong loop count. Refusal is
+/// runtime-identical: the loop lowers as a plain while. The precise
+/// union (`fn_touched` of each body call, resolved walk-side) is
+/// future work if a corpus case ever needs the conversion back.
+fn body_has_call(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
+            exprs.iter().any(expr_has_call)
+        }
+        Stmt::Assignment { expr, .. } => expr_has_call(expr),
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => expr_has_call(obj) || expr_has_call(key) || expr_has_call(value),
+        Stmt::While {
+            condition, body, ..
+        } => expr_has_call(condition) || body_has_call(body),
+        Stmt::Do { body, .. } => body_has_call(body),
+        Stmt::If {
+            condition,
+            then_body,
+            else_body,
+            ..
+        } => expr_has_call(condition) || body_has_call(then_body) || body_has_call(else_body),
+        Stmt::Expr { expr, .. } => expr_has_call(expr),
+        Stmt::Return { value: Some(e), .. } => expr_has_call(e),
+        _ => false,
+    })
 }

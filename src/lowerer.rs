@@ -2035,23 +2035,33 @@ impl<'a> IrLowerer<'a> {
                 // is lowered inside (the call itself at no expansion)
                 let call_ptr = expr.id();
                 let site = self.expansion_sites.first().copied().unwrap_or(call_ptr);
-                // H12/7a, ruling R1 (two-writer shadow): the instance
-                // record's break_base is the checker's ABSOLUTE loop
-                // depth at ITS expansion entry — the arithmetic twin of
-                // the base this arm is about to push. The two worlds
-                // must agree every compile; debug-only and graceful so a
-                // checker/lowerer site desync still reaches the fact-site
-                // guard below, and release bytes are untouched.
+                // H12/7a, ruling R1 (two-writer shadow): the lowerer's
+                // ABSOLUTE loop base must be ONE OF the pair's minted
+                // events' break_bases. Membership, not equality: a
+                // truth-keyed pair can carry MANY events (a shared body
+                // expanded twice in one extent) whose per-event bases
+                // legitimately DIVERGE (h12_break_base_is_per_event_pin's
+                // program), and the current event's own record is in
+                // this set by construction — same walk, same order — so
+                // membership never false-fires, while a base matching no
+                // minted event is a checker/lowerer desync. Debug-only
+                // and graceful so a checker/lowerer site desync still
+                // reaches the fact-site guard below, and release bytes
+                // are untouched. 7b's ordered cursor reads the event's
+                // OWN record and retires this check with the stacks.
                 if let Some(&owner) = self.shape.instance_of.get(&(call_ptr, site))
                     && let Some(owner_rec) = self.shape.instances.get(&owner)
                     && let Some(kids) = owner_rec.children.get(&call_ptr)
-                    && let Some(&kid) = kids.iter().next()
-                    && let Some(rec) = self.shape.instances.get(&kid)
                 {
-                    debug_assert_eq!(
-                        rec.break_base,
-                        self.break_ctxs.len(),
-                        "the shadow (7a): the lowerer's break base disagrees with the instance record"
+                    debug_assert!(
+                        kids.iter().any(|k| {
+                            self.shape
+                                .instances
+                                .get(k)
+                                .is_some_and(|rec| rec.break_base == self.break_ctxs.len())
+                        }),
+                        "the shadow (7a): the lowerer's break base matches no \
+                         minted event — the checker and the lowerer disagree"
                     );
                 }
                 // D4 precedence, lower half: a Field callee is a module
@@ -2702,10 +2712,12 @@ fn const_of(expr: &Expr) -> Option<i64> {
 
 fn find_moved_names(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
     let mut moved = BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for stmt in stmts {
         if let Some(names) = shape.move_poisons.get(&stmt.id()) {
             moved.extend(names.iter().cloned());
         }
+        stmt_call_touched(stmt, shape, &mut moved, &mut seen);
         match stmt {
             Stmt::While { body, .. } | Stmt::Do { body, .. } => {
                 moved.extend(find_moved_names(body, shape));
@@ -2718,14 +2730,18 @@ fn find_moved_names(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
                 moved.extend(find_moved_names(then_body, shape));
                 moved.extend(find_moved_names(else_body, shape));
             }
-            Stmt::Expr { expr, .. } => calls_touched(expr, shape, &mut moved),
             _ => {}
         }
     }
     moved
 }
 
-fn calls_touched(expr: &Expr, shape: &ShapeFacts, out: &mut BTreeSet<String>) {
+fn calls_touched(
+    expr: &Expr,
+    shape: &ShapeFacts,
+    out: &mut BTreeSet<String>,
+    seen: &mut BTreeSet<NodeId>,
+) {
     match expr {
         Expr::Call { callee, args, .. } => {
             // union read: every instantiation of this call expr (all its
@@ -2740,36 +2756,123 @@ fn calls_touched(expr: &Expr, shape: &ShapeFacts, out: &mut BTreeSet<String>) {
                 if let Some(touched) = shape.fn_touched.get(&fn_ptr) {
                     out.extend(touched.iter().cloned());
                 }
+                // THE TRANSITIVE CLOSURE: `fn_touched` is the per-fn law
+                // (a fn's own lexical outer touches — the derivation
+                // pass's scan; a callee's set lives under its own id and
+                // never propagates into its caller's). A chain G→H
+                // assigning an outer name must therefore reach the set
+                // through the MIDDLE call: walk the callee's OWNED BODY
+                // (H6's self-contained facts) with the same walker. The
+                // checker refuses recursive inlining, so the call graph
+                // is a DAG on every compile that reaches the lowerer;
+                // `seen` is the walk's convergence face and its defense
+                // in depth.
+                if seen.insert(fn_ptr)
+                    && let Some(def) = shape.fn_defs.get(&fn_ptr)
+                {
+                    fn_stmts_touched(def.body(), shape, out, seen);
+                }
             }
-            calls_touched(callee, shape, out);
+            calls_touched(callee, shape, out, seen);
             for a in args {
-                calls_touched(a, shape, out);
+                calls_touched(a, shape, out, seen);
             }
         }
         Expr::BinaryOp { left, right, .. } => {
-            calls_touched(left, shape, out);
-            calls_touched(right, shape, out);
+            calls_touched(left, shape, out, seen);
+            calls_touched(right, shape, out, seen);
         }
-        Expr::UnaryOp { expr, .. } => calls_touched(expr, shape, out),
+        Expr::UnaryOp { expr, .. } => calls_touched(expr, shape, out, seen),
         Expr::Index { obj, key, .. } => {
-            calls_touched(obj, shape, out);
-            calls_touched(key, shape, out);
+            calls_touched(obj, shape, out, seen);
+            calls_touched(key, shape, out, seen);
         }
+        Expr::Field { obj, .. } => calls_touched(obj, shape, out, seen),
         Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
                 if let CtorKey::Expr(ke) = k {
-                    calls_touched(ke, shape, out);
+                    calls_touched(ke, shape, out, seen);
                 }
-                calls_touched(v, shape, out);
+                calls_touched(v, shape, out, seen);
             }
         }
         _ => {}
     }
 }
 
+/// The transitive closure's body walker: one fn's owned body, every
+/// statement face (nested loops and branches included), every call
+/// routed back through `calls_touched` so the chain keeps walking.
+fn fn_stmts_touched(
+    stmts: &[Stmt],
+    shape: &ShapeFacts,
+    out: &mut BTreeSet<String>,
+    seen: &mut BTreeSet<NodeId>,
+) {
+    for s in stmts {
+        stmt_call_touched(s, shape, out, seen);
+        match s {
+            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
+                fn_stmts_touched(body, shape, out, seen);
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                fn_stmts_touched(then_body, shape, out, seen);
+                fn_stmts_touched(else_body, shape, out, seen);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every expression face one statement carries, swept for calls. The
+/// loop-phi collectors ride this on EVERY statement shape: the pre-fold
+/// scan reached `calls_touched` only from `Stmt::Expr`, so a call in
+/// any value position (`local c = H()`, `c = H()`, `print(H())`, a
+/// condition, a return value) contributed nothing — an outer name
+/// assigned through such a call never joined the loop's phi set, the
+/// loop body read the pre-loop register every iteration, and a
+/// post-loop read was an undominated use (the backend aborted on a
+/// legal program; without the read the loop's writes were silently
+/// lost). Over-approximation is the safe direction here: a name in the
+/// phi set whose register never changes mints a degenerate phi, never
+/// a wrong answer.
+fn stmt_call_touched(
+    stmt: &Stmt,
+    shape: &ShapeFacts,
+    out: &mut BTreeSet<String>,
+    seen: &mut BTreeSet<NodeId>,
+) {
+    match stmt {
+        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
+            for e in exprs {
+                calls_touched(e, shape, out, seen);
+            }
+        }
+        Stmt::Assignment { expr, .. } => calls_touched(expr, shape, out, seen),
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => {
+            calls_touched(obj, shape, out, seen);
+            calls_touched(key, shape, out, seen);
+            calls_touched(value, shape, out, seen);
+        }
+        Stmt::While { condition, .. } => calls_touched(condition, shape, out, seen),
+        Stmt::If { condition, .. } => calls_touched(condition, shape, out, seen),
+        Stmt::Expr { expr, .. } => calls_touched(expr, shape, out, seen),
+        Stmt::Return { value: Some(e), .. } => calls_touched(e, shape, out, seen),
+        _ => {}
+    }
+}
+
 fn find_mutated_vars(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
     let mut mutated = BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for stmt in stmts {
+        stmt_call_touched(stmt, shape, &mut mutated, &mut seen);
         match stmt {
             Stmt::Assignment { name, .. } => {
                 mutated.insert(name.clone());
@@ -2788,7 +2891,6 @@ fn find_mutated_vars(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
                 mutated.extend(find_mutated_vars(then_body, shape));
                 mutated.extend(find_mutated_vars(else_body, shape));
             }
-            Stmt::Expr { expr, .. } => calls_touched(expr, shape, &mut mutated),
             _ => {}
         }
     }

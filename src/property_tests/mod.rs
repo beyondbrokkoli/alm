@@ -695,3 +695,8 @@ include!("h12_local_types_key_the_outermost_extent_pin.rs");
 include!("h12_instantiation_facts_cover_every_site_pin.rs");
 include!("h12_dispatch_mints_at_absolute_base_pin.rs");
 include!("monomorphic_blocks_keep_one_elem_truth.rs");
+include!("h12_multi_event_divergent_depth_lowers_clean_pin.rs");
+include!("h12_break_arm_consumes_the_event_base_pin.rs");
+include!("h12_nested_dispatch_rides_the_outer_owner_pin.rs");
+include!("h12_creation_envs_site_law_at_depth_two_pin.rs");
+include!("h12_three_events_mint_in_body_order_pin.rs");
