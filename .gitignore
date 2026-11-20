@@ -1,2 +1,4 @@
 target
 *.md
+.alm_trace.bin
+tests/goldens
