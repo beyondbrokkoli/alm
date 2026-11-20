@@ -178,14 +178,19 @@ fn front_end_parity_vs_mirror_binary() {
             );
         } else {
             // A later-tier negative case: the front end must accept it
-            // (alm silent, exit 0), and mirror's own stderr carries no
-            // Syntax-tier line — the refusal belongs to a stage alm has
-            // not ported (Modules/Ffi/Analyze/Lower).
+            // (alm's stderr silent, exit 0), and mirror's own stderr
+            // carries no Syntax-tier line — the refusal belongs to a
+            // stage alm has not fully ported (Ffi/checker/lower).
+            // (L3 receipt: alm's `(none)` mode grew from front-only to
+            // the walk, so this leg drives `--dump-ast` — the front-only
+            // surface; stdout then carries the AST dump by the mode's
+            // design, which is not the front "speaking".)
             let mut alm_args = case.surface_flags();
+            alm_args.push("--dump-ast".to_string());
             alm_args.push(case.path.display().to_string());
             let alm = run(&mine, &alm_args);
             assert!(
-                alm.status.success() && alm.stdout.is_empty() && alm.stderr.is_empty(),
+                alm.status.success() && alm.stderr.is_empty(),
                 "{name}: not a front refusal, but alm's front end spoke:\n{}",
                 String::from_utf8_lossy(&alm.stderr)
             );

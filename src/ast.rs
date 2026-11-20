@@ -246,3 +246,46 @@ impl Stmt {
         }
     }
 }
+
+/// A `break` reachable from this block. While bodies are deliberately
+/// not descended: a break there targets that while, not any enclosing
+/// loop — so `visit_while` overrides to skip, and everything else rides
+/// the engine's default traversal.
+pub fn has_break(stmts: &[Stmt]) -> bool {
+    use crate::visit::{Visitor, walk_stmts};
+    use std::convert::Infallible;
+
+    struct BreakFinder(bool);
+
+    impl Visitor for BreakFinder {
+        type Break = Infallible;
+
+        fn visit_break(&mut self, _loc: Loc, _id: NodeId) -> Result<(), Self::Break> {
+            self.0 = true;
+            Ok(())
+        }
+
+        fn visit_while(
+            &mut self,
+            _condition: &Expr,
+            _body: &[Stmt],
+            _loc: Loc,
+            _id: NodeId,
+        ) -> Result<(), Self::Break> {
+            Ok(()) // a break inside targets this while — not an outer one
+        }
+
+        fn visit_function(
+            &mut self,
+            _params: &[String],
+            _body: &[Stmt],
+            _id: NodeId,
+        ) -> Result<(), Self::Break> {
+            Ok(()) // a function body has no break of this loop to find
+        }
+    }
+
+    let mut f = BreakFinder(false);
+    let _ = walk_stmts(&mut f, stmts);
+    f.0
+}

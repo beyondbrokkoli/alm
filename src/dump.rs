@@ -1,18 +1,23 @@
 //! The per-stage debug dumps — alm-only additive surface with no
 //! mirror counterpart, so no future mirror transfer can conflict with
 //! it (REBASE_PLAN.md §3.3.2: golden dumps per layer). L2 brings the
-//! AST dump (`--dump-ast`); each later stage adds its own renderer
-//! here (walk facts at L3, IR at L7, …).
+//! AST dump (`--dump-ast`); L3 adds the walk-facts dump
+//! (`--dump-shape`); each later stage adds its own renderer here (IR
+//! at L7, …).
 //!
 //! Format laws: one node per line, children indented two spaces;
 //! statements carry `@line` (the desugar attribution pins become
 //! greppable); constructor entries show physical slots and the P8
 //! provenance; `NodeId`s are never printed (they churn when a later
-//! layer parses modules in-process). Every match is exhaustive with no
-//! `_` arm — a new AST variant fails compilation here until the dump
-//! grows, so the dump cannot silently drift from the tree it reads.
+//! layer parses modules in-process) — the shape dump projects every
+//! `NodeId`-keyed fact through its node's line instead. Every match is
+//! exhaustive with no `_` arm — a new AST variant fails compilation
+//! here until the dump grows, so the dump cannot silently drift from
+//! the tree it reads.
 
-use crate::ast::{BinOp, CtorKey, Expr, Stmt, UnOp};
+use crate::ast::{BinOp, CtorKey, Expr, NodeId, Stmt, UnOp};
+use crate::shape::ShapeFacts;
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 /// Renders the post-desugar program exactly as `alm --dump-ast` and
@@ -235,6 +240,286 @@ fn unop_name(op: &UnOp) -> &'static str {
 
 fn emit(out: &mut String, depth: usize, text: &str) {
     let _ = writeln!(out, "{}{text}", "  ".repeat(depth));
+}
+
+/// Renders the walk's output exactly as `alm --dump-shape` and the L3
+/// walk goldens print it. Site indices, ghost ids, and unknown-node ids
+/// are the walk's own deterministic mint; `NodeId`-keyed facts project
+/// through their node's line (the AST walk below), so two parses of
+/// one source dump identically and in-process sweeps stay stable.
+pub fn render_shape(facts: &ShapeFacts, ast: &[Stmt]) -> String {
+    let mut lines = BTreeMap::new();
+    let index = |stmts: &[Stmt], lines: &mut BTreeMap<NodeId, u32>| {
+        let mut v = LineCollector {
+            lines,
+            current_line: 0,
+        };
+        let _ = crate::visit::walk_stmts(&mut v, stmts);
+    };
+    index(ast, &mut lines);
+
+    let line_of = |id: NodeId| -> u32 {
+        lines
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| unreachable!("a fact's key node was collected from the AST"))
+    };
+
+    let mut out = String::new();
+    let mut emitf = |text: String| {
+        let _ = writeln!(out, "{text}");
+    };
+
+    emitf(format!("sites: {}", facts.sites.len()));
+    for idx in 0..facts.elems.len() {
+        emitf(format!(
+            "  site {idx} @line {} elem {:?} layout {:?}",
+            facts.ctor_lines[idx],
+            resolve_ty(facts, &facts.elems[idx]),
+            facts.layouts[idx],
+        ));
+    }
+
+    // (the constraint store's substitution map is internal state — the
+    // pins' refinement lives there by design; the frozen surface is the
+    // resolved types above, which is all a downstream consumer reads.)
+
+    if !facts.cell_children.is_empty() {
+        emitf("cell-children:".into());
+        for (parent, kids) in &facts.cell_children {
+            let list = kids
+                .iter()
+                .map(|k| k.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            emitf(format!("  site {parent} -> [{list}]"));
+        }
+    }
+
+    if !facts.row_reads.is_empty() {
+        emitf("row-reads:".into());
+        for (base, (name, depth)) in &facts.row_reads {
+            emitf(format!("  site {base} ({name}, pierce {depth})"));
+        }
+    }
+
+    if !facts.stored_ctor_parents.is_empty() {
+        let list = facts
+            .stored_ctor_parents
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        emitf(format!("stored-ctor-parents: [{list}]"));
+    }
+
+    if !facts.free_sites.is_empty() {
+        emitf("frees:".into());
+        for stmt in &facts.free_sites {
+            let keeps = facts
+                .free_keeps
+                .get(stmt)
+                .map(|k| format!(" keeps: {}", render_keeps(k)))
+                .unwrap_or_default();
+            emitf(format!("  @line {}{keeps}", line_of(*stmt)));
+        }
+    }
+
+    if !facts.rebind_frees.is_empty() {
+        emitf("rebind-grants:".into());
+        for (stmt, grants) in &facts.rebind_frees {
+            for (name, keeps) in grants {
+                emitf(format!(
+                    "  @line {} {name} keeps: {}",
+                    line_of(*stmt),
+                    render_keeps(keeps)
+                ));
+            }
+        }
+    }
+
+    if !facts.arm_free_sites.is_empty() {
+        emitf("arm-frees:".into());
+        for (stmt, entries) in &facts.arm_free_sites {
+            for e in entries {
+                emitf(format!(
+                    "  @line {} {} tag {} nothing_on={} keeps: {}",
+                    line_of(*stmt),
+                    e.carrier,
+                    render_tag(&e.tag, &line_of),
+                    e.nothing_on,
+                    render_keeps(&e.keeps)
+                ));
+            }
+        }
+    }
+
+    if !facts.arm_rebind_frees.is_empty() {
+        emitf("arm-rebind-frees:".into());
+        for (stmt, entries) in &facts.arm_rebind_frees {
+            for e in entries {
+                emitf(format!(
+                    "  @line {} {} tag {} nothing_on={} keeps: {}",
+                    line_of(*stmt),
+                    e.carrier,
+                    render_tag(&e.tag, &line_of),
+                    e.nothing_on,
+                    render_keeps(&e.keeps)
+                ));
+            }
+        }
+    }
+
+    if !facts.join_tags.is_empty() {
+        emitf("join-tags:".into());
+        for (stmt, defer) in &facts.join_tags {
+            emitf(format!("  @line {} -> {defer}", line_of(*stmt)));
+        }
+    }
+
+    if !facts.call_tags.is_empty() {
+        emitf("call-tags:".into());
+        for (expr, defers) in &facts.call_tags {
+            let list = defers
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            emitf(format!("  @line {} -> [{list}]", line_of(*expr)));
+        }
+    }
+
+    if !facts.move_poisons.is_empty() {
+        emitf("move-poisons:".into());
+        for (stmt, names) in &facts.move_poisons {
+            let list = names.iter().cloned().collect::<Vec<_>>().join(" ");
+            emitf(format!("  @line {}: {list}", line_of(*stmt)));
+        }
+    }
+
+    if !facts.store_ghost_keeps.is_empty() {
+        emitf("store-ghost-keeps:".into());
+        for (stmt, ghosts) in &facts.store_ghost_keeps {
+            let list = ghosts
+                .iter()
+                .map(|g| g.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            emitf(format!("  @line {} ghosts [{list}]", line_of(*stmt)));
+        }
+    }
+
+    if !facts.ctor_ghost_keeps.is_empty() {
+        emitf("ctor-ghost-keeps:".into());
+        for (expr, keeps) in &facts.ctor_ghost_keeps {
+            for (entry, ghost) in keeps {
+                emitf(format!(
+                    "  @line {} entry {entry} ghost {ghost}",
+                    line_of(*expr)
+                ));
+            }
+        }
+    }
+
+    if !facts.fn_scope_keys.is_empty() {
+        emitf("fn-scope-keys:".into());
+        for (fn_ptr, (owner, arm)) in &facts.fn_scope_keys {
+            emitf(format!(
+                "  fn @line {} -> (@line {}, arm {arm})",
+                line_of(*fn_ptr),
+                line_of(*owner)
+            ));
+        }
+    }
+
+    if !facts.fn_touched.is_empty() {
+        emitf("fn-touched:".into());
+        for (fn_ptr, names) in &facts.fn_touched {
+            let list = names.iter().cloned().collect::<Vec<_>>().join(" ");
+            emitf(format!("  fn @line {}: {list}", line_of(*fn_ptr)));
+        }
+    }
+
+    if !facts.fn_capture_depths.is_empty() {
+        emitf("fn-capture-depths:".into());
+        for (fn_ptr, captures) in &facts.fn_capture_depths {
+            for (name, depth) in captures {
+                emitf(format!("  fn @line {} {name} @d{depth}", line_of(*fn_ptr)));
+            }
+        }
+    }
+
+    if !facts.fn_body_depths.is_empty() {
+        emitf("fn-body-depths:".into());
+        for (fn_ptr, depth) in &facts.fn_body_depths {
+            emitf(format!("  fn @line {} @d{depth}", line_of(*fn_ptr)));
+        }
+    }
+
+    if !facts.adopt_lines.is_empty() {
+        emitf("adopt-lines:".into());
+        for (name, line) in &facts.adopt_lines {
+            emitf(format!("  {name} @line {line}"));
+        }
+    }
+
+    if !facts.diagnostics.is_empty() {
+        emitf("diagnostics:".into());
+        for d in &facts.diagnostics {
+            emitf(format!("  {}", d.render()));
+        }
+    }
+
+    out
+}
+
+struct LineCollector<'a> {
+    lines: &'a mut BTreeMap<NodeId, u32>,
+    current_line: u32,
+}
+
+impl crate::visit::Visitor for LineCollector<'_> {
+    type Break = std::convert::Infallible;
+
+    fn enter_stmt(&mut self, stmt: &Stmt) -> Result<(), Self::Break> {
+        self.current_line = stmt.loc().line;
+        self.lines.insert(stmt.id(), stmt.loc().line);
+        Ok(())
+    }
+
+    fn enter_expr(&mut self, expr: &Expr) -> Result<(), Self::Break> {
+        // A ctor carries its own line (the site's); every other
+        // expression borrows its enclosing statement's — the only
+        // location the tree offers them.
+        let line = match expr {
+            Expr::TableCtor { line, .. } => *line,
+            _ => self.current_line,
+        };
+        self.lines.insert(expr.id(), line);
+        Ok(())
+    }
+}
+
+fn resolve_ty(facts: &ShapeFacts, ty: &crate::shape::Ty) -> crate::shape::Ty {
+    facts.resolved(ty)
+}
+
+fn render_keeps(keeps: &[crate::shape::Keep]) -> String {
+    keeps
+        .iter()
+        .map(|k| match k {
+            crate::shape::Keep::Name(n) => n.clone(),
+            crate::shape::Keep::Ghost(g) => format!("ghost {g}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_tag(tag: &crate::shape::TagSrc, line_of: &impl Fn(NodeId) -> u32) -> String {
+    match tag {
+        crate::shape::TagSrc::If(stmt) => format!("if @line {}", line_of(*stmt)),
+        crate::shape::TagSrc::Call(expr) => format!("call @line {}", line_of(*expr)),
+    }
 }
 
 #[cfg(test)]

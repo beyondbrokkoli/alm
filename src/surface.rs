@@ -130,9 +130,12 @@ mod tests {
 
     #[test]
     fn unknown_flag_refusal_wording_is_mirror_exact() {
+        // (L3 receipt: the example flag switched from `--module-root=`,
+        // which L3 parses as pipeline configuration — the wording law
+        // itself is unchanged.)
         assert_eq!(
-            Flag::parse("--module-root=cases/modules").unwrap_err(),
-            "alm compiler error: Unknown flag '--module-root=cases/modules'. \
+            Flag::parse("--len=run").unwrap_err(),
+            "alm compiler error: Unknown flag '--len=run'. \
              Flags must come before the source file."
         );
     }

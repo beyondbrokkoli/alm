@@ -1,28 +1,34 @@
 use alm::diag::Diagnostic;
-use alm::dump::render_ast;
+use alm::dump::{render_ast, render_shape};
 use alm::lexer::{self, LexOutput};
-use alm::pipeline::front;
+use alm::pipeline::{analyze_stage, front};
 use alm::source::SourceFile;
 use alm::surface::{Flag, Surface};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 const HELP: &str = "\
-Usage: alm [--index-base=0|1] [--for-limit=exclusive|inclusive] <mode> <file.lua>
+Usage: alm [--index-base=0|1] [--for-limit=exclusive|inclusive] [--module-root=DIR] <mode> <file.lua>
 
 Modes:
-  (none)          run the front end (lex + parse + desugar). Parse
-                  failures render the diagnostics on stderr, exit 1;
-                  a clean parse exits 0 silently (the compile-success
-                  print arrives with the backend layers).
+  (none)          run the front end, the require splice, and the shape
+                  walk. Failures render the diagnostics on stderr, exit
+                  1; a clean compile exits 0 silently (the
+                  compile-success print arrives with the backend layers).
   --dump-tokens   lex only; one token per line as `<kind> <start>..<end>`
                   (byte spans).
   --dump-ast      parse and print the post-desugar AST, one node per
                   line: statement `@line` attribution, constructor
                   slots with positional/explicit provenance, and the
                   desugar latches (`for$limit`, tuple temps).
+  --dump-shape    walk and print the shape facts: one site per line with
+                  its element type and layout verdict, plus the
+                  ownership, ghost, and fn-face fact families.
 
 Flags must come before the source file; they resolve once into the
-surface and are read at named seams only.";
+surface and are read at named seams only. --module-root anchors the
+module tree for dotted requires (require(\"a.b\") resolves to
+DIR/a/b.lua) — pipeline configuration, not a surface law.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -38,6 +44,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), String> {
     let mut surface = Surface::default();
     let mut dump: Option<&str> = None;
+    let mut module_root: Option<PathBuf> = None;
     let mut source: Option<&String> = None;
     for arg in args {
         if source.is_some() {
@@ -49,11 +56,28 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{HELP}");
             return Ok(());
         }
-        if arg == "--dump-tokens" || arg == "--dump-ast" {
+        if arg == "--dump-tokens" || arg == "--dump-ast" || arg == "--dump-shape" {
             if dump.is_some() {
-                return Err("alm compiler error: pick one of --dump-tokens or --dump-ast".into());
+                return Err(
+                    "alm compiler error: pick one of --dump-tokens, --dump-ast or --dump-shape"
+                        .into(),
+                );
             }
             dump = Some(arg);
+            continue;
+        }
+        if let Some(raw) = arg.strip_prefix("--module-root=") {
+            // Pipeline configuration, parsed beside the [surface]
+            // flags with mirror's exact refusal wording — it anchors a
+            // filesystem tree, so it never rides `Surface`.
+            if raw.is_empty() {
+                return Err(
+                    "alm compiler error: --module-root requires a directory path \
+                     (require(\"a.b\") resolves to DIR/a/b.lua — the flag anchors the tree)"
+                        .into(),
+                );
+            }
+            module_root = Some(raw.into());
             continue;
         }
         if arg.starts_with('-') {
@@ -65,7 +89,7 @@ fn run(args: &[String]) -> Result<(), String> {
 
     let Some(path) = source else {
         return Err(
-            "alm compiler error: Usage: alm [flags] (--dump-tokens | --dump-ast) <file.lua> (see --help)"
+            "alm compiler error: Usage: alm [flags] (--dump-tokens | --dump-ast | --dump-shape) <file.lua> (see --help)"
                 .into(),
         );
     };
@@ -85,7 +109,7 @@ fn run(args: &[String]) -> Result<(), String> {
             dump_tokens(&out, &mut stdout.lock())
                 .map_err(|e| format!("alm compiler error: failed to write token dump: {e}"))
         }
-        Some(_) => {
+        Some("--dump-ast") => {
             // --dump-ast: parse failures render exactly like the
             // compiler's (all diagnostics, mirror's fail_build shape).
             let out = front(&src, &surface);
@@ -97,13 +121,22 @@ fn run(args: &[String]) -> Result<(), String> {
             write_all(&text, &mut stdout.lock())
                 .map_err(|e| format!("alm compiler error: failed to write AST dump: {e}"))
         }
-        None => {
-            let out = front(&src, &surface);
-            if !out.is_ok() {
-                fail_build(&out.diagnostics);
-            }
-            Ok(())
+        Some(_) => {
+            // --dump-shape: refusals at any of the three stages render
+            // exactly like the compiler's.
+            let out = match analyze_stage(&src, &surface, module_root.as_deref(), true) {
+                Ok(out) => out,
+                Err((_, diags)) => fail_build(&diags),
+            };
+            let text = render_shape(&out.facts, &out.ast);
+            let stdout = std::io::stdout();
+            write_all(&text, &mut stdout.lock())
+                .map_err(|e| format!("alm compiler error: failed to write shape dump: {e}"))
         }
+        None => match analyze_stage(&src, &surface, module_root.as_deref(), true) {
+            Ok(_) => Ok(()),
+            Err((_, diags)) => fail_build(&diags),
+        },
     }
 }
 
@@ -223,7 +256,17 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            "alm compiler error: pick one of --dump-tokens or --dump-ast"
+            "alm compiler error: pick one of --dump-tokens, --dump-ast or --dump-shape"
+        );
+    }
+
+    #[test]
+    fn empty_module_root_refusal_is_mirror_wording() {
+        let err = run(&["--module-root=".to_string(), "x.lua".to_string()]).unwrap_err();
+        assert_eq!(
+            err,
+            "alm compiler error: --module-root requires a directory path \
+             (require(\"a.b\") resolves to DIR/a/b.lua — the flag anchors the tree)"
         );
     }
 }

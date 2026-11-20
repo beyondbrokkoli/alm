@@ -2,6 +2,7 @@ use crate::ast::{BinOp, CtorKey, Expr, Loc, NodeId, Stmt, UnOp};
 use crate::diag::Diagnostic;
 use crate::elaborate::TupleTarget;
 use crate::lexer::Token;
+use crate::shape::BOUNDS_FAIL_THRESHOLD;
 use crate::source::SourceFile;
 use crate::surface::Surface;
 use std::collections::BTreeSet;
@@ -10,11 +11,6 @@ use std::iter::Peekable;
 pub struct ParseError(pub Diagnostic);
 
 pub const MAX_EXPR_DEPTH: usize = 1024;
-
-/// [index-base] Mirror home: shape/core.rs @ 87aca4c (re-homes there
-/// when the shape tree ports at L5). Duplicated so the front end ports
-/// without the shape tree; same value, one fact.
-pub const BOUNDS_FAIL_THRESHOLD: i64 = i64::MAX / 8;
 
 struct Tokens<'a> {
     inner: Peekable<std::vec::IntoIter<(Token<'a>, usize)>>,
