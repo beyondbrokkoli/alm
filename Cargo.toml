@@ -1,0 +1,18 @@
+[package]
+name = "alm"
+version = "0.1.0"
+edition = "2024"
+
+# [index-base] Parity pin: the lexer is ported behavior-identically from
+# mirror_experimental @ 87aca4c, which builds against logos 0.16.1. Match
+# resolution and span behavior must not drift between the two compilers.
+[dependencies]
+logos = "=0.16.1"
+
+[lib]
+name = "alm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "alm"
+path = "src/main.rs"
