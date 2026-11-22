@@ -8,13 +8,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const HELP: &str = "\
-Usage: alm [--index-base=0|1] [--for-limit=exclusive|inclusive] [--module-root=DIR] <mode> <file.lua>
+Usage: alm [--index-base=0|1] [--for-limit=exclusive|inclusive] [--module-root=DIR] [--exe|--lib] <mode> <file.lua>
 
 Modes:
-  (none)          run the front end, the require splice, and the shape
-                  walk. Failures render the diagnostics on stderr, exit
-                  1; a clean compile exits 0 silently (the
-                  compile-success print arrives with the backend layers).
+  (none)          run the front end, the require splice, the shape
+                  walk + checker, and the ffi gate. Failures render
+                  the diagnostics on stderr, exit 1; a clean compile
+                  exits 0 silently (the compile-success print arrives
+                  with the backend layers).
   --dump-tokens   lex only; one token per line as `<kind> <start>..<end>`
                   (byte spans).
   --dump-ast      parse and print the post-desugar AST, one node per
@@ -23,12 +24,15 @@ Modes:
                   desugar latches (`for$limit`, tuple temps).
   --dump-shape    walk and print the shape facts: one site per line with
                   its element type and layout verdict, plus the
-                  ownership, ghost, and fn-face fact families.
+                  ownership, ghost, fn-face, and checker fact families.
 
 Flags must come before the source file; they resolve once into the
 surface and are read at named seams only. --module-root anchors the
 module tree for dotted requires (require(\"a.b\") resolves to
-DIR/a/b.lua) — pipeline configuration, not a surface law.";
+DIR/a/b.lua) — pipeline configuration, not a surface law. --exe links
+a standalone executable and --lib a shared library (the default; the
+linking itself arrives with the backend layers — the ffi gate reads
+the mode now: ffi.load is --exe-only).";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,6 +49,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut surface = Surface::default();
     let mut dump: Option<&str> = None;
     let mut module_root: Option<PathBuf> = None;
+    // [ffi] The link mode, parsed like --module-root (pipeline
+    // configuration): the ffi gate reads it now; the linking itself is
+    // L9's. mirror's law — last flag wins, no refusal for repeats.
+    let mut standalone = false;
     let mut source: Option<&String> = None;
     for arg in args {
         if source.is_some() {
@@ -64,6 +72,14 @@ fn run(args: &[String]) -> Result<(), String> {
                 );
             }
             dump = Some(arg);
+            continue;
+        }
+        if arg == "--exe" {
+            standalone = true;
+            continue;
+        }
+        if arg == "--lib" {
+            standalone = false;
             continue;
         }
         if let Some(raw) = arg.strip_prefix("--module-root=") {
@@ -122,9 +138,10 @@ fn run(args: &[String]) -> Result<(), String> {
                 .map_err(|e| format!("alm compiler error: failed to write AST dump: {e}"))
         }
         Some(_) => {
-            // --dump-shape: refusals at any of the three stages render
+            // --dump-shape: refusals at any of the stages render
             // exactly like the compiler's.
-            let out = match analyze_stage(&src, &surface, module_root.as_deref(), true) {
+            let out = match analyze_stage(&src, &surface, module_root.as_deref(), true, standalone)
+            {
                 Ok(out) => out,
                 Err((_, diags)) => fail_build(&diags),
             };
@@ -133,7 +150,7 @@ fn run(args: &[String]) -> Result<(), String> {
             write_all(&text, &mut stdout.lock())
                 .map_err(|e| format!("alm compiler error: failed to write shape dump: {e}"))
         }
-        None => match analyze_stage(&src, &surface, module_root.as_deref(), true) {
+        None => match analyze_stage(&src, &surface, module_root.as_deref(), true, standalone) {
             Ok(_) => Ok(()),
             Err((_, diags)) => fail_build(&diags),
         },

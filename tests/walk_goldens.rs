@@ -8,7 +8,9 @@ mod common;
 
 use alm::pipeline::analyze_stage;
 use alm::source::SourceFile;
-use common::{cases_dir, collect_lua_files, is_front_refusal, module_root, surface_flags_of};
+use common::{
+    cases_dir, collect_lua_files, is_front_refusal, module_root, standalone_of, surface_flags_of,
+};
 use std::path::{Path, PathBuf};
 
 fn goldens_dir() -> PathBuf {
@@ -54,10 +56,11 @@ fn walk_goldens_freeze_the_corpus() {
                 let text = text.clone();
                 move || {
                     let surface = surface_flags_of(&text);
+                    let standalone = standalone_of(&text);
                     let src = SourceFile::new(path, text);
                     let root = module_root();
-                    match analyze_stage(&src, &surface, Some(&root), true) {
-                        // A walk refusal still dumps — the diagnostics
+                    match analyze_stage(&src, &surface, Some(&root), true, standalone) {
+                        // A refusal still dumps — the diagnostics
                         // section is part of the frozen surface. Front
                         // and Modules refusals have no walk to freeze;
                         // their parity lives in the analyze-parity leg.

@@ -262,10 +262,11 @@ pub fn parse_parts(source: &str) -> Vec<alm::ast::Stmt> {
     out.ast
 }
 
-/// The L3 analyze leg's driver: front + splice + walk with the
-/// `walk_pins` lever, on a thread with the sweep's stack headroom. A
-/// panic maps to `Stage::Panicked` exactly as mirror's catch_unwind
-/// harness does.
+/// The L3+ analyze leg's driver: front + splice + walk + checker with
+/// the `walk_pins` lever, on a thread with the sweep's stack headroom.
+/// A panic maps to `Stage::Panicked` exactly as mirror's catch_unwind
+/// harness does. The case's `--exe`/`--lib` FLAGS ride along (the ffi
+/// gate's law).
 pub fn analyze_with_lever(
     path: String,
     text: String,
@@ -275,10 +276,11 @@ pub fn analyze_with_lever(
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
             let surface = surface_flags_of(&text);
+            let standalone = standalone_of(&text);
             let src = SourceFile::new(path, text);
             let root = module_root();
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                alm::pipeline::analyze_stage(&src, &surface, Some(&root), walk_pins)
+                alm::pipeline::analyze_stage(&src, &surface, Some(&root), walk_pins, standalone)
             })) {
                 Ok(Ok(out)) => Ok(alm::dump::render_shape(&out.facts, &out.ast)),
                 Ok(Err((stage, diags))) => {
@@ -295,6 +297,26 @@ pub fn analyze_with_lever(
         .expect("spawn sweep thread")
         .join()
         .unwrap_or_else(|_| Err((alm::pipeline::Stage::Panicked, "thread panicked".into())))
+}
+
+/// The case's link mode from its `-- FLAGS:` header — `--exe` arms
+/// standalone (exempting the ffi gate), `--lib` or nothing is the
+/// default shared-library mode. Last flag wins, mirror's law.
+pub fn standalone_of(text: &str) -> bool {
+    let mut standalone = false;
+    for word in text
+        .lines()
+        .find_map(|l| l.strip_prefix("-- FLAGS:"))
+        .into_iter()
+        .flat_map(str::split_whitespace)
+    {
+        match word {
+            "--exe" => standalone = true,
+            "--lib" => standalone = false,
+            _ => {}
+        }
+    }
+    standalone
 }
 
 /// The frozen front-refusal catalog: corpus files the front end (lex +

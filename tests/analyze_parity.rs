@@ -1,31 +1,39 @@
-//! The walk-tier parity leg vs the frozen mirror oracle (the
-//! FRONT_REFUSALS pattern, continued at the Analyze boundary): the
-//! corpus is the specification, and the rebuilt mirror release binary
-//! at 87aca4c is the oracle it runs against.
+//! The Analyze-tier parity leg vs the frozen mirror oracle (the
+//! FRONT_REFUSALS pattern, continued): the corpus is the
+//! specification, and the rebuilt mirror release binary at 87aca4c is
+//! the oracle it runs against — now with the checker interleaved
+//! (L4), the leg is the checker's acceptance bar.
 //!
-//! Three frozen catalogs classify every front-clean case (release vs
-//! release, modulo the sanctioned ALM_TRACE poke lines):
+//! Release-vs-release, modulo the sanctioned `ALM_TRACE:` poke lines.
+//! mirror compiles, links, AND runs its artifact; the oracle's
+//! verdict therefore splits two ways a compile-only comparison must
+//! not conflate:
 //!
-//! - `WALK_REFUSALS` (61): both compilers refuse; the FIRST
-//!   diagnostic is byte-identical (walk-tier truth — the full stderr
-//!   may carry checker-tier trailing lines mirror also prints).
-//! - `CHECKER_OWNED` (61): mirror's first failure is
-//!   checker-tier; alm's walk accepts or diverges — **L4's acceptance
-//!   bar** (the checker ports until this catalog is empty).
-//! - `CHECKER_MEDIATED` (9): mirror ACCEPTS because its
-//!   interleaved checker unifies the site unknowns before
-//!   `check_row_reads` resolves them (`lat.unify(&elem, &val_ty)` in
-//!   the checker's IndexAssign arm); alm's walk-only pass fires the
-//!   row-read diagnostic — **L4 retires these**.
+//! - a COMPILE refusal — first stderr line `line …` or
+//!   `alm compiler error: …`, exit 1. alm must refuse with the
+//!   byte-identical first diagnostic (`WALK_REFUSALS` ∪
+//!   `CHECKER_REFUSALS` — the walk still breaks the interleave
+//!   first, so the walk's own sixty-one keep their first line).
+//! - a RUN refusal — first stderr line `alm runtime error:` /
+//!   `alm fatal:` / `alm: …` after a successful compile+link (the
+//!   artifact's abort, nonzero exit). alm has no runtime yet: it
+//!   compiles these clean, and they freeze as `RUNTIME_OWNED` —
+//!   L9's ledger, when the corpus becomes runnable.
 //!
-//! The hard law: mirror accepts => alm accepts, except the mediated
-//! nine; and alm never refuses outside the catalogs (drift tripwire).
+//! `CHECKER_MEDIATED` (L3's nine) is retired: the interleaved
+//! checker unifies the site unknowns before `check_row_reads`
+//! resolves them, so the walk-only over-rejection is gone — mirror
+//! accepts ⇒ alm accepts, no exceptions.
+//!
+//! Hard law: mirror compile-accepts ⇒ alm accepts; both compile-refuse
+//! ⇒ first diagnostic byte-exact; and no divergence outside the
+//! catalogs (drift tripwire).
 
 mod common;
 
 use alm::pipeline::analyze_stage;
 use alm::source::SourceFile;
-use common::{cases_dir, collect_lua_files, is_front_refusal, module_root, surface_flags_of};
+use common::{cases_dir, collect_lua_files, is_front_refusal, module_root, standalone_of};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -64,8 +72,8 @@ pub const WALK_REFUSALS: &[&str] = &[
     "index_base1_row_housing_conflict.lua",
     "len_string_scalar_rejected.lua",
     "line_number_pin.lua",
-    "alpha.lua",
-    "beta.lua",
+    "modules/cycle/alpha.lua",
+    "modules/cycle/beta.lua",
     "moved_in_loop_rejected.lua",
     "moved_twice_rejected.lua",
     "move_poisoning_rejected.lua",
@@ -93,26 +101,20 @@ pub const WALK_REFUSALS: &[&str] = &[
     "while_body_borrow_conflict_rejected.lua",
 ];
 
-pub const CHECKER_OWNED: &[&str] = &[
-    "22_interop_panic_div_zero.lua",
+/// The checker's own compile refusals (L4's bar): mirror's first
+/// failure is checker- or ffi-gate-tier; alm's walk+checker must
+/// refuse with the byte-identical first diagnostic.
+pub const CHECKER_REFUSALS: &[&str] = &[
     "any_adopt_key_neg.lua",
     "any_adopt_read_neg.lua",
-    "args_any_len_int_panic.lua",
-    "args_any_len_str.lua",
     "args_bool_int_reject.lua",
-    "args_boundary_death.lua",
     "args_key_conflict.lua",
     "args_mixed_reject.lua",
-    "assert_fail_msg.lua",
-    "async_resume_invalid_panics.lua",
-    "async_yield_drain_word_panics.lua",
     "boundary_lane_mixed_store_rejected.lua",
     "boundary_lane_str_dispatch_rejected.lua",
     "concat_reject_mixed.lua",
     "ctor_expr_key_type_rejected.lua",
     "cyclic_ctor_assign_rejected.lua",
-    "div_zero_runtime_error.lua",
-    "error_raises.lua",
     "error_value_position_rejected.lua",
     "escape_block_local_dispatch_rejected.lua",
     "escape_cond_mint_rejected.lua",
@@ -132,8 +134,6 @@ pub const CHECKER_OWNED: &[&str] = &[
     "ffi_sizeof_unknown_name.lua",
     "ffi_so_load_refused.lua",
     "ffi_static_key_over_capacity.lua",
-    "fill_reserve_huge_bound_panic.lua",
-    "fill_reserve_offset_wrap_panic.lua",
     "fixed_math_monomorphic_rejected.lua",
     "fn_monomorphic_return_rejected.lua",
     "fn_mutual_recursion_rejected.lua",
@@ -144,29 +144,36 @@ pub const CHECKER_OWNED: &[&str] = &[
     "fn_value_table_rejected.lua",
     "index_nontable_rejected.lua",
     "len_defer_pin_neg.lua",
-    "counter.lua",
-    "counter.lua",
+    "modules/shared/counter.lua",
+    "rebind_scalar_conflict_rejected.lua",
+    "rebind_scalar_table_cross_rejected.lua",
+    "redecl_same_scope_rejected.lua",
+    "type_errors.lua",
+];
+
+/// The run-tier ledger (L9's bar): mirror compiles and links these
+/// clean, then the ARTIFACT refuses at run/abort time (`alm runtime
+/// error:`, `alm fatal:`, `alm: …`). alm has no runtime — it compiles
+/// them clean, byte-for-nothing to compare yet; the corpus run lane
+/// (L9) owns their parity.
+pub const RUNTIME_OWNED: &[&str] = &[
+    "22_interop_panic_div_zero.lua",
+    "args_any_len_int_panic.lua",
+    "args_any_len_str.lua",
+    "args_boundary_death.lua",
+    "assert_fail_msg.lua",
+    "async_resume_invalid_panics.lua",
+    "async_yield_drain_word_panics.lua",
+    "div_zero_runtime_error.lua",
+    "error_raises.lua",
+    "fill_reserve_huge_bound_panic.lua",
+    "fill_reserve_offset_wrap_panic.lua",
     "nested_fill_nil_row_store_runtime_error.lua",
     "nested_oob_row_store_runtime_error.lua",
     "null_host_inner_fill_base1_inclusive_panic.lua",
     "null_host_inner_fill_base1_panic.lua",
-    "rebind_scalar_conflict_rejected.lua",
-    "rebind_scalar_table_cross_rejected.lua",
-    "redecl_same_scope_rejected.lua",
+    "modules/selfref/counter.lua",
     "tuple_displace_wip.lua",
-    "type_errors.lua",
-];
-
-pub const CHECKER_MEDIATED: &[&str] = &[
-    "cross_arm_row_adoption.lua",
-    "ctor_expr_keys_tables.lua",
-    "ctor_nested.lua",
-    "nested_alias_row_decided.lua",
-    "nested_fill_ctor_row_reserve.lua",
-    "nested_fill_minted_rows.lua",
-    "nested_inner_first_touch_sizing.lua",
-    "nested_shapes.lua",
-    "soundness_edge_gauntlet.lua",
 ];
 
 fn mirror_binary() -> PathBuf {
@@ -181,12 +188,13 @@ fn mirror_binary() -> PathBuf {
     p
 }
 
-/// mirror's verdict: (accepted, first filtered stderr line).
-fn mirror_run(binary: &PathBuf, case: &PathBuf, flags: &[String]) -> (bool, String) {
+/// mirror's verdict: (accepted, first filtered stderr line, the
+/// stderr's run-tier shape).
+fn mirror_run(binary: &PathBuf, case: &PathBuf, flags: &[String]) -> (bool, String, bool) {
     // The oracle writes its build artifacts (alm_out*, .alm_rt_trace)
     // into its working directory — run it from a scratch dir so the
     // alm tree stays clean.
-    let scratch = std::env::temp_dir().join("alm_l3_parity_scratch");
+    let scratch = std::env::temp_dir().join("alm_l4_parity_scratch");
     std::fs::create_dir_all(&scratch).expect("scratch dir");
     let out = Command::new(binary)
         .args(flags)
@@ -201,20 +209,29 @@ fn mirror_run(binary: &PathBuf, case: &PathBuf, flags: &[String]) -> (bool, Stri
         .find(|l| !l.starts_with("ALM_TRACE:"))
         .unwrap_or_default()
         .to_string();
-    (out.status.success(), first)
+    // The run tier's signatures: the artifact aborts after a clean
+    // compile+link (`alm runtime error:`, `alm fatal:`, `alm: `, the
+    // host's boundary report) —
+    // compile refusals read `line N: …` or `alm compiler error: …`.
+    let runtime_tier = first.starts_with("alm runtime error:")
+        || first.starts_with("alm fatal:")
+        || first.starts_with("alm: ")
+        || first.starts_with("[alm host]");
+    (out.status.success(), first, runtime_tier)
 }
 
-/// alm's walk verdict: (accepted, first diagnostic line).
-fn alm_walk(name: &str, text: &str) -> (bool, String) {
+/// alm's walk+checker verdict: (accepted, first diagnostic line).
+fn alm_analyze(name: &str, text: &str) -> (bool, String) {
     let name = name.to_string();
     let text = text.to_string();
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
-            let surface = surface_flags_of(&text);
+            let surface = common::surface_flags_of(&text);
+            let standalone = standalone_of(&text);
             let src = SourceFile::new(name, text);
             let root = module_root();
-            match analyze_stage(&src, &surface, Some(&root), true) {
+            match analyze_stage(&src, &surface, Some(&root), true, standalone) {
                 Ok(_) => (true, String::new()),
                 Err((_stage, diags)) => {
                     let first = diags.first().map(|d| d.render()).unwrap_or_default();
@@ -235,7 +252,7 @@ fn case_flags(text: &str) -> Vec<String> {
 }
 
 #[test]
-fn walk_tier_parity_against_the_frozen_oracle() {
+fn analyze_tier_parity_against_the_frozen_oracle() {
     let binary = mirror_binary();
 
     let mut files = Vec::new();
@@ -244,56 +261,62 @@ fn walk_tier_parity_against_the_frozen_oracle() {
     assert!(files.len() >= 449, "corpus pool shrank: {}", files.len());
 
     let mut both_accept = 0usize;
-    let mut walk_tier = 0usize;
+    let mut compile_refusals = 0usize;
+    let mut runtime_owned = 0usize;
     for path in &files {
         let name = path
+            .strip_prefix(cases_dir())
+            .ok()
+            .and_then(|r| r.to_str())
+            .map(|r| r.replace('\\', "/"))
+            .unwrap_or_default();
+        let base = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        if is_front_refusal(&name) {
+        if is_front_refusal(&base) {
             continue;
         }
         let text =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let (m_ok, m_first) = mirror_run(&binary, path, &case_flags(&text));
-        let (a_ok, a_first) = alm_walk(&name, &text);
+        let (m_ok, m_first, m_runtime) = mirror_run(&binary, path, &case_flags(&text));
+        let (a_ok, a_first) = alm_analyze(&base, &text);
 
         if m_ok {
-            if a_ok {
-                both_accept += 1;
-            } else if CHECKER_MEDIATED.contains(&name.as_str()) {
-                // the documented shape: a walk-tier refusal the checker
-                // retires (all nine carry the row-read diagnostic)
-                assert!(
-                    a_first.starts_with("line ")
-                        && a_first.contains("Type Error: a row of")
-                        && a_first.contains("is read before it is ever given a value"),
-                    "{name} left the mediated shape: {a_first}"
-                );
-            } else {
-                panic!(
-                    "the walk over-rejects {name} — mirror accepts:
-  alm: {a_first}"
-                );
-            }
-        } else if a_ok {
+            both_accept += 1;
             assert!(
-                CHECKER_OWNED.contains(&name.as_str()),
-                "{name} accepted where the oracle refuses — uncatalogued divergence                  (mirror: {m_first})"
+                a_ok,
+                "the checker over-rejects {name} — the oracle accepts:\n  alm: {a_first}"
+            );
+        } else if m_runtime {
+            // the run tier is L9's ledger: mirror's refusal is the
+            // artifact's, not the compile's — alm compiles it clean.
+            // (The host's boundary report prints on clean runs too —
+            // the exit status refuses, the line classifies.)
+            assert!(
+                RUNTIME_OWNED.contains(&name.as_str()),
+                "{name} hit the run tier outside RUNTIME_OWNED — the oracle's first line moved: {m_first}"
+            );
+            runtime_owned += 1;
+            assert!(
+                a_ok,
+                "{name} must compile clean until the runtime lands (L9) — alm: {a_first}"
             );
         } else {
             assert!(
-                WALK_REFUSALS.contains(&name.as_str()) || CHECKER_OWNED.contains(&name.as_str()),
-                "{name} refuses outside every catalog — drift                  (mirror: {m_first}; alm: {a_first})"
+                !a_ok,
+                "{name}: the oracle refuses but alm accepts — uncatalogued divergence (mirror: {m_first})"
             );
-            if WALK_REFUSALS.contains(&name.as_str()) {
-                walk_tier += 1;
-                assert_eq!(
-                    m_first, a_first,
-                    "{name}: the walk-tier first diagnostic drifted from the oracle"
-                );
-            }
+            assert!(
+                WALK_REFUSALS.contains(&name.as_str()) || CHECKER_REFUSALS.contains(&name.as_str()),
+                "{name} refuses outside every catalog — drift (mirror: {m_first}; alm: {a_first})"
+            );
+            compile_refusals += 1;
+            assert_eq!(
+                m_first, a_first,
+                "{name}: the first diagnostic drifted from the oracle"
+            );
         }
     }
     assert!(
@@ -301,13 +324,19 @@ fn walk_tier_parity_against_the_frozen_oracle() {
         "the accepted pool shrank: {both_accept}"
     );
     assert_eq!(
-        walk_tier,
-        WALK_REFUSALS.len(),
-        "a walk-tier case went missing"
+        compile_refusals,
+        WALK_REFUSALS.len() + CHECKER_REFUSALS.len(),
+        "a compile-refusal case went missing"
+    );
+    assert_eq!(
+        runtime_owned,
+        RUNTIME_OWNED.len(),
+        "a run-tier case went missing"
     );
     eprintln!(
-        "parity: {both_accept} both-accept, {walk_tier} walk-tier byte-exact,          {} checker-owned, {} checker-mediated (L4's ledger)",
-        CHECKER_OWNED.len(),
-        CHECKER_MEDIATED.len()
+        "parity: {both_accept} both-accept, {compile_refusals} compile refusals byte-exact \
+         ({} walk + {} checker), {runtime_owned} runtime-owned (L9's ledger)",
+        WALK_REFUSALS.len(),
+        CHECKER_REFUSALS.len(),
     );
 }

@@ -1,19 +1,17 @@
-use super::type_name::type_name;
+use super::checker::type_name;
 use crate::ast::NodeId;
 use crate::diag::Diagnostic;
 use crate::shape::Ty;
 use std::collections::BTreeMap;
 
-/// The constraint store. (L4 receipt: `unify` and the fn-value node
-/// minters are the checker's unification lane — they ride the walk's
-/// store now and wake when the checker ports; the walk itself only
-/// binds through the pins' `bind`.)
+/// The constraint store — the walk binds through the pins, the
+/// interleaved checker unifies (`unify`, `fresh`, the fn-value node
+/// minters are its lane).
 pub(super) struct UnknownStore {
     subs: BTreeMap<usize, Ty>,
     next_id: usize,
     boundary_seed: Option<usize>,
     fn_ret_nodes: BTreeMap<NodeId, usize>,
-    #[allow(dead_code)]
     fn_value_nodes: BTreeMap<NodeId, usize>,
 }
 
@@ -36,7 +34,6 @@ impl UnknownStore {
         id
     }
 
-    #[allow(dead_code)]
     pub(super) fn fresh(&mut self) -> Ty {
         Ty::Unknown(self.mint_id())
     }
@@ -59,7 +56,6 @@ impl UnknownStore {
         self.fn_ret_nodes.get(&fn_ptr).copied()
     }
 
-    #[allow(dead_code)]
     pub(super) fn ensure_fn_value(&mut self, fn_ptr: NodeId) -> usize {
         if let Some(&id) = self.fn_value_nodes.get(&fn_ptr) {
             return id;
@@ -69,7 +65,6 @@ impl UnknownStore {
         id
     }
 
-    #[allow(dead_code)]
     pub(super) fn fn_value_node(&self, fn_ptr: NodeId) -> Option<usize> {
         self.fn_value_nodes.get(&fn_ptr).copied()
     }
@@ -118,7 +113,6 @@ impl UnknownStore {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(super) fn unify(&mut self, expected: &Ty, actual: &Ty) -> Result<(), Diagnostic> {
         let expected = self.resolve(expected);
         let actual = self.resolve(actual);

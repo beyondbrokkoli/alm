@@ -42,6 +42,7 @@ pub enum Stage {
     Panicked,
     Front,
     Modules,
+    Ffi,
     Analyze,
 }
 
@@ -51,10 +52,20 @@ impl Stage {
             Stage::Panicked => "panicked",
             Stage::Front => "front (lexer/parser)",
             Stage::Modules => "require splice (module amalgamation)",
+            Stage::Ffi => "ffi gate (ffi.load is --exe-only)",
             Stage::Analyze => "shape analyzer + checker (one walk)",
         }
     }
 }
+
+/// [ffi] The acyclicity law, as link-time accounting: a .so may use
+/// the callee seam (cdef/new/sizeof — the M4 relaxation), but it may
+/// never itself load a shared object. Loading stays --exe-only; the
+/// verbs are the checker's resolved table, so the gate names the
+/// actual load, not any ffi mention. (mirror's exact wording.)
+const FFI_LOAD_EXE_ONLY: &str = "alm compiler error: ffi.load is --exe-only — a shared object \
+                                 may not load shared objects (the callee seam: a .so exposes \
+                                 alm_arg_kind/alm_exec, it never loads)";
 
 /// Lex + parse + desugar.
 ///
@@ -89,16 +100,19 @@ pub struct Analyzed {
     pub facts: shape::ShapeFacts,
 }
 
-/// Front → require splice → shape walk (L3's pipeline extent). The
-/// walk runs with the recording gate the `walk_pins` lever arms;
-/// surface laws ride `&Surface` (the P5 cure — the facts carry no
-/// surface field), and `module_root` anchors the require splice as
-/// plain pipeline configuration.
+/// Front → require splice → shape walk + checker (L4's pipeline
+/// extent) → the ffi gate. The walk runs with the recording gate the
+/// `walk_pins` lever arms; surface laws ride `&Surface` (the P5 cure
+/// — the facts carry no surface field), `module_root` anchors the
+/// require splice as plain pipeline configuration, and `standalone`
+/// is the link-mode flag the gate reads (`--exe`/`--lib` in main —
+/// the linking itself is L9's).
 pub fn analyze_stage(
     src: &SourceFile,
     surface: &Surface,
     module_root: Option<&Path>,
     walk_pins: bool,
+    standalone: bool,
 ) -> Result<Analyzed, (Stage, Vec<Diagnostic>)> {
     let front = front(src, surface);
     if !front.is_ok() {
@@ -106,13 +120,23 @@ pub fn analyze_stage(
     }
     // (mirror decision 8, kept: the splice runs ahead of the ffi gate
     // — inlining is compile-time and pure, and the amalgamated unit
-    // carries ffi only if the source does. The gate itself lands with
-    // the checker's verb table at L4.)
+    // carries ffi only if the source does.)
     let ast = require::expand(front.ast, surface, module_root).map_err(|d| (Stage::Modules, d))?;
     let ctx = analysis::build_context(&ast);
     let facts = shape::analyze(&ctx, walk_pins, surface);
     if !facts.diagnostics.is_empty() {
         return Err((Stage::Analyze, facts.diagnostics));
+    }
+    // The acyclicity law, as link-time accounting: a .so may use the
+    // callee seam (cdef/new/sizeof — the M4 relaxation), but it may
+    // never itself load a shared object.
+    if !standalone
+        && facts
+            .ffi_verbs
+            .values()
+            .any(|verb| matches!(verb, crate::shape::FfiVerb::Load))
+    {
+        return Err((Stage::Ffi, vec![Diagnostic::bare(FFI_LOAD_EXE_ONLY)]));
     }
     Ok(Analyzed { ast, facts })
 }

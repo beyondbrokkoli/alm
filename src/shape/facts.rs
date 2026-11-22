@@ -42,16 +42,123 @@ pub enum KeyShape {
     GuardOffset(i64),
 }
 
-/// [ownership] The walk's output — walk-minted facts only, never a
-/// surface field (the P5 cure: the lowerer will take `(ShapeFacts,
+/// One fn literal the checker collected — params, body text, and the
+/// monomorphic ret/signature the call expansions unify against.
+#[derive(Clone)]
+pub struct FnDef {
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
+    pub ret: Ty,
+    pub signature: Option<Vec<Ty>>,
+}
+
+impl FnDef {
+    pub fn body(&self) -> &[Stmt] {
+        &self.body
+    }
+}
+
+/// [ffi] One `ffi.new` mint, recorded at the call site the lowerer
+/// (L7) and the reserve-plan builder (L5) both consume straight. The
+/// elem/capacity come from the cdef registry at the checker's choke
+/// point — never re-derived downstream.
+#[derive(Clone, Debug)]
+pub struct FfiMint {
+    /// The local name the minted table binds (the second-writer
+    /// contract is per-name).
+    pub name: String,
+    pub elem: Ty,
+    pub capacity: i64,
+}
+
+/// [ffi] The checker's resolved verb table — one entry per accepted
+/// ffi/async call node; the gate and the lowerer read it straight.
+#[derive(Clone)]
+pub enum FfiVerb {
+    Load,
+    ArgKind,
+    Cdef,
+    New {
+        #[allow(dead_code)]
+        name: String,
+    },
+    Sizeof {
+        bytes: i64,
+    },
+    AsyncCreate,
+    AsyncResume,
+    AsyncYield,
+    AsyncStatus,
+    AsyncClose,
+    Drive {
+        base: String,
+        sym: String,
+    },
+}
+
+/// The M2 builtin table: assert/error/tonumber are checker builtins —
+/// a call whose name resolves to no user binding falls to the builtin
+/// table, the checker records the verb here, and the lowerer (L7)
+/// consumes it straight (the ffi_verbs seam, one lane over).
+#[derive(Clone)]
+pub enum BuiltinVerb {
+    Assert,
+    Error,
+    ToNumber,
+}
+
+/// Which lane an index key took — the instance record's per-node
+/// fact, minted by the checker's key check.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyLane {
+    Int,
+    Str,
+}
+
+/// A call expansion's identity. ROOT (0) is the script's own extent;
+/// every `mint_instance` mints the next id (per-compile deterministic:
+/// ROOT seeded at construction, first expansion 1 — the same sequence
+/// mirror's first compile mints; the counter is the Checker's own, not
+/// a process global, so the in-process sweeps compare equal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InstanceId(pub u32);
+
+impl InstanceId {
+    pub const ROOT: InstanceId = InstanceId(0);
+}
+
+/// [ownership] One call expansion's record. The checker writes it as
+/// the expansion runs; the lowerer (L7) reads the ret/env/key-lane/
+/// access faces to lower each site against its instance. (The whole
+/// struct rides `#[allow(dead_code)]` until then — mirror's readers
+/// are the lowerer's files.)
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct InstanceInfo {
+    pub call: Option<NodeId>,
+    pub fn_node: Option<NodeId>,
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
+    pub frame_base: usize,
+    pub break_base: usize,
+    pub env_face: Option<BTreeMap<String, Ty>>,
+    pub ret: Option<Ty>,
+    pub children: BTreeMap<NodeId, BTreeSet<InstanceId>>,
+    pub creation_envs: BTreeMap<NodeId, NodeId>,
+    pub closure_calls: BTreeSet<NodeId>,
+    pub index_key_lanes: BTreeMap<NodeId, KeyLane>,
+    pub access_elems: BTreeMap<NodeId, Ty>,
+}
+
+/// [ownership] The walk's output plus the checker's (the L4 merge: the
+/// interleaved checker mints its families into the same facts) — never
+/// a surface field (the P5 cure: the lowerer will take `(ShapeFacts,
 /// &Surface)` as two inputs; `index_base` is dropped forever).
 ///
-/// The diet ledger: L4 adds the checker-minted families (boundary_elem,
-/// local_types, fn_defs, env_faces, env_face_depths, closure_fields,
-/// call_fns, ffi_verbs, builtin_verbs, ffi_mints, instances); L5 adds
-/// fast_stores/reserve_plans; L6 adds the exit-fate families
-/// (do_exit_frees, root_exit_frees, stmt/cond/arm_temp_frees,
-/// ret_path_*, break_path_*, arm_do_exit_frees, arm_root_exit_frees).
+/// The diet ledger: L5 adds fast_stores/reserve_plans; L6 adds the
+/// exit-fate families (do_exit_frees, root_exit_frees,
+/// stmt/cond/arm_temp_frees, ret_path_*, break_path_*,
+/// arm_do_exit_frees, arm_root_exit_frees).
 #[derive(Clone)]
 pub struct ShapeFacts {
     pub sites: BTreeMap<NodeId, usize>,
@@ -75,13 +182,37 @@ pub struct ShapeFacts {
     pub fn_scope_keys: BTreeMap<NodeId, (NodeId, u8)>,
     pub fn_touched: BTreeMap<NodeId, BTreeSet<String>>,
     /// Each fn literal's capture name -> the walk-scope index its
-    /// binding lives at, minted at definition. (L4 swaps the source to
-    /// the checker's copy — the walk stamps it, the checker carries it
-    /// through its snapshots; one field assignment, receipted.)
+    /// binding lives at, minted at definition. (The L4 source swap:
+    /// the walk stamps it, the checker carries the same map through
+    /// its ctx — the facts take the checker's copy.)
     pub fn_capture_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
     /// Every fn literal's body-scope walk depth: the index its body
     /// scope occupies on the walk stack at the definition site.
     pub fn_body_depths: BTreeMap<NodeId, usize>,
+    // — the checker-minted families (L4). Every lowerer-consumed field
+    // rides #[allow(dead_code)] until L7 reads it; `ffi_verbs` has its
+    // reader now — the pipeline's ffi gate.
+    #[allow(dead_code)]
+    pub boundary_elem: Option<Ty>,
+    #[allow(dead_code)]
+    pub local_types: BTreeMap<(NodeId, InstanceId, String), Ty>,
+    #[allow(dead_code)]
+    pub fn_defs: BTreeMap<NodeId, FnDef>,
+    #[allow(dead_code)]
+    pub env_faces: BTreeMap<NodeId, BTreeMap<String, Ty>>,
+    #[allow(dead_code)]
+    pub env_face_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
+    #[allow(dead_code)]
+    pub closure_fields: BTreeMap<(usize, String), NodeId>,
+    #[allow(dead_code)]
+    pub call_fns: BTreeMap<NodeId, BTreeSet<NodeId>>,
+    pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,
+    #[allow(dead_code)]
+    pub builtin_verbs: BTreeMap<NodeId, BuiltinVerb>,
+    #[allow(dead_code)]
+    pub ffi_mints: BTreeMap<NodeId, FfiMint>,
+    #[allow(dead_code)]
+    pub instances: BTreeMap<InstanceId, InstanceInfo>,
     pub ctor_lines: Vec<usize>,
     #[allow(dead_code)]
     pub adopt_lines: BTreeMap<String, usize>,

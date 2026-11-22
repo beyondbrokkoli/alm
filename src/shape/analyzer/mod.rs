@@ -14,6 +14,7 @@ pub(super) use crate::diag::Diagnostic;
 use crate::surface::Surface;
 use Ty::{Any, Async, Bool, Conflict, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
 
+mod checker;
 mod checks;
 mod constraints;
 mod functions;
@@ -22,7 +23,6 @@ mod lattice;
 mod pins;
 mod rebind;
 mod rows;
-mod type_name;
 mod walk;
 
 use infer::*;
@@ -559,15 +559,47 @@ pub fn analyze(ctx: &AnalysisContext<'_>, walk_pins: bool, surface: &Surface) ->
     a.pin_derived_exprs.clear();
     a.pin_justified_names.clear();
 
-    // (L4 receipt: the checker interleaves here — snapshot_pre,
-    // walk_stmt, snapshot_post, check_stmt per statement; this pass is
-    // walk-only until it ports.)
+    // The L4 interleave: one checker statement between every walk
+    // statement, reading the walk's snapshots. A walk error breaks the
+    // loop before the checker sees that statement; an elems refusal
+    // (a missing-value diagnostic already minted) never runs the
+    // checker at all.
+    let mut chk = checker::Checker::new(checker::CheckCtx {
+        // [index-base] the one CheckCtx mint — the surface's law feeds
+        // the checker's mint bounds seam.
+        index_base: a.surface.index_base(),
+        adopt_lines: adopt_lines.clone(),
+        sites: a.lattice.sites.clone(),
+        elems: static_elems.clone(),
+        fn_def_sites: a.fn_def_sites.clone(),
+        fn_captures: a.fn_captures.clone(),
+        fn_capture_depths: a.fn_capture_depths.clone(),
+    });
+    let mut checker_ran = elems_diags.is_empty();
+    let mut last_post: Option<Vec<Scope>> = None;
     let mut walk_completed = true;
     for stmt in ctx.ast {
+        if let Some(post) = &last_post {
+            debug_assert_eq!(
+                a.walk.scopes, *post,
+                "the interleaving broke: the walk moved between the checker's snapshots"
+            );
+        }
+        chk.snapshot_pre(&a.walk, &a.holds.moved_severed);
         if let Err(err) = a.walk_stmt(rec, stmt) {
             a.ledger
                 .diagnostics
                 .push(err.0.with_site(Some(stmt.loc().line as usize)));
+            checker_ran = false;
+            walk_completed = false;
+            break;
+        }
+        chk.snapshot_post(&a.walk, &a.holds.moved_severed);
+        last_post = Some(a.walk.scopes.clone());
+        if checker_ran && let Err(msg) = chk.check_stmt(&mut a.lattice.unknowns, stmt) {
+            a.ledger
+                .diagnostics
+                .push(msg.with_site(Some(stmt.loc().line as usize)));
             walk_completed = false;
             break;
         }
@@ -587,12 +619,16 @@ pub fn analyze(ctx: &AnalysisContext<'_>, walk_pins: bool, surface: &Surface) ->
         a.lattice.row_ghost_next <= a.lattice.unknowns.next_id() + 1,
         "id-space exhausted: row ghosts crossed the unknown-node minter"
     );
+    if checker_ran {
+        chk.finish(&mut a.lattice.unknowns);
+    }
+    let chk_facts = chk.into_facts();
     // (L6 receipt: decide_root_exit + plan_stmt_temp_frees run here in
     // mirror, minting the exit-fate facts; L5 receipt: mint_fast_lane
     // follows them.)
 
     let mut facts = a
-        .into_recorded(adopt_lines, static_elems, elems_diags)
+        .into_recorded(adopt_lines, static_elems, elems_diags, chk_facts)
         .into_facts();
     facts.fn_touched = ctx.fn_touched.clone();
     facts.check_row_reads();
@@ -673,16 +709,12 @@ struct Recorded {
     ctor_lines: Vec<usize>,
     fn_scope_keys: BTreeMap<NodeId, (NodeId, u8)>,
     fn_body_depths: BTreeMap<NodeId, usize>,
-    /// (L4 receipt: mirror sources `fn_capture_depths` from the
-    /// checker's facts — the walk stamps them at definition and the
-    /// checker carries the same map through; the source swaps when the
-    /// checker ports.)
-    fn_capture_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
     join_tags: BTreeMap<NodeId, bool>,
     call_tags: BTreeMap<NodeId, Vec<bool>>,
     adopt_lines: BTreeMap<String, usize>,
     static_elems: Vec<crate::shape::Ty>,
     elems_diags: Vec<Diagnostic>,
+    chk: checker::CheckFacts,
 }
 
 impl Analyzer {
@@ -691,6 +723,7 @@ impl Analyzer {
         adopt_lines: BTreeMap<String, usize>,
         static_elems: Vec<crate::shape::Ty>,
         elems_diags: Vec<Diagnostic>,
+        chk: checker::CheckFacts,
     ) -> Recorded {
         Recorded {
             ledger: self.ledger,
@@ -701,12 +734,12 @@ impl Analyzer {
             ctor_lines: self.ctor_lines,
             fn_scope_keys: self.fn_scope_keys,
             fn_body_depths: self.fn_body_depths,
-            fn_capture_depths: self.fn_capture_depths,
             join_tags: self.join_tags,
             call_tags: self.call_tags,
             adopt_lines,
             static_elems,
             elems_diags,
+            chk,
         }
     }
 
@@ -775,6 +808,7 @@ impl Recorded {
     fn into_facts(mut self) -> ShapeFacts {
         let mut diagnostics = std::mem::take(&mut self.ledger.diagnostics);
         diagnostics.append(&mut self.elems_diags);
+        diagnostics.append(&mut self.chk.diagnostics);
 
         let substitutions = self.lattice.unknowns.take_subs();
 
@@ -783,9 +817,9 @@ impl Recorded {
             cell_children.entry(parent).or_default().extend(kids);
         }
 
-        // (L4/L5 receipt: mirror's second-writer contract marks a
-        // reserve plan's pre-satisfied names from the checker's ffi.new
-        // mints here — both families land with their layers.)
+        // (L5 receipt: mirror's second-writer contract marks a reserve
+        // plan's pre-satisfied names from the checker's ffi.new mints
+        // here — the mints exist now, the plans land with L5.)
 
         ShapeFacts {
             sites: self.lattice.sites,
@@ -807,10 +841,21 @@ impl Recorded {
             arm_free_sites: self.own.arm_free_sites,
             arm_rebind_frees: self.own.arm_rebind_frees,
             fn_touched: BTreeMap::new(),
-            fn_capture_depths: self.fn_capture_depths,
             fn_body_depths: self.fn_body_depths,
             ctor_lines: self.ctor_lines,
             adopt_lines: self.adopt_lines,
+            boundary_elem: self.chk.boundary_elem,
+            local_types: self.chk.local_types,
+            fn_defs: self.chk.fn_defs,
+            env_faces: self.chk.env_faces,
+            env_face_depths: self.chk.env_face_depths,
+            fn_capture_depths: self.chk.fn_capture_depths,
+            closure_fields: self.chk.closure_fields,
+            call_fns: self.chk.call_fns,
+            ffi_verbs: self.chk.ffi_verbs,
+            builtin_verbs: self.chk.builtin_verbs,
+            ffi_mints: self.chk.ffi_mints,
+            instances: self.chk.instances,
             diagnostics,
         }
     }
@@ -849,6 +894,13 @@ pub(super) fn dotted_callee(callee: &Expr) -> Option<String> {
         _ => return None,
     };
     Some(format!("{base}.{name}"))
+}
+
+pub(super) fn value_call_msg(name: &str) -> Diagnostic {
+    Diagnostic::ty(format!(
+        "'{name}' is not an expansion — a call through a value \
+         needs a closure"
+    ))
 }
 
 pub(super) fn calls_through_fn_var_msg() -> Diagnostic {

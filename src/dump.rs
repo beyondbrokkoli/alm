@@ -16,7 +16,7 @@
 //! the tree it reads.
 
 use crate::ast::{BinOp, CtorKey, Expr, NodeId, Stmt, UnOp};
-use crate::shape::ShapeFacts;
+use crate::shape::{BuiltinVerb, FfiVerb, ShapeFacts};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
@@ -456,6 +456,190 @@ pub fn render_shape(facts: &ShapeFacts, ast: &[Stmt]) -> String {
         }
     }
 
+    // — the checker-minted families (L4). Instance ids are the
+    // checker's own per-compile counter; every NodeId-keyed entry
+    // projects through its node's line like the walk's.
+    if let Some(elem) = &facts.boundary_elem {
+        emitf("boundary-elem:".into());
+        emitf(format!(
+            "  elem {}",
+            render_ty(&resolve_ty(facts, elem), &line_of)
+        ));
+    }
+
+    if !facts.fn_defs.is_empty() {
+        emitf("fn-defs:".into());
+        for (ptr, def) in &facts.fn_defs {
+            let sig = def
+                .signature
+                .as_ref()
+                .map(|sig| {
+                    sig.iter()
+                        .map(|ty| render_ty(&resolve_ty(facts, ty), &line_of))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_else(|| "—".to_string());
+            emitf(format!(
+                "  fn @line {} params {} ret {} sig {sig}",
+                line_of(*ptr),
+                def.params.len(),
+                render_ty(&resolve_ty(facts, &def.ret), &line_of),
+            ));
+        }
+    }
+
+    if !facts.env_faces.is_empty() {
+        emitf("env-faces:".into());
+        for (ptr, face) in &facts.env_faces {
+            for (name, ty) in face {
+                emitf(format!(
+                    "  fn @line {} {name} {}",
+                    line_of(*ptr),
+                    render_ty(&resolve_ty(facts, ty), &line_of),
+                ));
+            }
+        }
+    }
+
+    if !facts.env_face_depths.is_empty() {
+        emitf("env-face-depths:".into());
+        for (ptr, depths) in &facts.env_face_depths {
+            for (name, depth) in depths {
+                emitf(format!("  fn @line {} {name} @d{depth}", line_of(*ptr)));
+            }
+        }
+    }
+
+    if !facts.closure_fields.is_empty() {
+        emitf("closure-fields:".into());
+        for ((site, field), ptr) in &facts.closure_fields {
+            emitf(format!(
+                "  ctor site {site} @line {} field {field} -> fn @line {}",
+                facts.ctor_lines[*site],
+                line_of(*ptr),
+            ));
+        }
+    }
+
+    if !facts.call_fns.is_empty() {
+        emitf("call-fns:".into());
+        for (call, fns) in &facts.call_fns {
+            let list = fns
+                .iter()
+                .map(|f| format!("@line {}", line_of(*f)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            emitf(format!("  call @line {} -> fn {list}", line_of(*call)));
+        }
+    }
+
+    if !facts.instances.is_empty() {
+        emitf("instances:".into());
+        for (id, rec) in &facts.instances {
+            let head = match (rec.call, rec.fn_node) {
+                (Some(call), Some(f)) => format!(
+                    "  instance #{} call @line {} fn @line {}",
+                    id.0,
+                    line_of(call),
+                    line_of(f),
+                ),
+                _ => format!("  instance #{} (root extent)", id.0),
+            };
+            let tail = rec
+                .ret
+                .as_ref()
+                .map(|ty| format!(" ret {}", render_ty(&resolve_ty(facts, ty), &line_of)))
+                .unwrap_or_default();
+            emitf(format!("{head}{tail}"));
+            for (call, kids) in &rec.children {
+                let list = kids
+                    .iter()
+                    .map(|k| format!("#{}", k.0))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                emitf(format!("    child call @line {} -> {list}", line_of(*call)));
+            }
+            for (node, ptr) in &rec.creation_envs {
+                emitf(format!(
+                    "    creation @line {} -> fn @line {}",
+                    line_of(*node),
+                    line_of(*ptr),
+                ));
+            }
+            for node in &rec.closure_calls {
+                emitf(format!("    closure-call @line {}", line_of(*node)));
+            }
+            for (node, lane) in &rec.index_key_lanes {
+                emitf(format!("    key @line {} {:?}", line_of(*node), lane,));
+            }
+            for (node, ty) in &rec.access_elems {
+                emitf(format!(
+                    "    access @line {} {}",
+                    line_of(*node),
+                    render_ty(&resolve_ty(facts, ty), &line_of),
+                ));
+            }
+        }
+    }
+
+    if !facts.ffi_verbs.is_empty() {
+        emitf("ffi-verbs:".into());
+        for (node, verb) in &facts.ffi_verbs {
+            let verb = match verb {
+                FfiVerb::Load => "load".to_string(),
+                FfiVerb::ArgKind => "arg-kind".to_string(),
+                FfiVerb::Cdef => "cdef".to_string(),
+                FfiVerb::New { name } => format!("new '{name}'"),
+                FfiVerb::Sizeof { bytes } => format!("sizeof {bytes}"),
+                FfiVerb::AsyncCreate => "async-create".to_string(),
+                FfiVerb::AsyncResume => "async-resume".to_string(),
+                FfiVerb::AsyncYield => "async-yield".to_string(),
+                FfiVerb::AsyncStatus => "async-status".to_string(),
+                FfiVerb::AsyncClose => "async-close".to_string(),
+                FfiVerb::Drive { base, sym } => format!("drive {base}.{sym}"),
+            };
+            emitf(format!("  @line {} {verb}", line_of(*node)));
+        }
+    }
+
+    if !facts.builtin_verbs.is_empty() {
+        emitf("builtin-verbs:".into());
+        for (node, verb) in &facts.builtin_verbs {
+            let verb = match verb {
+                BuiltinVerb::Assert => "assert",
+                BuiltinVerb::Error => "error",
+                BuiltinVerb::ToNumber => "tonumber",
+            };
+            emitf(format!("  @line {} {verb}", line_of(*node)));
+        }
+    }
+
+    if !facts.ffi_mints.is_empty() {
+        emitf("ffi-mints:".into());
+        for (node, mint) in &facts.ffi_mints {
+            emitf(format!(
+                "  @line {} name '{}' elem {} capacity {}",
+                line_of(*node),
+                mint.name,
+                render_ty(&resolve_ty(facts, &mint.elem), &line_of),
+                mint.capacity,
+            ));
+        }
+    }
+
+    if !facts.local_types.is_empty() {
+        emitf("local-types:".into());
+        for ((stmt, inst, name), ty) in &facts.local_types {
+            emitf(format!(
+                "  stmt @line {} #{} {name} {}",
+                line_of(*stmt),
+                inst.0,
+                render_ty(&resolve_ty(facts, ty), &line_of),
+            ));
+        }
+    }
+
     if !facts.adopt_lines.is_empty() {
         emitf("adopt-lines:".into());
         for (name, line) in &facts.adopt_lines {
@@ -502,6 +686,27 @@ impl crate::visit::Visitor for LineCollector<'_> {
 
 fn resolve_ty(facts: &ShapeFacts, ty: &crate::shape::Ty) -> crate::shape::Ty {
     facts.resolved(ty)
+}
+
+/// The dump's `Ty` text: `Debug`'s shape, except a `Closure`'s
+/// `NodeId` projects through its node's line — the dump law (raw
+/// NodeIds churn across in-process parses; lines do not).
+fn render_ty(ty: &crate::shape::Ty, line_of: &impl Fn(NodeId) -> u32) -> String {
+    match ty {
+        crate::shape::Ty::Pending => "Pending".to_string(),
+        crate::shape::Ty::Int => "Int".to_string(),
+        crate::shape::Ty::Flt => "Flt".to_string(),
+        crate::shape::Ty::Bool => "Bool".to_string(),
+        crate::shape::Ty::Str => "Str".to_string(),
+        crate::shape::Ty::Tbl(inner) => format!("Tbl({})", render_ty(inner, line_of)),
+        crate::shape::Ty::Ffi => "Ffi".to_string(),
+        crate::shape::Ty::FfiLib => "FfiLib".to_string(),
+        crate::shape::Ty::Async => "Async".to_string(),
+        crate::shape::Ty::Any => "Any".to_string(),
+        crate::shape::Ty::Closure(ptr) => format!("Closure(@line {})", line_of(*ptr)),
+        crate::shape::Ty::Unknown(id) => format!("Unknown({id})"),
+        crate::shape::Ty::Conflict => "Conflict".to_string(),
+    }
 }
 
 fn render_keeps(keeps: &[crate::shape::Keep]) -> String {

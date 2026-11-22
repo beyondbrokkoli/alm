@@ -120,22 +120,31 @@ fn facts_equal_modulo_pin_refinement(on: &str, off: &str) -> bool {
 
 #[test]
 fn walk_pin_len_deferral_rejects_identically_pin() {
-    // (L4 receipt: mirror asserts the case REJECTS at the analyzer with
-    // the checker's "'#' requires … got Integer" diagnostic; alm's walk
-    // alone accepts it — the rejection is checker-owned. The on/off
-    // differential — this layer's law — ports now; the rejection
-    // assertions port verbatim with the checker.)
+    // mirror's pin, verbatim now that the checker owns the rejection
+    // (the L3 receipt, spent): the case REJECTS at the analyzer — not
+    // panics — with the deferred '#' diagnostic, identically on both
+    // lever positions.
     let source = "print(#arg[0])\nlocal n = arg[0] + 1\n";
     let on = analyze_with_lever("len_deferral".into(), source.into(), true);
     let off = analyze_with_lever("len_deferral".into(), source.into(), false);
     match (&on, &off) {
-        (Ok(a), Ok(b)) => assert_eq!(a, b, "the len-deferral pins changed the facts"),
-        (Err((s1, d1)), Err((s2, d2))) => {
-            assert_eq!(s1.name(), s2.name());
-            assert_eq!(d1, d2);
+        (Err((stage_on, diags_on)), Err((stage_off, diags_off))) => {
+            assert_eq!(
+                stage_on.name(),
+                "shape analyzer + checker (one walk)",
+                "the incident case must reject at the analyzer, not panic"
+            );
+            assert_eq!(stage_on.name(), stage_off.name());
+            assert_eq!(diags_on, diags_off);
+            assert!(
+                diags_on.contains("'#' requires a Table, String, or Any operand, got Integer"),
+                "the len-deferral diagnostic changed: {}",
+                diags_on
+            );
         }
         _ => panic!(
-            "the len-deferral case flipped acceptance:\n  pins on : {}\n  pins off: {}",
+            "the len-deferral incident case must reject on both lever positions:\n  \
+             pins on : {}\n  pins off: {}",
             outcome(&on),
             outcome(&off)
         ),
