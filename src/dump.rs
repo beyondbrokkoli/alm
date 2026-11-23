@@ -456,6 +456,60 @@ pub fn render_shape(facts: &ShapeFacts, ast: &[Stmt]) -> String {
         }
     }
 
+    // — the fast-lane families (L5): the reserve plans a conversion
+    // loop minted and the store eligibility facts the post-walk scan
+    // proved. NodeId keys project through their node's line like every
+    // walk family; the plan's ctor reserves print as the stores' lines
+    // in mint order (the NodeId space is parse order).
+    if !facts.fast_stores.is_empty() {
+        emitf("fast-stores:".into());
+        for (stmt, elig) in &facts.fast_stores {
+            emitf(format!(
+                "  store @line {} {} key {:?} row_reserve {} loop @line {}",
+                line_of(*stmt),
+                elig.table,
+                elig.key,
+                elig.row_reserve,
+                line_of(elig.loop_id),
+            ));
+        }
+    }
+
+    if !facts.reserve_plans.is_empty() {
+        emitf("reserve-plans:".into());
+        for (loop_id, plan) in &facts.reserve_plans {
+            let names = |v: &[String]| {
+                if v.is_empty() {
+                    "—".to_string()
+                } else {
+                    v.join(" ")
+                }
+            };
+            let ctors = plan
+                .ctor_reserves
+                .iter()
+                .map(|s| format!("@line {}", line_of(*s)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ctors = if ctors.is_empty() {
+                "—".to_string()
+            } else {
+                ctors
+            };
+            let opt = |k: &Option<i64>| k.map(|v| v.to_string()).unwrap_or_else(|| "—".to_string());
+            emitf(format!(
+                "  loop @line {} pre [{}] pre-sat [{}] nested [{}] ctor-reserves [{}] entry-lb {} key-offset {}",
+                line_of(*loop_id),
+                names(&plan.pre_header),
+                names(&plan.pre_satisfied),
+                names(&plan.nested),
+                ctors,
+                opt(&plan.entry_lb),
+                opt(&plan.key_offset),
+            ));
+        }
+    }
+
     // — the checker-minted families (L4). Instance ids are the
     // checker's own per-compile counter; every NodeId-keyed entry
     // projects through its node's line like the walk's.

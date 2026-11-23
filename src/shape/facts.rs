@@ -31,15 +31,70 @@ pub struct ArmFreeEntry {
     pub keeps: Vec<Keep>,
 }
 
-/// [index-base] How a fast-store key relates to its loop guard (L5's
-/// fill-loop detector consumes it; the helpers mint it now because the
-/// seam's types belong to the walk). `Guard` is the key the guard name
-/// currently names; `GuardOffset(k)` is that name plus the constant
-/// `k` (`j - 1` is `GuardOffset(-1)`).
+/// [index-base] How a fast-store key relates to its loop guard. `Guard`
+/// is the key the guard name currently names; `GuardOffset(k)` is that
+/// name plus the constant `k` (`j - 1` is `GuardOffset(-1)`), the
+/// literal already folded by the index base.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum KeyShape {
     Guard,
     GuardOffset(i64),
+}
+
+/// [fast-lane] One store the walk proved eligible for the fast lane —
+/// the P4 facts half: presence in `fast_stores` is the whole decision;
+/// minted at exactly one chokepoint (`claim_store` under
+/// `mint_fast_lane`), read by the statement's `NodeId`, re-derived
+/// nowhere. The lowerer (L7) reads it behind `choose_store_lane`.
+#[derive(Clone, Debug)]
+pub struct FastStoreElig {
+    pub loop_id: NodeId,
+    /// The base name the claim rode; read by the lane pins. A table
+    /// can sit in a plan's pre-header and nested lists at once, so
+    /// this name alone does not say which claim fired.
+    #[allow(dead_code)]
+    pub table: String,
+    /// The key's relation to the guard. The lowerer lowers the key
+    /// expression and never branches on the shape; it travels with the
+    /// fact so key-shape extensions stay walk-side, where the proof
+    /// obligations live.
+    #[allow(dead_code)]
+    pub key: KeyShape,
+    /// The claim is the nested-row kind: the store's table register is
+    /// a fresh row, so the row's own reserve rides this store instead
+    /// of the pre-header.
+    pub row_reserve: bool,
+}
+
+/// [fast-lane] The reserve shape of one conversion loop: which names
+/// get a pre-header reserve, which names are nested rows reserved under
+/// the header, and which constructor-value stores borrow the loop's
+/// bound. The bound itself stays a reference to the loop condition's
+/// right operand; the lowerer lowers it and keeps the register.
+#[derive(Clone, Debug)]
+pub struct ReservePlan {
+    pub pre_header: Vec<String>,
+    /// Pre-header names whose reserve was already satisfied by an
+    /// `ffi.new` mint over that name — the second-writer contract's
+    /// consumption side: no second `TableReserve` is emitted for them
+    /// at the loop's pre-header seam.
+    pub pre_satisfied: Vec<String>,
+    pub nested: Vec<String>,
+    pub ctor_reserves: BTreeSet<NodeId>,
+    /// The loop entry's sound lower bound, minted by `detect_fill_loop`
+    /// from the same `num_assigns` its nonneg gate reads at the same
+    /// instant (the body has not walked yet, so the shapes are the
+    /// entry facts). The admission gate reads it when the entry has no
+    /// exact constant; `None` = no derivable bound.
+    pub entry_lb: Option<i64>,
+    /// `None` = no admitted offset (a declined store contributes
+    /// nothing and the reserves keep the raw bound); `Some(k)` = the
+    /// widest physical key offset `K_eff` over the loop's admitted
+    /// keys (signed, unclamped — the tight form), so the reserves
+    /// cover `bound + K_eff` cells and the border equals the logical
+    /// length under every base. The loop's condition still tests the
+    /// raw bound.
+    pub key_offset: Option<i64>,
 }
 
 /// One fn literal the checker collected — params, body text, and the
@@ -155,10 +210,9 @@ pub struct InstanceInfo {
 /// a surface field (the P5 cure: the lowerer will take `(ShapeFacts,
 /// &Surface)` as two inputs; `index_base` is dropped forever).
 ///
-/// The diet ledger: L5 adds fast_stores/reserve_plans; L6 adds the
-/// exit-fate families (do_exit_frees, root_exit_frees,
-/// stmt/cond/arm_temp_frees, ret_path_*, break_path_*,
-/// arm_do_exit_frees, arm_root_exit_frees).
+/// The diet ledger: L6 adds the exit-fate families (do_exit_frees,
+/// root_exit_frees, stmt/cond/arm_temp_frees, ret_path_*,
+/// break_path_*, arm_do_exit_frees, arm_root_exit_frees).
 #[derive(Clone)]
 pub struct ShapeFacts {
     pub sites: BTreeMap<NodeId, usize>,
@@ -175,6 +229,11 @@ pub struct ShapeFacts {
     pub arm_free_sites: BTreeMap<NodeId, Vec<ArmFreeEntry>>,
     pub arm_rebind_frees: BTreeMap<NodeId, Vec<ArmFreeEntry>>,
     pub move_poisons: BTreeMap<NodeId, BTreeSet<String>>,
+    /// [fast-lane] The fast-store eligibility facts — the L5 families.
+    /// The dump renders them; the lowerer (L7) reads them behind
+    /// `choose_store_lane`.
+    pub fast_stores: BTreeMap<NodeId, FastStoreElig>,
+    pub reserve_plans: BTreeMap<NodeId, ReservePlan>,
     pub stored_ctor_parents: BTreeSet<usize>,
     pub substitutions: BTreeMap<usize, Ty>,
     pub row_reads: BTreeMap<usize, (String, usize)>,

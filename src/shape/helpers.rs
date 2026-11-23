@@ -135,3 +135,92 @@ pub fn guard_key_shape(key: &Expr, guard: &str, index_base: i64) -> Option<crate
         | Expr::Call { .. } => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // The two helper-law pins (mirror's fast_lane_facts_pin.rs tail,
+    // kept beside the helpers because the seams are pub(crate)): the
+    // shift-once law and the base-fold law.
+    use super::{const_key_value, guard_key_shape};
+    use crate::ast::{BinOp, Expr, NodeId};
+    use crate::shape::KeyShape;
+
+    #[test]
+    fn const_key_value_shifts_once_in_physical_space() {
+        let int = |v: i64| Expr::Integer {
+            value: v,
+            id: NodeId::mint(),
+        };
+        assert_eq!(
+            const_key_value(&int(3), 0),
+            Some(3),
+            "base 0 is the identity"
+        );
+        assert_eq!(
+            const_key_value(&int(3), 1),
+            Some(2),
+            "a literal shifts once"
+        );
+        let sum = Expr::BinaryOp {
+            op: BinOp::Add,
+            left: Box::new(int(3)),
+            right: Box::new(int(1)),
+            id: NodeId::mint(),
+        };
+        assert_eq!(
+            const_key_value(&sum, 1),
+            Some(3),
+            "arithmetic folds raw, then the result shifts exactly once"
+        );
+        assert_eq!(
+            const_key_value(&int(i64::MIN), 1),
+            None,
+            "a shift overflow declines the constant"
+        );
+    }
+
+    #[test]
+    fn guard_key_shape_folds_the_base_into_guard_offsets() {
+        let guard = "i";
+        let int = |v: i64| Expr::Integer {
+            value: v,
+            id: NodeId::mint(),
+        };
+        let ident = || Expr::Identifier {
+            name: guard.to_string(),
+            id: NodeId::mint(),
+        };
+        let plus = |k: i64| Expr::BinaryOp {
+            op: BinOp::Add,
+            left: Box::new(ident()),
+            right: Box::new(int(k)),
+            id: NodeId::mint(),
+        };
+        let minus = |k: i64| Expr::BinaryOp {
+            op: BinOp::Sub,
+            left: Box::new(ident()),
+            right: Box::new(int(k)),
+            id: NodeId::mint(),
+        };
+        assert_eq!(
+            guard_key_shape(&plus(2), guard, 1),
+            Some(KeyShape::GuardOffset(1)),
+            "i + 2 folds to physical +1 at base 1"
+        );
+        assert_eq!(
+            guard_key_shape(&minus(1), guard, 1),
+            Some(KeyShape::GuardOffset(-2)),
+            "i - 1 folds to physical -2 at base 1"
+        );
+        assert_eq!(
+            guard_key_shape(&plus(2), guard, 0),
+            Some(KeyShape::GuardOffset(2)),
+            "base 0 keeps the raw literal"
+        );
+        assert_eq!(
+            guard_key_shape(&ident(), guard, 1),
+            Some(KeyShape::Guard),
+            "the bare guard stays Guard in every base"
+        );
+    }
+}

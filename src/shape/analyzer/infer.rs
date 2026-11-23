@@ -1,8 +1,9 @@
 use super::*;
+use crate::ast::has_break;
 
 /// [fast-lane] The arithmetic shape of a numeric expression — sums and
 /// products of literals and names. The walk writes it into
-/// `holds.num_assigns` at every decl and assignment; L5's fill-loop
+/// `holds.num_assigns` at every decl and assignment; the fill-loop
 /// detector is the read side (guard nonneg / lower-bound / ascends
 /// facts over exactly this grammar).
 #[derive(Clone, Debug, PartialEq)]
@@ -49,6 +50,176 @@ pub(super) fn num_of(expr: &Expr) -> NumExpr {
         | Expr::Function { .. }
         | Expr::Call { .. } => NumExpr::Other,
     }
+}
+
+/// [fast-lane] Nonnegativity through the assignment graph: a literal is
+/// itself, a name is every shape it was ever assigned (a cycle is a
+/// previous trip, not this one), sums and products are conjuncts.
+pub(super) fn provably_nonneg(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    expr: &NumExpr,
+    self_name: &str,
+    path: &mut BTreeSet<String>,
+) -> bool {
+    match expr {
+        NumExpr::Lit(v) => *v >= 0,
+        NumExpr::Var(n) => {
+            if n == self_name {
+                true
+            } else if path.contains(n) {
+                false
+            } else {
+                let Some(shapes) = num_assigns.get(n) else {
+                    return false;
+                };
+                path.insert(n.clone());
+                let ok = shapes
+                    .iter()
+                    .all(|sh| provably_nonneg(num_assigns, sh, n, path));
+                path.remove(n);
+                ok
+            }
+        }
+        NumExpr::Add(a, b) | NumExpr::Mul(a, b) => {
+            provably_nonneg(num_assigns, a, self_name, path)
+                && provably_nonneg(num_assigns, b, self_name, path)
+        }
+        NumExpr::Other => false,
+    }
+}
+
+pub(super) fn guard_provably_nonneg_expr(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    expr: &Expr,
+) -> bool {
+    let mut path = BTreeSet::new();
+    provably_nonneg(num_assigns, &num_of(expr), "", &mut path)
+}
+
+pub(super) fn guard_provably_nonneg(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    guard: &str,
+) -> bool {
+    num_assigns.get(guard).is_some_and(|shapes| {
+        let mut path = BTreeSet::new();
+        shapes
+            .iter()
+            .all(|sh| provably_nonneg(num_assigns, sh, guard, &mut path))
+    })
+}
+
+/// [fast-lane] The sound lower bound of the guard's value at loop entry,
+/// minted beside `guard_provably_nonneg` from the same shapes at the same
+/// instant: every rule under-approximates every runtime value, so the
+/// admission gate can spend it as an entry when the exact constant is
+/// unknown. `None` = no derivable bound (a cycle is a previous trip,
+/// not the entry).
+pub(super) fn guard_lower_bound(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    guard: &str,
+) -> Option<i64> {
+    let shapes = num_assigns.get(guard)?;
+    let mut best = i64::MAX;
+    for sh in shapes {
+        let mut path = BTreeSet::new();
+        let bound = shape_lower_bound(num_assigns, sh, guard, &mut path)?;
+        best = best.min(bound);
+    }
+    Some(best)
+}
+
+pub(super) fn shape_lower_bound(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    expr: &NumExpr,
+    self_name: &str,
+    path: &mut BTreeSet<String>,
+) -> Option<i64> {
+    match expr {
+        NumExpr::Lit(v) => Some(*v),
+        NumExpr::Var(n) => {
+            if n == self_name || path.contains(n) {
+                return None;
+            }
+            let shapes = num_assigns.get(n)?;
+            if shapes.is_empty() {
+                return None;
+            }
+            path.insert(n.clone());
+            let mut best = i64::MAX;
+            for sh in shapes {
+                let bound = shape_lower_bound(num_assigns, sh, n, path)?;
+                best = best.min(bound);
+            }
+            path.remove(n);
+            Some(best)
+        }
+        NumExpr::Add(a, b) => {
+            let la = shape_lower_bound(num_assigns, a, self_name, path)?;
+            let lb = shape_lower_bound(num_assigns, b, self_name, path)?;
+            la.checked_add(lb)
+        }
+        NumExpr::Mul(a, b) => {
+            let la = shape_lower_bound(num_assigns, a, self_name, path)?;
+            let lb = shape_lower_bound(num_assigns, b, self_name, path)?;
+            // Monotone only over nonnegative operands; a negative
+            // factor flips the inequality and the product stops being
+            // a bound.
+            if la >= 0 && lb >= 0 {
+                la.checked_mul(lb)
+            } else {
+                None
+            }
+        }
+        NumExpr::Other => None,
+    }
+}
+
+pub(super) fn guard_only_ascends(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    stmts: &[Stmt],
+    guard: &str,
+) -> bool {
+    for s in stmts {
+        match s {
+            Stmt::Assignment { name, expr, .. } if name == guard => {
+                let Expr::BinaryOp {
+                    op: BinOp::Add,
+                    left,
+                    right,
+                    ..
+                } = expr
+                else {
+                    return false;
+                };
+                if !matches!(left.as_ref(), Expr::Identifier { name: n, .. } if n == guard) {
+                    return false;
+                }
+                if !guard_provably_nonneg_expr(num_assigns, right) {
+                    return false;
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
+                if !guard_only_ascends(num_assigns, body, guard) {
+                    return false;
+                }
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } if !guard_only_ascends(num_assigns, then_body, guard)
+                || !guard_only_ascends(num_assigns, else_body, guard) =>
+            {
+                return false;
+            }
+            // everything else leaves the guard untouched: the other
+            // statements (LocalDecl, IndexAssign, Print, Expr, Return,
+            // Break), non-guard Assignments, and an If whose branches
+            // both ascend (checked in the arm above)
+            _ => {}
+        }
+    }
+    true
 }
 
 impl Analyzer {
@@ -763,4 +934,336 @@ impl Analyzer {
         }
         Ok(())
     }
+
+    /// [fast-lane] The walk-time half of the fast lane: recognize one
+    /// conversion loop (`guard < bound` with a provably nonnegative,
+    /// only-ascending guard, no breaks, no calls, a bound the body
+    /// neither mutates nor stores into) and mint its ReservePlan —
+    /// the fills visible and dense at this depth take a pre-header
+    /// reserve; the table-of-table names among them plus the nested
+    /// fills reserve under the header. Plan presence is the
+    /// conversion verdict; `mint_fast_lane` (the post-walk half)
+    /// spends the plans to mint store eligibility.
+    pub(super) fn detect_fill_loop(
+        &mut self,
+        rec: Gate,
+        while_stmt: NodeId,
+        guard: &str,
+        bound: &Expr,
+        body: &[Stmt],
+    ) {
+        if has_break(body) {
+            return;
+        }
+        if body_has_call(body) {
+            return;
+        }
+        if !guard_provably_nonneg(&self.holds.num_assigns, guard) {
+            return;
+        }
+        if !guard_only_ascends(&self.holds.num_assigns, body, guard) {
+            return;
+        }
+
+        let mutated = self.collect_mutated_names(rec, body);
+        let stored = collect_index_assign_bases(body);
+        if idents_of(bound)
+            .iter()
+            .any(|v| mutated.contains(v) || stored.contains(v))
+        {
+            return;
+        }
+
+        let mut fills = BTreeSet::new();
+        let mut nested_fills = BTreeSet::new();
+
+        fn collect_fills(
+            stmts: &[Stmt],
+            guard: &str,
+            index_base: i64,
+            mutated: &BTreeSet<String>,
+            fills: &mut BTreeSet<String>,
+            nested_fills: &mut BTreeSet<String>,
+        ) {
+            for stmt in stmts {
+                if let Stmt::IndexAssign { obj, key, .. } = stmt
+                    && guard_key_shape(key, guard, index_base).is_some()
+                    && let Some(table_name) = get_base_identifier(obj)
+                    && !mutated.contains(table_name)
+                {
+                    match obj {
+                        Expr::Identifier { .. } => {
+                            fills.insert(table_name.clone());
+                        }
+                        Expr::Index { .. } => {
+                            nested_fills.insert(table_name.clone());
+                        }
+                        // unreachable in practice: get_base_identifier
+                        // returned Some, so obj is a base — defensive only
+                        _ => {}
+                    }
+                }
+                match stmt {
+                    Stmt::While { body, .. } | Stmt::Do { body, .. } => {
+                        collect_fills(body, guard, index_base, mutated, fills, nested_fills)
+                    }
+                    Stmt::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        collect_fills(then_body, guard, index_base, mutated, fills, nested_fills);
+                        collect_fills(else_body, guard, index_base, mutated, fills, nested_fills);
+                    }
+                    // non-nesting statements own no fill facts: decls,
+                    // stores (checked above), prints, exprs, returns,
+                    // breaks — their expressions cannot be a fill
+                    Stmt::LocalDecl { .. }
+                    | Stmt::IndexAssign { .. }
+                    | Stmt::Assignment { .. }
+                    | Stmt::Print { .. }
+                    | Stmt::Expr { .. }
+                    | Stmt::Return { .. }
+                    | Stmt::Break { .. } => {}
+                }
+            }
+        }
+
+        collect_fills(
+            body,
+            guard,
+            self.surface.index_base(),
+            &mutated,
+            &mut fills,
+            &mut nested_fills,
+        );
+
+        if fills.is_empty() && nested_fills.is_empty() {
+            return;
+        }
+        let dense_bases: Vec<String> = fills.iter().chain(nested_fills.iter()).cloned().collect();
+
+        let depth = self.walk.scopes.len();
+        for table_name in dense_bases {
+            let site_ids: BTreeSet<usize> = self
+                .walk
+                .scopes
+                .iter()
+                .rev()
+                .filter_map(|s| s.get(&table_name))
+                .flat_map(|b| b.shape.aliases.iter().copied())
+                .collect();
+
+            for &site in &site_ids {
+                // (mirror nests these two guards around the
+                // FILL_LOOP_DENSE signal; §B's removal leaves a
+                // collapsible pair, and clippy is right.)
+                if !is_root(&site)
+                    && !is_ghost(&site)
+                    && self.layout.verdicts[site] == LayoutVerdict::Growing
+                {
+                    self.layout.verdicts[site] = LayoutVerdict::Dense;
+                }
+            }
+
+            self.layout.name_dense.insert((table_name, depth), true);
+        }
+
+        // The reserve plan carries the lowerer's old emission-time
+        // decisions as walk facts: the fills visible here and dense at
+        // this depth take a pre-header reserve; the table-of-table
+        // names among them plus the nested fills take a reserve under
+        // the header. Plan presence is the conversion verdict (at
+        // least one visible dense fill, or any nested fill at all).
+        let depth = self.walk.scopes.len();
+        let visible = |name: &str| self.walk.scopes.iter().any(|s| s.contains_key(name));
+        let dense_here = |name: &str| {
+            self.layout
+                .name_dense
+                .get(&(name.to_string(), depth))
+                .copied()
+                .unwrap_or(false)
+        };
+        let tbl_of_tbl = |name: &str| {
+            self.walk
+                .scopes
+                .iter()
+                .rev()
+                .find_map(|s| s.get(name))
+                .is_some_and(
+                    |bind| matches!(bind.shape.ty, Tbl(ref inner) if matches!(**inner, Tbl(_))),
+                )
+        };
+        let pre_header: Vec<String> = fills
+            .iter()
+            .filter(|n| visible(n) && dense_here(n))
+            .cloned()
+            .collect();
+        let mut nested: Vec<String> = pre_header
+            .iter()
+            .filter(|n| tbl_of_tbl(n))
+            .cloned()
+            .collect();
+        nested.extend(
+            nested_fills
+                .iter()
+                .filter(|n| visible(n) && tbl_of_tbl(n))
+                .cloned(),
+        );
+        if !pre_header.is_empty() || !nested_fills.is_empty() {
+            self.layout.reserve_plans.insert(
+                while_stmt,
+                ReservePlan {
+                    pre_header,
+                    // Filled by the post-check pass over the checker's
+                    // mint facts (the second-writer contract).
+                    pre_satisfied: Vec::new(),
+                    nested,
+                    ctor_reserves: BTreeSet::new(),
+                    entry_lb: guard_lower_bound(&self.holds.num_assigns, guard),
+                    key_offset: None,
+                },
+            );
+        }
+    }
+
+    /// Assignment names a body may mutate — rides the traversal engine.
+    /// A function literal's body is not its enclosing scope's mutation
+    /// (the assignment lane reaches it through the call edge).
+    pub(super) fn collect_mutated_names(&self, _rec: Gate, stmts: &[Stmt]) -> BTreeSet<String> {
+        struct Mutated {
+            out: BTreeSet<String>,
+        }
+        impl crate::visit::Visitor for Mutated {
+            type Break = std::convert::Infallible;
+            fn visit_assignment(
+                &mut self,
+                name: &str,
+                expr: &Expr,
+                _loc: crate::ast::Loc,
+                _id: NodeId,
+            ) -> Result<(), Self::Break> {
+                self.out.insert(name.to_string());
+                let _ = crate::visit::walk_expr(self, expr);
+                Ok(())
+            }
+            fn visit_function(
+                &mut self,
+                _params: &[String],
+                _body: &[Stmt],
+                _id: NodeId,
+            ) -> Result<(), Self::Break> {
+                Ok(())
+            }
+        }
+        let mut v = Mutated {
+            out: BTreeSet::new(),
+        };
+        let _ = crate::visit::walk_stmts(&mut v, stmts);
+        v.out
+    }
+}
+
+/// Identifiers an expression reads — rides the traversal engine.
+struct IdentsOf {
+    out: BTreeSet<String>,
+}
+
+impl crate::visit::Visitor for IdentsOf {
+    type Break = std::convert::Infallible;
+
+    fn visit_identifier(&mut self, name: &str, _id: NodeId) -> Result<(), Self::Break> {
+        self.out.insert(name.to_string());
+        Ok(())
+    }
+
+    // NOTE historical shape: the hand walker never descended a Field's
+    // obj — kept bit-for-bit for the goldens.
+    fn visit_field(&mut self, _obj: &Expr, _name: &str, _id: NodeId) -> Result<(), Self::Break> {
+        Ok(())
+    }
+}
+
+fn idents_of(expr: &Expr) -> BTreeSet<String> {
+    let mut v = IdentsOf {
+        out: BTreeSet::new(),
+    };
+    let _ = crate::visit::walk_expr(&mut v, expr);
+    v.out
+}
+
+/// Bases stored into by a body — rides the traversal engine; function
+/// literals inside expressions are not this body's stores.
+struct IndexAssignBases {
+    out: BTreeSet<String>,
+}
+
+impl crate::visit::Visitor for IndexAssignBases {
+    type Break = std::convert::Infallible;
+
+    fn visit_index_assign(
+        &mut self,
+        obj: &Expr,
+        key: &Expr,
+        value: &Expr,
+        _loc: crate::ast::Loc,
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        if let Some(base) = get_base_identifier(obj) {
+            self.out.insert(base.clone());
+        }
+        let _ = crate::visit::walk_expr(self, obj);
+        let _ = crate::visit::walk_expr(self, key);
+        let _ = crate::visit::walk_expr(self, value);
+        Ok(())
+    }
+
+    fn visit_function(
+        &mut self,
+        _params: &[String],
+        _body: &[Stmt],
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        Ok(())
+    }
+}
+
+fn collect_index_assign_bases(stmts: &[Stmt]) -> BTreeSet<String> {
+    let mut v = IndexAssignBases {
+        out: BTreeSet::new(),
+    };
+    let _ = crate::visit::walk_stmts(&mut v, stmts);
+    v.out
+}
+
+/// Whether any call occurs — rides the traversal engine; function
+/// literal bodies are separate scopes, not calls in this one.
+struct HasCall(bool);
+
+impl crate::visit::Visitor for HasCall {
+    type Break = std::convert::Infallible;
+
+    fn visit_call(&mut self, callee: &Expr, args: &[Expr], _id: NodeId) -> Result<(), Self::Break> {
+        self.0 = true;
+        let _ = crate::visit::walk_expr(self, callee);
+        for a in args {
+            let _ = crate::visit::walk_expr(self, a);
+        }
+        Ok(())
+    }
+
+    fn visit_function(
+        &mut self,
+        _params: &[String],
+        _body: &[Stmt],
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        Ok(())
+    }
+}
+
+fn body_has_call(stmts: &[Stmt]) -> bool {
+    let mut v = HasCall(false);
+    let _ = crate::visit::walk_stmts(&mut v, stmts);
+    v.0
 }

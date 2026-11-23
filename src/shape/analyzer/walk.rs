@@ -726,9 +726,15 @@ impl Analyzer {
                 self.pin_bool_use(rec, condition, &cty);
                 self.check_uses(rec, condition)?;
 
-                // (L5 receipt: mirror detects the fill loop here under
-                // `rec.on()` — `detect_fill_loop` mints the reserve
-                // plans; it ports with the fast-lane layer.)
+                // [fast-lane] The walk-time half of the lane: recognize
+                // the conversion loop and mint its reserve plan (the
+                // recorded pass only — the fixpoint's unrecorded trips
+                // mint nothing).
+                if rec.on()
+                    && let Some((guard, bound)) = extract_guard(condition)
+                {
+                    self.detect_fill_loop(rec, stmt.id(), guard, bound, body);
+                }
 
                 let entry = self.walk.scopes.clone();
                 let mut head = entry.clone();

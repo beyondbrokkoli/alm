@@ -7,8 +7,8 @@ use super::core::{
     RowLineage, SPARSE_THRESHOLD, TableShape, is_ghost, is_root,
 };
 use super::facts;
-use super::facts::ShapeFacts;
-use super::helpers::const_key_value;
+use super::facts::{FastStoreElig, KeyShape, ReservePlan, ShapeFacts};
+use super::helpers::{const_key_value, extract_guard, guard_key_shape};
 use super::ty::{Ty, arith_ty, contains_any, decided, join_ty, pinned_scalar, value_kind};
 pub(super) use crate::diag::Diagnostic;
 use crate::surface::Surface;
@@ -17,6 +17,7 @@ use Ty::{Any, Async, Bool, Conflict, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
 mod checker;
 mod checks;
 mod constraints;
+mod fast_lane;
 mod functions;
 mod infer;
 mod lattice;
@@ -116,8 +117,9 @@ struct WalkState {
 /// The recorded pass's gate: fixpoint passes run unrecorded (`None`),
 /// the final pass runs recorded (`Some`) — the walk replays identically
 /// while the pin machinery arms and the rec-gated fact minters fire.
-/// (L3: the checker interleave and the exit/fast-lane minters are the
-/// gate's other historical consumers; they return with L4–L6.)
+/// (The checker interleave returned with L4, the fill-loop detector
+/// with L5; the exit-fate minters are the gate's remaining historical
+/// consumers, L6.)
 #[derive(Clone, Copy)]
 struct Recording {
     _priv: (),
@@ -236,12 +238,11 @@ struct OwnershipState {
     free_keeps: BTreeMap<NodeId, Vec<super::facts::Keep>>,
     rebind_grants: BTreeMap<NodeId, BTreeMap<String, Vec<super::facts::Keep>>>,
     stored_ctor_parents: BTreeSet<usize>,
-    /// Every IndexAssign whose value inferred table-typed — the same
-    /// predicate the lowerer's `contains_tables` ownership bit keys on.
-    /// (L5's fast lane reads it so a store's row kind survives a
+    /// [fast-lane] Every IndexAssign whose value inferred table-typed —
+    /// the same predicate the lowerer's `contains_tables` ownership bit
+    /// keys on. The fast lane reads it so a store's row kind survives a
     /// non-ctor spelling (`t[i] = r`), which the lane's syntactic
-    /// `TableCtor` check alone would miss and mark nothing.)
-    #[allow(dead_code)]
+    /// `TableCtor` check alone would miss and mark nothing.
     row_value_stores: BTreeSet<NodeId>,
     move_poisons: BTreeMap<NodeId, BTreeSet<String>>,
     store_ghost_keeps: BTreeMap<NodeId, Vec<usize>>,
@@ -254,7 +255,7 @@ struct HoldsState {
     hold_edges: BTreeMap<usize, BTreeSet<usize>>,
     cyclic_stores: BTreeMap<String, (String, usize)>,
     /// [fast-lane] Guard arithmetic shapes, written by every decl and
-    /// assignment the walk passes; L5's fill-loop detector is the read
+    /// assignment the walk passes; the fill-loop detector is the read
     /// side (guard nonneg/lower-bound/ascends facts).
     num_assigns: BTreeMap<String, Vec<NumExpr>>,
     nil_severed: BTreeMap<String, BTreeSet<usize>>,
@@ -271,6 +272,11 @@ struct ReadSideState {
 }
 
 struct LayoutFactsState {
+    /// [fast-lane] The (name, depth) pairs a fill loop proved dense —
+    /// the reserve plan builder's own read-back, the scan's scratch.
+    name_dense: BTreeMap<(String, usize), bool>,
+    fast_stores: BTreeMap<NodeId, super::facts::FastStoreElig>,
+    reserve_plans: BTreeMap<NodeId, super::facts::ReservePlan>,
     verdicts: Vec<LayoutVerdict>,
 }
 
@@ -485,6 +491,9 @@ pub fn analyze(ctx: &AnalysisContext<'_>, walk_pins: bool, surface: &Surface) ->
             boundary_fed: BTreeSet::new(),
         },
         layout: LayoutFactsState {
+            name_dense: BTreeMap::new(),
+            fast_stores: BTreeMap::new(),
+            reserve_plans: BTreeMap::new(),
             verdicts: vec![LayoutVerdict::Growing; n],
         },
         ctor_lines: ctx.ctor_lines.clone(),
@@ -623,9 +632,10 @@ pub fn analyze(ctx: &AnalysisContext<'_>, walk_pins: bool, surface: &Surface) ->
         chk.finish(&mut a.lattice.unknowns);
     }
     let chk_facts = chk.into_facts();
-    // (L6 receipt: decide_root_exit + plan_stmt_temp_frees run here in
-    // mirror, minting the exit-fate facts; L5 receipt: mint_fast_lane
-    // follows them.)
+    // (L6 receipt: mirror's `decide_root_exit` + `plan_stmt_temp_frees`
+    // run ahead of the lane mint here, writing exit-fate families the
+    // scan never reads — behavior-neutral to omit until they land.)
+    a.mint_fast_lane(ctx.ast);
 
     let mut facts = a
         .into_recorded(adopt_lines, static_elems, elems_diags, chk_facts)
@@ -817,9 +827,25 @@ impl Recorded {
             cell_children.entry(parent).or_default().extend(kids);
         }
 
-        // (L5 receipt: mirror's second-writer contract marks a reserve
-        // plan's pre-satisfied names from the checker's ffi.new mints
-        // here — the mints exist now, the plans land with L5.)
+        // [fast-lane] The second-writer contract's consumption marking:
+        // a reserve plan's pre-header name whose reserve an ffi.new mint
+        // over that name already satisfied skips its own reserve — the
+        // mint's reserve is the one reserve.
+        let mint_caps: BTreeSet<&str> = self
+            .chk
+            .ffi_mints
+            .values()
+            .filter(|m| !m.name.is_empty())
+            .map(|m| m.name.as_str())
+            .collect();
+        for plan in self.layout.reserve_plans.values_mut() {
+            plan.pre_satisfied = plan
+                .pre_header
+                .iter()
+                .filter(|n| mint_caps.contains(n.as_str()))
+                .cloned()
+                .collect();
+        }
 
         ShapeFacts {
             sites: self.lattice.sites,
@@ -829,6 +855,8 @@ impl Recorded {
             free_keeps: self.own.free_keeps,
             rebind_frees: self.own.rebind_grants,
             move_poisons: self.own.move_poisons,
+            fast_stores: self.layout.fast_stores,
+            reserve_plans: self.layout.reserve_plans,
             stored_ctor_parents: self.own.stored_ctor_parents,
             substitutions,
             row_reads: std::mem::take(&mut self.reads.row_reads),
