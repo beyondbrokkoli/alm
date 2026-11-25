@@ -415,6 +415,23 @@ pub struct ExitCounts {
     pub scalar_skip: u32,
 }
 
+impl ExitCounts {
+    /// Two programs' counts summed — the corpus totals.
+    pub fn add(self, other: ExitCounts) -> ExitCounts {
+        ExitCounts {
+            do_exit: self.do_exit + other.do_exit,
+            stmt_temp: self.stmt_temp + other.stmt_temp,
+            root_exit: self.root_exit + other.root_exit,
+            ret_path: self.ret_path + other.ret_path,
+            cond_temp: self.cond_temp + other.cond_temp,
+            arm_temp: self.arm_temp + other.arm_temp,
+            ret_keep: self.ret_keep + other.ret_keep,
+            arm_split: self.arm_split + other.arm_split,
+            scalar_skip: self.scalar_skip + other.scalar_skip,
+        }
+    }
+}
+
 /// The trace registry's slot ids by signal name: `<slot> <NAME> <tier>
 /// <text>` rows, comments and blanks ignored. Slots are looked up by
 /// name, never hard-coded.
@@ -462,15 +479,23 @@ fn plate_pokes(plate: &[u8]) -> BTreeMap<u8, u32> {
     pokes
 }
 
-/// The oracle's own count of the exit facts it minted for one program
-/// (L6_HARNESS.md §3). mirror has no facts dump, but it writes a
-/// trace plate unconditionally and the exit-family slots are poked
-/// only from `exits.rs`. A corpus file compiles from its own path;
-/// anything else is `name` written into a scratch directory, so a pin
-/// can pass its source. The run takes the case's FLAGS, the module
-/// root, core limit 0 (the oracle aborts by design on 17 cases) and
-/// no watcher variables.
-pub fn oracle_exit_counts(name: &str, text: &str) -> ExitCounts {
+/// One oracle run: the process's output and the scratch directory it
+/// ran in — the plate lands there, and the caller removes it once the
+/// run is read.
+struct OracleRun {
+    out: std::process::Output,
+    scratch: PathBuf,
+}
+
+/// Spawns the oracle on one program (L6_HARNESS.md §2): a corpus file
+/// compiles from its own path; anything else is `name` written into a
+/// scratch directory, so a pin can pass its source. One directory per
+/// run — the plate lands in the oracle's working directory, so two
+/// runs sharing one would read each other's plate (the pins call this
+/// in parallel). The run takes the case's FLAGS, the module root, core
+/// limit 0 (the oracle aborts by design on 17 cases) and no watcher
+/// variables.
+fn run_oracle(name: &str, text: &str) -> OracleRun {
     let cases = cases_dir();
     let binary = cases
         .parent()
@@ -482,9 +507,6 @@ pub fn oracle_exit_counts(name: &str, text: &str) -> ExitCounts {
          (cd ../mirror_experimental && cargo build --release)"
     );
 
-    // One scratch directory per run: the plate lands in the oracle's
-    // working directory, so two runs sharing one would read each
-    // other's plate (the pins call this in parallel).
     static RUNS: AtomicU64 = AtomicU64::new(0);
     let scratch = std::env::temp_dir().join(format!(
         "alm_l6_oracle_scratch_{}_{}",
@@ -523,6 +545,15 @@ pub fn oracle_exit_counts(name: &str, text: &str) -> ExitCounts {
         .env_remove("ALM_OMNI_STRICT")
         .output()
         .unwrap_or_else(|e| panic!("running the oracle {} failed: {e}", binary.display()));
+    OracleRun { out, scratch }
+}
+
+/// The oracle's own count of the exit facts it minted for one program
+/// (L6_HARNESS.md §3). mirror has no facts dump, but it writes a
+/// trace plate unconditionally and the exit-family slots are poked
+/// only from `exits.rs`.
+pub fn oracle_exit_counts(name: &str, text: &str) -> ExitCounts {
+    let OracleRun { out, scratch } = run_oracle(name, text);
     let plate = std::fs::read(scratch.join(".alm_trace.bin")).unwrap_or_else(|e| {
         panic!(
             "the oracle left no trace plate ({}): {e} — exit {out:?}",
@@ -531,7 +562,7 @@ pub fn oracle_exit_counts(name: &str, text: &str) -> ExitCounts {
     });
     let _ = std::fs::remove_dir_all(&scratch);
 
-    let registry_path = cases
+    let registry_path = cases_dir()
         .parent()
         .expect("corpus root has a parent")
         .join("trace_signals.txt");
@@ -558,21 +589,49 @@ pub fn oracle_exit_counts(name: &str, text: &str) -> ExitCounts {
     }
 }
 
+/// The oracle's verdict on one program: whether it accepted the
+/// compile, and its stderr without the `ALM_TRACE:` pokes — the lines
+/// a diagnostic pin compares (L6_HARNESS.md §2: filter the trace
+/// lines, gate on the exit status, then read the first line).
+pub fn oracle_verdict(name: &str, text: &str) -> (bool, Vec<String>) {
+    let OracleRun { out, scratch } = run_oracle(name, text);
+    let _ = std::fs::remove_dir_all(&scratch);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    (
+        out.status.success(),
+        stderr
+            .lines()
+            .filter(|line| !line.starts_with("ALM_TRACE:"))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 /// alm's side of the oracle table (L6_HARNESS.md §3): what the facts
 /// hold, per family, in the oracle's units — one key per poke for the
-/// temp maps. A family counts zero until its checkpoint lands it: 6.2
-/// mints the do-exit, root-exit and arm-split maps, 6.3 the
-/// ret/break-path and ret-keep ones.
+/// temp maps. The oracle pokes `DO_EXIT_FREE_SITE` once per free of
+/// every scope-death plan, the root drain's included, and
+/// `JOIN_ARM_SPLIT` once per arm-split entry across its four maps (two
+/// live since L3). The ret/break-path and ret-keep families count zero
+/// until 6.3 lands them.
 pub fn count_exit_families(facts: &ShapeFacts) -> ExitCounts {
     ExitCounts {
-        do_exit: 0,
+        do_exit: (facts.root_exit_frees.len()
+            + facts.do_exit_frees.values().map(Vec::len).sum::<usize>()) as u32,
         stmt_temp: facts.stmt_temp_frees.len() as u32,
-        root_exit: 0,
+        root_exit: facts.root_exit_frees.len() as u32,
         ret_path: 0,
         cond_temp: facts.cond_temp_frees.len() as u32,
         arm_temp: facts.arm_temp_frees.len() as u32,
         ret_keep: 0,
-        arm_split: 0,
+        arm_split: (facts
+            .arm_do_exit_frees
+            .values()
+            .chain(facts.arm_free_sites.values())
+            .chain(facts.arm_rebind_frees.values())
+            .map(Vec::len)
+            .sum::<usize>()
+            + facts.arm_root_exit_frees.len()) as u32,
         scalar_skip: 0,
     }
 }
@@ -616,6 +675,33 @@ pub fn facts_of(source: &str) -> (Vec<Stmt>, ShapeFacts) {
                 "pin source must analyze clean: {:?}",
                 facts.diagnostics
             );
+            (out.ast, facts)
+        })
+        .expect("spawn pin thread")
+        .join()
+        .expect("pin thread panicked")
+}
+
+/// The refused program's driver (6.2's diagnostic pin): `facts_of`'s
+/// run, keeping the diagnostics instead of refusing them. The exit
+/// planners run on whatever the walk got through — a scope-exit claim
+/// that refuses a later read is minted before it refuses, and
+/// `analyze_stage` would drop both the facts and this path.
+pub fn facts_with_diagnostics(source: &str) -> (Vec<Stmt>, ShapeFacts) {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let surface = Surface::default();
+            let src = SourceFile::new("pin.lua", source);
+            let out = front(&src, &surface);
+            assert!(
+                out.diagnostics.is_empty(),
+                "pin source must parse clean: {:?}",
+                out.diagnostics
+            );
+            let ctx = build_context(&out.ast);
+            let facts = alm::shape::analyze(&ctx, true, &surface);
             (out.ast, facts)
         })
         .expect("spawn pin thread")

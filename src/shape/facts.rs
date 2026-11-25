@@ -14,6 +14,14 @@ pub enum Keep {
     Ghost(usize),
 }
 
+#[derive(Clone)]
+pub struct DoExitFree {
+    #[allow(dead_code)]
+    pub site: usize,
+    pub carrier: String,
+    pub keeps: Vec<Keep>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TagSrc {
     If(NodeId),
@@ -221,6 +229,8 @@ pub struct ShapeFacts {
     pub layouts: Vec<LayoutVerdict>,
     pub free_sites: BTreeSet<NodeId>,
     pub free_keeps: BTreeMap<NodeId, Vec<Keep>>,
+    pub do_exit_frees: BTreeMap<(NodeId, u8), Vec<DoExitFree>>,
+    pub root_exit_frees: Vec<DoExitFree>,
     pub stmt_temp_frees: BTreeMap<NodeId, Vec<usize>>,
     pub cond_temp_frees: BTreeMap<NodeId, Vec<usize>>,
     pub arm_temp_frees: BTreeMap<NodeId, Vec<usize>>,
@@ -231,6 +241,8 @@ pub struct ShapeFacts {
     pub ctor_ghost_keeps: BTreeMap<NodeId, Vec<(usize, usize)>>,
     pub arm_free_sites: BTreeMap<NodeId, Vec<ArmFreeEntry>>,
     pub arm_rebind_frees: BTreeMap<NodeId, Vec<ArmFreeEntry>>,
+    pub arm_do_exit_frees: BTreeMap<(NodeId, u8), Vec<ArmFreeEntry>>,
+    pub arm_root_exit_frees: Vec<ArmFreeEntry>,
     pub move_poisons: BTreeMap<NodeId, BTreeSet<String>>,
     /// [fast-lane] The fast-store eligibility facts — the L5 families.
     /// The dump renders them; the lowerer (L7) reads them behind

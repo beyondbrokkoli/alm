@@ -325,6 +325,49 @@ pub fn render_shape(facts: &ShapeFacts, ast: &[Stmt]) -> String {
         }
     }
 
+    // — the exit-fate families (L6): the scope-death planner's maps
+    // (6.2). A do-exit entry is keyed by the scope that died — its
+    // statement's line and arm — and frees one site or row ghost; the
+    // root drain frees the host chunk's own bindings in name order. A
+    // key whose list is empty prints nothing (`do_exit_frees` holds a
+    // key for nearly every If / While / Do / fn literal), so a section
+    // prints only when it has an entry line.
+    {
+        let do_exit: Vec<String> = facts
+            .do_exit_frees
+            .iter()
+            .flat_map(|((stmt, arm), frees)| {
+                frees.iter().map(move |f| {
+                    format!(
+                        "  @line {} arm {arm} site {} {} keeps: {}",
+                        line_of(*stmt),
+                        f.site,
+                        f.carrier,
+                        render_keeps(&f.keeps)
+                    )
+                })
+            })
+            .collect();
+        if !do_exit.is_empty() {
+            emitf("do-exit-frees:".into());
+            for entry in do_exit {
+                emitf(entry);
+            }
+        }
+    }
+
+    if !facts.root_exit_frees.is_empty() {
+        emitf("root-exit-frees:".into());
+        for f in &facts.root_exit_frees {
+            emitf(format!(
+                "  site {} {} keeps: {}",
+                f.site,
+                f.carrier,
+                render_keeps(&f.keeps)
+            ));
+        }
+    }
+
     // — the exit-fate families (L6): the temp-fate planner's three
     // maps (6.1) — the ctor sites born in a statement, a condition, an
     // and/or operand and freed where the value dies. Site ids print
@@ -399,6 +442,47 @@ pub fn render_shape(facts: &ShapeFacts, ast: &[Stmt]) -> String {
                     render_keeps(&e.keeps)
                 ));
             }
+        }
+    }
+
+    // The scope-death planner's arm-split half (6.2): a mixed binding
+    // whose arms release differently frees on the join's tag, keyed by
+    // the scope that died like the do-exit entries above.
+    {
+        let arm_do_exit: Vec<String> = facts
+            .arm_do_exit_frees
+            .iter()
+            .flat_map(|((stmt, arm), splits)| {
+                splits.iter().map(move |e| {
+                    format!(
+                        "  @line {} arm {arm} {} tag {} nothing_on={} keeps: {}",
+                        line_of(*stmt),
+                        e.carrier,
+                        render_tag(&e.tag, &line_of),
+                        e.nothing_on,
+                        render_keeps(&e.keeps)
+                    )
+                })
+            })
+            .collect();
+        if !arm_do_exit.is_empty() {
+            emitf("arm-do-exit-frees:".into());
+            for entry in arm_do_exit {
+                emitf(entry);
+            }
+        }
+    }
+
+    if !facts.arm_root_exit_frees.is_empty() {
+        emitf("arm-root-exit-frees:".into());
+        for e in &facts.arm_root_exit_frees {
+            emitf(format!(
+                "  {} tag {} nothing_on={} keeps: {}",
+                e.carrier,
+                render_tag(&e.tag, &line_of),
+                e.nothing_on,
+                render_keeps(&e.keeps)
+            ));
         }
     }
 

@@ -1,11 +1,13 @@
-//! The exit-fate pins (L6_DESIGN.md §6): the temp-fate programs of
+//! The exit-fate pins (L6_DESIGN.md §6): the hand-written programs of
 //! `L6_PORT_MAP.md` §7, each asserting what the organ's law says —
 //! derived from its code, never from a run — and carrying the oracle's
-//! own count for its source (L6_HARNESS.md §3). Facts are addressed
-//! through the rendered dump: a section by name, a statement by line,
-//! a ctor site by the line it was born on — never a raw id. Where two
-//! ctors share a line (T9, L1 and its control) the pin destructures
-//! the statement to the ctor nodes instead.
+//! own count for its source (L6_HARNESS.md §3). The temp-fate programs
+//! (T1–T9, 6.1) and the scope-death and root-drain programs (S1–S9,
+//! 6.2). Facts are addressed through the rendered dump: a section by
+//! name, a statement by line, a ctor site by the line it was born on —
+//! never a raw id. Where two ctors share a line (T9, L1 and its
+//! control) the pin destructures the statement to the ctor nodes
+//! instead.
 //!
 //! The one lease, `known_lease/field-obj-arm-scan`, asserts the
 //! correct behaviour under `common::xfail`: it must fail until the
@@ -15,7 +17,10 @@ mod common;
 
 use alm::ast::{BinOp, Expr, NodeId, Stmt};
 use alm::shape::ShapeFacts;
-use common::{oracle_exit_counts, section, site_of, xfail};
+use common::{
+    analyze_with_lever, count_exit_families, oracle_exit_counts, oracle_verdict, section, site_of,
+    xfail,
+};
 
 const T1: &str = "local f = function() return {1, 2} end\n\
                   print(f()[0])\n\
@@ -464,4 +469,580 @@ fn l1_lease_field_obj_arm_scan() {
             "the right operand of the `and` is arm-keyed, freeing its ctor's site"
         );
     });
+}
+
+// — 6.2: scope death and the root drain (`L6_PORT_MAP.md` §7). The
+// programs keep their own line numbers: the pins name statements by
+// line.
+
+const S1: &str = "do
+    local t = {}
+    t[0] = 1
+    print(t[0])
+end
+";
+
+const S2: &str = "local i = 0
+while i < 2 do
+    local t = {}
+    t[0] = i
+    print(t[0])
+    i = i + 1
+end
+";
+
+const S3: &str = "if 1 < 2 then
+    local t = {}
+    t[0] = 1
+    print(t[0])
+end
+";
+
+const S4: &str = "local t = {5, 6}
+local u = {7}
+print(t[0] + u[0])
+";
+
+/// S5 with a second read of the row after its housing died.
+const S6: &str = "local a = {{1, 2}, {3}}
+do
+    local t = {}
+    t[0] = a[0]
+    print(t[0][0])
+end
+print(a[0][0])
+";
+
+const S8: &str = "do
+    local mix_base = {{9, 8}, {7}}
+    local mix
+    if 1 == 1 then mix = {99} else mix = mix_base[0] end
+    print(mix[0])
+end
+";
+
+const S9: &str = "local mix_base = {{9, 8}, {7}}
+local mix
+if 1 == 1 then mix = {99} else mix = mix_base[0] end
+print(mix[0])
+";
+
+/// S5 on its own: the first five lines of S6.
+const S5: &str = "local a = {{1, 2}, {3}}
+do
+    local t = {}
+    t[0] = a[0]
+    print(t[0][0])
+end
+";
+
+/// One exit free as the dump renders it: the carrier, the site it
+/// frees — a ctor site or a row ghost, printed raw — and its keeps.
+#[derive(Debug, PartialEq)]
+struct Freed {
+    site: usize,
+    carrier: String,
+    keeps: Vec<String>,
+}
+
+/// One arm-split free as the dump renders it. `at` is the scope key —
+/// the owning statement's line and its arm — on a do-exit entry, and
+/// `None` on the root drain's.
+#[derive(Debug, PartialEq)]
+struct ArmSplit {
+    at: Option<(u32, u8)>,
+    carrier: String,
+    tag: String,
+    nothing_on: bool,
+    keeps: Vec<String>,
+}
+
+/// An entry line split at its `keeps:` field: what precedes it, and
+/// the keeps as rendered (names, `ghost N`) — empty when none.
+fn keeps_field(line: &str) -> (&str, Vec<String>) {
+    let (head, keeps) = line
+        .trim()
+        .rsplit_once("keeps:")
+        .unwrap_or_else(|| panic!("not an exit-fate entry: {line:?}"));
+    let keeps = keeps.trim();
+    (
+        head.trim_end(),
+        if keeps.is_empty() {
+            Vec::new()
+        } else {
+            keeps.split(", ").map(str::to_string).collect()
+        },
+    )
+}
+
+/// A do-exit entry — `  @line L arm K site S carrier keeps: …` — as
+/// the scope's line, its arm, and the free.
+fn do_exit_entry(line: &str) -> (u32, u8, Freed) {
+    let (head, keeps) = keeps_field(line);
+    let (scope, rest) = head
+        .strip_prefix("@line ")
+        .and_then(|rest| rest.split_once(" arm "))
+        .unwrap_or_else(|| panic!("not a do-exit entry: {line:?}"));
+    let (arm, rest) = rest.split_once(" site ").expect("the freed site");
+    let (site, carrier) = rest.split_once(' ').expect("the carrier");
+    (
+        scope.parse().expect("a line number"),
+        arm.parse().expect("an arm"),
+        Freed {
+            site: site.parse().expect("a site id"),
+            carrier: carrier.to_string(),
+            keeps,
+        },
+    )
+}
+
+/// A root-drain entry — `  site S carrier keeps: …`.
+fn root_exit_entry(line: &str) -> Freed {
+    let (head, keeps) = keeps_field(line);
+    let (site, carrier) = head
+        .strip_prefix("site ")
+        .and_then(|rest| rest.split_once(' '))
+        .unwrap_or_else(|| panic!("not a root-exit entry: {line:?}"));
+    Freed {
+        site: site.parse().expect("a site id"),
+        carrier: carrier.to_string(),
+        keeps,
+    }
+}
+
+/// An arm-split entry — `[`@line L arm K `]carrier tag T
+/// nothing_on=B keeps: …`: the scope key on a do-exit entry, none on
+/// the root drain's.
+fn arm_split_entry(line: &str) -> ArmSplit {
+    let (head, keeps) = keeps_field(line);
+    let (at, rest) = match head.strip_prefix("@line ") {
+        Some(rest) => {
+            let (scope, rest) = rest.split_once(" arm ").expect("the scope's arm");
+            let (arm, rest) = rest.split_once(' ').expect("the carrier");
+            (
+                Some((
+                    scope.parse().expect("a line number"),
+                    arm.parse().expect("an arm"),
+                )),
+                rest,
+            )
+        }
+        None => (None, head),
+    };
+    let (carrier, rest) = rest.split_once(" tag ").expect("the join's tag");
+    let (tag, nothing_on) = rest.split_once(" nothing_on=").expect("nothing_on");
+    ArmSplit {
+        at,
+        carrier: carrier.to_string(),
+        tag: tag.to_string(),
+        nothing_on: nothing_on.parse().expect("a bool"),
+        keeps,
+    }
+}
+
+/// The do-exit frees under the scope at `line`, arm `arm` — empty
+/// when that scope frees nothing (its key then prints no line).
+fn do_exit_at(dump: &str, line: u32, arm: u8) -> Vec<Freed> {
+    section(dump, "do-exit-frees")
+        .iter()
+        .filter_map(|entry| do_exit_entry(entry).into())
+        .filter(|(at, k, _)| *at == line && *k == arm)
+        .map(|(_, _, f)| f)
+        .collect()
+}
+
+/// The root drain's frees, in name order.
+fn root_exit(dump: &str) -> Vec<Freed> {
+    section(dump, "root-exit-frees")
+        .iter()
+        .map(|entry| root_exit_entry(entry))
+        .collect()
+}
+
+/// The arm-split frees under the scope at `line`, arm `arm`.
+fn arm_do_exit_at(dump: &str, line: u32, arm: u8) -> Vec<ArmSplit> {
+    section(dump, "arm-do-exit-frees")
+        .iter()
+        .map(|entry| arm_split_entry(entry))
+        .filter(|split| split.at == Some((line, arm)))
+        .collect()
+}
+
+/// The root drain's arm-split frees.
+fn arm_root(dump: &str) -> Vec<ArmSplit> {
+    section(dump, "arm-root-exit-frees")
+        .iter()
+        .map(|entry| arm_split_entry(entry))
+        .collect()
+}
+
+/// A `local x = <expr>` statement's initializer.
+fn initializer(stmt: &Stmt) -> &Expr {
+    let Stmt::LocalDecl { exprs, .. } = stmt else {
+        panic!("the statement is a local declaration")
+    };
+    &exprs[0]
+}
+
+/// The row ghosts a store at `line` houses — its row of the
+/// `store-ghost-keeps` section.
+fn ghosts_housed_at(dump: &str, line: u32) -> Vec<usize> {
+    section(dump, "store-ghost-keeps")
+        .iter()
+        .filter_map(|row| {
+            let (at, list) = row.trim().strip_prefix("@line ")?.split_once(" ghosts [")?;
+            (at.parse::<u32>() == Ok(line)).then(|| {
+                list.strip_suffix(']')
+                    .expect("the ghost list closes")
+                    .split(' ')
+                    .filter(|g| !g.is_empty())
+                    .map(|g| g.parse().expect("a ghost id"))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .flatten()
+        .collect()
+}
+
+#[test]
+fn s1_do_plain_free() {
+    let (ast, facts) = common::facts_of(S1);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    // A block's death plans its innermost scope — the Do's own — after
+    // the body walk and before the pop: `t` dies there with its one
+    // ctor, nothing kept. The root scope holds only `arg`, whose alias
+    // is a root site and is filtered, so the drain frees nothing.
+    assert!(
+        matches!(&ast[0], Stmt::Do { .. }),
+        "the program is one do block"
+    );
+    assert_eq!(facts.do_exit_frees.len(), 1, "one scope key — the block's");
+    assert!(facts.do_exit_frees.contains_key(&(ast[0].id(), 0)));
+    assert_eq!(
+        do_exit_at(&dump, 1, 0),
+        [Freed {
+            site: site_born_at(&dump, 2),
+            carrier: "t".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    assert!(root_exit(&dump).is_empty());
+    assert!(facts.root_exit_frees.is_empty());
+    let oracle = oracle_exit_counts("s1_do_plain_free.lua", S1);
+    assert_eq!((oracle.do_exit, oracle.root_exit), (1, 0));
+    let mine = count_exit_families(&facts);
+    assert_eq!((mine.do_exit, mine.root_exit), (1, 0));
+}
+
+#[test]
+fn s2_while_body_scope_free() {
+    let (ast, facts) = common::facts_of(S2);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    // The While arm plans inside `with_scope`, on every trip of the
+    // latch loop: each trip re-plans the body scope under the one key
+    // `(While, 0)`, and the insert replaces, so one fact stands. `i`
+    // is a value kind: the root drain skips it.
+    assert!(matches!(&ast[1], Stmt::While { .. }));
+    assert_eq!(
+        facts.do_exit_frees.len(),
+        1,
+        "one scope key — the loop body's"
+    );
+    assert!(facts.do_exit_frees.contains_key(&(ast[1].id(), 0)));
+    assert_eq!(
+        do_exit_at(&dump, 2, 0),
+        [Freed {
+            site: site_born_at(&dump, 3),
+            carrier: "t".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    assert!(root_exit(&dump).is_empty());
+    let oracle = oracle_exit_counts("s2_while_body_scope_free.lua", S2);
+    assert_eq!((oracle.do_exit, oracle.root_exit), (1, 0));
+    let mine = count_exit_families(&facts);
+    assert_eq!((mine.do_exit, mine.root_exit), (1, 0));
+}
+
+#[test]
+fn s3_if_arm_scope_free() {
+    let (ast, facts) = common::facts_of(S3);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    // Each arm is its own scope, planned as it closes: the then arm
+    // (k = 0) frees `t`; the else arm (k = 1) owns nothing, and its key
+    // still lands — with an empty list, which prints no line, so that
+    // half reads off the map.
+    assert!(matches!(&ast[0], Stmt::If { .. }));
+    assert_eq!(
+        do_exit_at(&dump, 1, 0),
+        [Freed {
+            site: site_born_at(&dump, 2),
+            carrier: "t".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    assert!(
+        facts
+            .do_exit_frees
+            .get(&(ast[0].id(), 1))
+            .is_some_and(|frees| frees.is_empty()),
+        "the else arm's key lands with an empty list"
+    );
+    assert_eq!(
+        facts.do_exit_frees.len(),
+        2,
+        "the then arm and the else arm"
+    );
+    assert!(root_exit(&dump).is_empty());
+    let oracle = oracle_exit_counts("s3_if_arm_scope_free.lua", S3);
+    assert_eq!((oracle.do_exit, oracle.root_exit), (1, 0));
+    let mine = count_exit_families(&facts);
+    assert_eq!((mine.do_exit, mine.root_exit), (1, 0));
+}
+
+#[test]
+fn s4_root_drain() {
+    let (ast, facts) = common::facts_of(S4);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    // The root drain plans scope 0 once the walk is done: every
+    // binding with a non-root alias frees, in name order (the dying
+    // scope is a BTreeMap) — `t` then `u` — each with nothing kept. No
+    // inner scope died on the way, so the do-exit map is empty.
+    assert!(facts.do_exit_frees.is_empty());
+    assert_eq!(
+        root_exit(&dump),
+        [
+            Freed {
+                site: site_born_at(&dump, 1),
+                carrier: "t".into(),
+                keeps: Vec::new(),
+            },
+            Freed {
+                site: site_born_at(&dump, 2),
+                carrier: "u".into(),
+                keeps: Vec::new(),
+            },
+        ]
+    );
+    let oracle = oracle_exit_counts("s4_root_drain.lua", S4);
+    assert_eq!((oracle.do_exit, oracle.root_exit), (2, 2));
+    let mine = count_exit_families(&facts);
+    assert_eq!((mine.do_exit, mine.root_exit), (2, 2));
+}
+
+#[test]
+fn s5_housed_origin_defers_fire_with_keeps() {
+    let (ast, facts) = common::facts_of(S5);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    let Stmt::Do { body, .. } = &ast[1] else {
+        panic!("the program ends in a do block")
+    };
+    let a = site_of(&facts, initializer(&ast[0]).id());
+    let t = site_of(&facts, initializer(&body[0]).id());
+    let [ghost] = ghosts_housed_at(&dump, 4)[..] else {
+        panic!("the store on line 4 houses one row")
+    };
+    // The store `t[0] = a[0]` houses the row ghost in `t`: it links
+    // the row's site into t's `row_links`; t's own aliases stay its one
+    // ctor, so nothing is mixed and nothing defers.
+    // `housed_in_release` answers two different sets. At the block's
+    // death t's release finds the ghost's base in t's *housing*: the
+    // ghost is claimed, not spared, and t's free carries no keep. At
+    // the root drain a's release set holds the row's site while a
+    // houses nothing: the same ghost is *spared*, and a's free carries
+    // it as its one keep. The block frees `t` alone — `a` is a root
+    // binding — and the drain frees `a`.
+    assert_eq!(
+        do_exit_at(&dump, 2, 0),
+        [Freed {
+            site: t,
+            carrier: "t".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    assert_eq!(facts.do_exit_frees.len(), 1);
+    assert_eq!(
+        root_exit(&dump),
+        [Freed {
+            site: a,
+            carrier: "a".into(),
+            keeps: vec![format!("ghost {ghost}")],
+        }]
+    );
+    let oracle = oracle_exit_counts("s5_housed_origin_defers_fire_with_keeps.lua", S5);
+    assert_eq!((oracle.do_exit, oracle.root_exit), (2, 1));
+    let mine = count_exit_families(&facts);
+    assert_eq!((mine.do_exit, mine.root_exit), (2, 1));
+}
+
+#[test]
+fn s6_scope_exit_claim_read_refused() {
+    // The refusal the claim buys: after the block dies, the row `a[0]`
+    // was released with its housing `t` (S5's claim), so reading it
+    // through `a` again is a read of a claimed ghost.
+    const REFUSED: &str = "line 7: Lifetime Error: this row was already released with its \
+                           housing — read it through the housing's cell before it drops";
+    let (ast, facts) = common::facts_with_diagnostics(S6);
+    let refusals: Vec<String> = facts.diagnostics.iter().map(|d| d.render()).collect();
+    assert_eq!(refusals, [REFUSED], "S6 is refused, once, at the read");
+    // The exit planners ran all the same — they ride the tail whatever
+    // the walk's outcome: the block's free of `t` and the drain's of
+    // `a`, as in S5.
+    let dump = alm::dump::render_shape(&facts, &ast);
+    let Stmt::Do { body, .. } = &ast[1] else {
+        panic!("the program's second statement is the do block")
+    };
+    let t = site_of(&facts, initializer(&body[0]).id());
+    assert_eq!(
+        do_exit_at(&dump, 2, 0)
+            .iter()
+            .map(|f| (f.site, f.carrier.as_str(), f.keeps.is_empty()))
+            .collect::<Vec<_>>(),
+        [(t, "t", true)]
+    );
+    let root = root_exit(&dump);
+    assert_eq!(root.len(), 1);
+    assert_eq!(root[0].carrier, "a");
+    assert_eq!(
+        root[0].keeps.len(),
+        1,
+        "a's free spares the housed row ghost, as in S5"
+    );
+    // The canonical path (front → splice → walk + checker → gate)
+    // refuses with the same line.
+    match analyze_with_lever(
+        "s6_scope_exit_claim_read_refused.lua".into(),
+        S6.into(),
+        true,
+    ) {
+        Err((_stage, text)) => assert_eq!(text, REFUSED),
+        Ok(dump) => panic!("the pipeline accepts S6:\n{dump}"),
+    }
+    // The oracle's refusal, byte for byte: exit status 1, and one
+    // stderr line once the trace pokes are filtered.
+    let (accepted, stderr) = oracle_verdict("s6_scope_exit_claim_read_refused.lua", S6);
+    assert!(!accepted, "the oracle accepts S6: {stderr:?}");
+    assert_eq!(stderr, [REFUSED.to_string()]);
+}
+
+#[test]
+fn s8_arm_split_do_exit() {
+    let (ast, facts) = common::facts_of(S8);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    let Stmt::Do { body, .. } = &ast[0] else {
+        panic!("the program is one do block")
+    };
+    let Stmt::If { .. } = &body[2] else {
+        panic!("the block's third statement is the if")
+    };
+    let mix_base = site_of(&facts, initializer(&body[0]).id());
+    // The If joins `mix` mixed — `{99}` on the then arm, the row
+    // `mix_base[0]` on the else arm — so at the block's death
+    // `plan_mixed` reads the arms back: the then arm owns a fresh
+    // ctor and never defers; the else arm's row has its origin in
+    // `mix_base`, still live, so it defers. One deferring arm and one
+    // firing arm is the split: the free rides the join's tag, it is
+    // `nothing_on` the then arm (the tag's false), and keeps nothing —
+    // `mix_base` borrows none of the fresh ctor. The binding is pushed
+    // housed and skipped: the block's own free is `mix_base`'s.
+    assert_eq!(
+        arm_do_exit_at(&dump, 1, 0),
+        [ArmSplit {
+            at: Some((1, 0)),
+            carrier: "mix".into(),
+            tag: "if @line 4".into(),
+            nothing_on: false,
+            keeps: Vec::new(),
+        }]
+    );
+    assert_eq!(facts.arm_do_exit_frees.len(), 1);
+    assert_eq!(
+        do_exit_at(&dump, 1, 0),
+        [Freed {
+            site: mix_base,
+            carrier: "mix_base".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    // The If inside the block owns two arm scopes of its own. Each
+    // assigns to `mix`, a binding of the block, so each dies owning
+    // nothing: its key lands with an empty list.
+    assert_eq!(
+        facts.do_exit_frees.len(),
+        3,
+        "the block and the if's two arms — no other scope died"
+    );
+    for arm in [0, 1] {
+        assert!(
+            facts
+                .do_exit_frees
+                .get(&(body[2].id(), arm))
+                .is_some_and(|frees| frees.is_empty()),
+            "the if's arm {arm} frees nothing"
+        );
+    }
+    assert!(root_exit(&dump).is_empty());
+    assert!(facts.arm_root_exit_frees.is_empty());
+    // The tag the split rides is the join's own fact.
+    assert_eq!(section(&dump, "join-tags"), ["  @line 4 -> false"]);
+    let oracle = oracle_exit_counts("s8_arm_split_do_exit.lua", S8);
+    assert_eq!(
+        (oracle.arm_split, oracle.do_exit, oracle.root_exit),
+        (1, 1, 0)
+    );
+    let mine = count_exit_families(&facts);
+    assert_eq!((mine.arm_split, mine.do_exit, mine.root_exit), (1, 1, 0));
+}
+
+#[test]
+fn s9_arm_split_root() {
+    let (ast, facts) = common::facts_of(S9);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    let mix_base = site_of(&facts, initializer(&ast[0]).id());
+    let Stmt::If { .. } = &ast[2] else {
+        panic!("the program's third statement is the if")
+    };
+    // The same join at the root: the drain finds `mix` mixed and
+    // splits it — `nothing_on` the then arm, keeping nothing — and
+    // frees `mix_base` plainly.
+    assert_eq!(
+        arm_root(&dump),
+        [ArmSplit {
+            at: None,
+            carrier: "mix".into(),
+            tag: "if @line 3".into(),
+            nothing_on: false,
+            keeps: Vec::new(),
+        }]
+    );
+    assert_eq!(facts.arm_root_exit_frees.len(), 1);
+    assert_eq!(
+        root_exit(&dump),
+        [Freed {
+            site: mix_base,
+            carrier: "mix_base".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    // The If's two arm scopes died owning nothing (as in S8): their
+    // keys land with empty lists and print no line.
+    assert_eq!(facts.do_exit_frees.len(), 2, "the if's two arms");
+    for arm in [0, 1] {
+        assert!(
+            facts
+                .do_exit_frees
+                .get(&(ast[2].id(), arm))
+                .is_some_and(|frees| frees.is_empty()),
+            "the if's arm {arm} frees nothing"
+        );
+    }
+    assert!(facts.arm_do_exit_frees.is_empty());
+    assert_eq!(section(&dump, "join-tags"), ["  @line 3 -> false"]);
+    let oracle = oracle_exit_counts("s9_arm_split_root.lua", S9);
+    assert_eq!(
+        (oracle.arm_split, oracle.do_exit, oracle.root_exit),
+        (1, 1, 1)
+    );
+    let mine = count_exit_families(&facts);
+    assert_eq!((mine.arm_split, mine.do_exit, mine.root_exit), (1, 1, 1));
 }

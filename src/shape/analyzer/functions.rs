@@ -239,8 +239,7 @@ impl Analyzer {
         self.fn_ret_reaches.push(BTreeSet::new());
         self.fn_walk.push((fn_ptr, params.to_vec()));
         self.fn_scope_entries.push(self.walk.scopes.len());
-        // (L6 receipt: `decide_scope_exit(rec, key)` records the fn
-        // body scope's exit frees inside the closure here.)
+        let mut result = Ok(());
         self.with_scope(|an| {
             let scope = an.walk.scopes.last_mut().unwrap();
             for p in params {
@@ -265,6 +264,9 @@ impl Analyzer {
                 );
             }
             an.walk_stmts(rec, body);
+            if let Err(err) = an.decide_scope_exit(rec, key) {
+                result = Err(err);
+            }
         });
         self.fn_scope_entries.pop();
         self.fn_walk.pop();
@@ -280,7 +282,7 @@ impl Analyzer {
         if let Some(shape) = joined {
             self.fn_ret_shapes.insert(fn_ptr, shape);
         }
-        Ok(())
+        result
     }
 
     pub(super) fn sever_creation_captures(&mut self, rec: Gate, stmt: &Stmt) {

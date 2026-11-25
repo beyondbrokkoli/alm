@@ -29,6 +29,7 @@ mod walk;
 
 use infer::*;
 use lattice::*;
+use rebind::*;
 use rows::*;
 
 struct ShapeError(pub Diagnostic);
@@ -237,6 +238,8 @@ struct GhostMint {
 struct OwnershipState {
     free_sites: BTreeSet<NodeId>,
     free_keeps: BTreeMap<NodeId, Vec<super::facts::Keep>>,
+    do_exit_frees: BTreeMap<(NodeId, u8), Vec<super::facts::DoExitFree>>,
+    root_exit_frees: Vec<super::facts::DoExitFree>,
     stmt_temp_frees: BTreeMap<NodeId, Vec<usize>>,
     cond_temp_frees: BTreeMap<NodeId, Vec<usize>>,
     arm_temp_frees: BTreeMap<NodeId, Vec<usize>>,
@@ -253,6 +256,8 @@ struct OwnershipState {
     ctor_ghost_keeps: BTreeMap<NodeId, Vec<(usize, usize)>>,
     arm_free_sites: BTreeMap<NodeId, Vec<super::facts::ArmFreeEntry>>,
     arm_rebind_frees: BTreeMap<NodeId, Vec<super::facts::ArmFreeEntry>>,
+    arm_do_exit_frees: BTreeMap<(NodeId, u8), Vec<super::facts::ArmFreeEntry>>,
+    arm_root_exit_frees: Vec<super::facts::ArmFreeEntry>,
 }
 
 struct HoldsState {
@@ -470,6 +475,8 @@ pub fn analyze(ctx: &AnalysisContext<'_>, walk_pins: bool, surface: &Surface) ->
         own: OwnershipState {
             free_sites: BTreeSet::new(),
             free_keeps: BTreeMap::new(),
+            do_exit_frees: BTreeMap::new(),
+            root_exit_frees: Vec::new(),
             stmt_temp_frees: BTreeMap::new(),
             cond_temp_frees: BTreeMap::new(),
             arm_temp_frees: BTreeMap::new(),
@@ -481,6 +488,8 @@ pub fn analyze(ctx: &AnalysisContext<'_>, walk_pins: bool, surface: &Surface) ->
             ctor_ghost_keeps: BTreeMap::new(),
             arm_free_sites: BTreeMap::new(),
             arm_rebind_frees: BTreeMap::new(),
+            arm_do_exit_frees: BTreeMap::new(),
+            arm_root_exit_frees: Vec::new(),
         },
         holds: HoldsState {
             hold_edges: BTreeMap::new(),
@@ -639,9 +648,10 @@ pub fn analyze(ctx: &AnalysisContext<'_>, walk_pins: bool, surface: &Surface) ->
         chk.finish(&mut a.lattice.unknowns);
     }
     let chk_facts = chk.into_facts();
-    // (L6 receipt: mirror's `decide_root_exit` runs ahead of the lane
-    // mint here, writing exit-fate families the scan never reads —
-    // behavior-neutral to omit until it lands.)
+
+    if let Err(err) = a.decide_root_exit(rec) {
+        a.ledger.diagnostics.push(err.0);
+    }
     a.plan_stmt_temp_frees(ctx.ast);
     a.mint_fast_lane(ctx.ast);
 
@@ -861,6 +871,8 @@ impl Recorded {
             layouts: self.layout.verdicts,
             free_sites: self.own.free_sites,
             free_keeps: self.own.free_keeps,
+            do_exit_frees: self.own.do_exit_frees,
+            root_exit_frees: self.own.root_exit_frees,
             stmt_temp_frees: self.own.stmt_temp_frees,
             cond_temp_frees: self.own.cond_temp_frees,
             arm_temp_frees: self.own.arm_temp_frees,
@@ -879,6 +891,8 @@ impl Recorded {
             ctor_ghost_keeps: self.own.ctor_ghost_keeps,
             arm_free_sites: self.own.arm_free_sites,
             arm_rebind_frees: self.own.arm_rebind_frees,
+            arm_do_exit_frees: self.own.arm_do_exit_frees,
+            arm_root_exit_frees: self.own.arm_root_exit_frees,
             fn_touched: BTreeMap::new(),
             fn_body_depths: self.fn_body_depths,
             ctor_lines: self.ctor_lines,

@@ -738,13 +738,15 @@ impl Analyzer {
 
                 let entry = self.walk.scopes.clone();
                 let mut head = entry.clone();
+                let scope_key = (stmt.id(), 0);
                 self.loop_scope_entries.push(self.walk.scopes.len());
                 loop {
                     self.walk.scopes = head.clone();
                     self.check_uses(rec, condition)?;
-                    // (L6 receipt: `decide_scope_exit(rec, scope_key)`
-                    // records the scope's exit frees here.)
-                    self.with_scope(|an| an.walk_stmts(rec, body));
+                    self.with_scope(|an| {
+                        an.walk_stmts(rec, body);
+                        an.decide_scope_exit(rec, scope_key)
+                    })?;
                     let latch = self.walk.scopes.clone();
                     let mut merged = entry.clone();
                     merge_table_scopes(&mut merged, &head, &latch);
@@ -791,9 +793,10 @@ impl Analyzer {
                 self.pin_bool_use(rec, condition, &cty);
                 self.check_uses(rec, condition)?;
                 let snapshot = self.walk.scopes.clone();
-                // (L6 receipt: `decide_scope_exit(rec, (stmt.id(), 0))`
-                // records the then-arm's exit frees inside the scope.)
-                self.with_scope(|an| an.walk_stmts(rec, then_body));
+                self.with_scope(|an| {
+                    an.walk_stmts(rec, then_body);
+                    an.decide_scope_exit(rec, (stmt.id(), 0))
+                })?;
                 let then_exit = self.walk.scopes.clone();
                 self.walk.scopes = snapshot;
                 // The face flip (the judge's law, 2026-11-14): the arms
@@ -803,9 +806,10 @@ impl Analyzer {
                 // other arm's reads or for the join. Prov is the
                 // exception: it was snapshotted and restored, and the
                 // bindings carry it back exactly.
-                // (L6 receipt: `decide_scope_exit(rec, (stmt.id(), 1))`
-                // records the else-arm's exit frees inside the scope.)
-                self.with_scope(|an| an.walk_stmts(rec, else_body));
+                self.with_scope(|an| {
+                    an.walk_stmts(rec, else_body);
+                    an.decide_scope_exit(rec, (stmt.id(), 1))
+                })?;
                 let else_exit = self.walk.scopes.clone();
                 merge_table_scopes(&mut self.walk.scopes, &then_exit, &else_exit);
                 // The If join's prov tagging: a name whose aliases split
@@ -850,11 +854,10 @@ impl Analyzer {
                 }
             }
 
-            Stmt::Do { body, .. } => {
-                // (L6 receipt: `decide_scope_exit(rec, (stmt.id(), 0))`
-                // records the block's exit frees inside the scope.)
-                self.with_scope(|an| an.walk_stmts(rec, body))
-            }
+            Stmt::Do { body, .. } => self.with_scope(|an| {
+                an.walk_stmts(rec, body);
+                an.decide_scope_exit(rec, (stmt.id(), 0))
+            })?,
 
             Stmt::Print { exprs, .. } => {
                 for e in exprs {

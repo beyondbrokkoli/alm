@@ -92,9 +92,6 @@ pub(super) fn borrowers_of(
     out
 }
 
-/// (L6 receipt: `compute_scope_frees` reads this covered-check when
-/// the exit planner ports.)
-#[allow(dead_code)]
 pub(super) fn ghost_origin_covered(
     lattice: &LatticeState,
     covered: &BTreeSet<usize>,

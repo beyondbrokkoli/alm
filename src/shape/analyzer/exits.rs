@@ -6,6 +6,244 @@ pub(super) enum Fate {
 }
 
 impl Analyzer {
+    pub(super) fn scope_exit_frees(
+        &mut self,
+        _rec: Gate,
+        depth: usize,
+        key: (NodeId, u8),
+    ) -> Result<
+        (
+            Vec<super::facts::DoExitFree>,
+            Vec<super::facts::ArmFreeEntry>,
+        ),
+        ShapeError,
+    > {
+        let (frees, arms) = self.compute_scope_frees(depth, true)?;
+        let _ = key;
+        Ok((frees, arms))
+    }
+
+    /// [ownership] The scope-death plan: a dying binding's roots split
+    /// into sites and ghosts (a mixed shape by `plan_mixed`), freed
+    /// unless a housed origin defers or another free covers them.
+    pub(super) fn compute_scope_frees(
+        &mut self,
+        depth: usize,
+        split: bool,
+    ) -> Result<
+        (
+            Vec<super::facts::DoExitFree>,
+            Vec<super::facts::ArmFreeEntry>,
+        ),
+        ShapeError,
+    > {
+        let dying = self.walk.scopes[depth].clone();
+        let mut arm_frees: Vec<super::facts::ArmFreeEntry> = Vec::new();
+
+        struct Batch {
+            name: String,
+            sites: Vec<usize>,
+            ghosts: Vec<usize>,
+            housed: bool,
+        }
+        let mut batch: Vec<Batch> = Vec::new();
+        let mut fired_keeps: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, bind) in &dying {
+            let shape = &bind.shape;
+            let roots: Vec<usize> = shape
+                .aliases
+                .iter()
+                .copied()
+                .filter(|site| !is_root(site))
+                .collect();
+            if roots.is_empty() {
+                continue;
+            }
+            if value_kind(&shape.ty) {
+                continue;
+            }
+            let ghosts: Vec<usize> = roots.iter().copied().filter(is_ghost).collect();
+            let sites: Vec<usize> = roots.iter().copied().filter(|s| !is_ghost(s)).collect();
+            if split && !ghosts.is_empty() && !sites.is_empty() {
+                match self.plan_mixed(name, depth, shape) {
+                    MixedPlan::NotMixed => {}
+                    MixedPlan::Suppress => {
+                        batch.push(Batch {
+                            name: name.clone(),
+                            sites,
+                            ghosts,
+                            housed: true,
+                        });
+                        continue;
+                    }
+                    MixedPlan::Fire { keeps } => {
+                        batch.push(Batch {
+                            name: name.clone(),
+                            sites,
+                            ghosts,
+                            housed: false,
+                        });
+                        fired_keeps.push((name.clone(), keeps));
+                        continue;
+                    }
+                    MixedPlan::ArmSplit {
+                        tag,
+                        nothing_on,
+                        keeps,
+                    } => {
+                        arm_frees.push(super::facts::ArmFreeEntry {
+                            carrier: name.clone(),
+                            tag,
+                            nothing_on,
+                            keeps: keeps.into_iter().map(super::facts::Keep::Name).collect(),
+                        });
+                        batch.push(Batch {
+                            name: name.clone(),
+                            sites,
+                            ghosts,
+                            housed: true,
+                        });
+                        continue;
+                    }
+                }
+            }
+            let housed = !ghosts.is_empty()
+                && shape.lineage.keys().any(|o| {
+                    origin_housed(
+                        &self.walk.scopes[..depth],
+                        &self.lattice,
+                        &self.own,
+                        &self.reads,
+                        *o,
+                        depth,
+                        name,
+                    )
+                });
+            batch.push(Batch {
+                name: name.clone(),
+                sites,
+                ghosts,
+                housed,
+            });
+        }
+
+        let covered: BTreeSet<usize> = batch
+            .iter()
+            .filter(|b| !b.housed)
+            .flat_map(|b| b.sites.iter().copied())
+            .flat_map(|site| release_set(&self.lattice, &self.own, &self.reads, site))
+            .collect();
+        let covered_flags: Vec<bool> = batch
+            .iter()
+            .map(|b| {
+                b.housed
+                    || b.ghosts.iter().any(|_g| {
+                        let shape = &dying[&b.name].shape;
+                        shape.lineage.keys().any(|o| {
+                            !shape.aliases.contains(o)
+                                && ghost_origin_covered(&self.lattice, &covered, *o)
+                        })
+                    })
+            })
+            .collect();
+
+        let mut frees: Vec<super::facts::DoExitFree> = Vec::new();
+        for (i, b) in batch.iter().enumerate() {
+            if covered_flags[i] {
+                continue;
+            }
+            let forced: Option<Vec<String>> = fired_keeps
+                .iter()
+                .find(|(n, _)| n == &b.name)
+                .map(|(_, k)| k.clone());
+            for site in &b.sites {
+                let (spare, _) = self.housed_in_release(*site);
+                let harm = self.harm_set(*site);
+                let mut keeps: Vec<super::facts::Keep> = match &forced {
+                    Some(k) => k
+                        .iter()
+                        .map(|n| super::facts::Keep::Name(n.clone()))
+                        .collect(),
+                    None => borrowers_of(&self.walk.scopes, &harm, depth, depth, &b.name)
+                        .into_iter()
+                        .map(super::facts::Keep::Name)
+                        .collect(),
+                };
+                if !spare.is_empty() {
+                    keeps.extend(spare.iter().map(|&g| super::facts::Keep::Ghost(g)));
+                }
+                // [ownership] the claim: the release houses these row
+                // ghosts unless a keep spares them.
+                self.mark_claimed(*site, &keeps);
+                frees.push(super::facts::DoExitFree {
+                    site: *site,
+                    carrier: b.name.clone(),
+                    keeps,
+                });
+            }
+            for ghost in &b.ghosts {
+                let harm = self.harm_set(*ghost);
+                let keeps: Vec<super::facts::Keep> = match &forced {
+                    Some(k) => k
+                        .iter()
+                        .map(|n| super::facts::Keep::Name(n.clone()))
+                        .collect(),
+                    None => borrowers_of(
+                        &self.walk.scopes,
+                        &harm,
+                        self.walk.scopes.len(),
+                        depth,
+                        &b.name,
+                    )
+                    .into_iter()
+                    .map(super::facts::Keep::Name)
+                    .collect(),
+                };
+                frees.push(super::facts::DoExitFree {
+                    site: *ghost,
+                    carrier: b.name.clone(),
+                    keeps,
+                });
+            }
+        }
+        Ok((frees, arm_frees))
+    }
+
+    pub(super) fn decide_scope_exit(
+        &mut self,
+        rec: Gate,
+        key: (NodeId, u8),
+    ) -> Result<(), ShapeError> {
+        if !rec.on() {
+            return Ok(());
+        }
+
+        let depth = self.walk.scopes.len() - 1;
+        let (frees, arms) = self.scope_exit_frees(rec, depth, key)?;
+        // [ownership] the do-exit mint: a scope's exit frees, keyed by
+        // the scope that died — the key lands even when empty.
+        self.own.do_exit_frees.insert(key, frees);
+        if !arms.is_empty() {
+            // [ownership] the arm-split mint: a mixed binding whose
+            // arms release differently frees on the join's tag.
+            self.own.arm_do_exit_frees.insert(key, arms);
+        }
+        Ok(())
+    }
+
+    pub(super) fn decide_root_exit(&mut self, rec: Gate) -> Result<(), ShapeError> {
+        if !rec.on() {
+            return Ok(());
+        }
+
+        let (frees, arms) = self.scope_exit_frees(rec, 0, (NodeId(u32::MAX), 0))?;
+        // [ownership] the root drain: the host chunk's own exit frees,
+        // plain and arm-split.
+        self.own.root_exit_frees = frees;
+        self.own.arm_root_exit_frees = arms;
+        Ok(())
+    }
+
     pub(super) fn prune_deepfree_children(&self, sites: &mut Vec<usize>) {
         let mut children: BTreeSet<usize> = BTreeSet::new();
         for &site in sites.iter() {
