@@ -17,6 +17,7 @@ use Ty::{Any, Async, Bool, Conflict, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
 mod checker;
 mod checks;
 mod constraints;
+mod exits;
 mod fast_lane;
 mod functions;
 mod infer;
@@ -236,6 +237,9 @@ struct GhostMint {
 struct OwnershipState {
     free_sites: BTreeSet<NodeId>,
     free_keeps: BTreeMap<NodeId, Vec<super::facts::Keep>>,
+    stmt_temp_frees: BTreeMap<NodeId, Vec<usize>>,
+    cond_temp_frees: BTreeMap<NodeId, Vec<usize>>,
+    arm_temp_frees: BTreeMap<NodeId, Vec<usize>>,
     rebind_grants: BTreeMap<NodeId, BTreeMap<String, Vec<super::facts::Keep>>>,
     stored_ctor_parents: BTreeSet<usize>,
     /// [fast-lane] Every IndexAssign whose value inferred table-typed —
@@ -466,6 +470,9 @@ pub fn analyze(ctx: &AnalysisContext<'_>, walk_pins: bool, surface: &Surface) ->
         own: OwnershipState {
             free_sites: BTreeSet::new(),
             free_keeps: BTreeMap::new(),
+            stmt_temp_frees: BTreeMap::new(),
+            cond_temp_frees: BTreeMap::new(),
+            arm_temp_frees: BTreeMap::new(),
             rebind_grants: BTreeMap::new(),
             stored_ctor_parents: BTreeSet::new(),
             row_value_stores: BTreeSet::new(),
@@ -632,9 +639,10 @@ pub fn analyze(ctx: &AnalysisContext<'_>, walk_pins: bool, surface: &Surface) ->
         chk.finish(&mut a.lattice.unknowns);
     }
     let chk_facts = chk.into_facts();
-    // (L6 receipt: mirror's `decide_root_exit` + `plan_stmt_temp_frees`
-    // run ahead of the lane mint here, writing exit-fate families the
-    // scan never reads — behavior-neutral to omit until they land.)
+    // (L6 receipt: mirror's `decide_root_exit` runs ahead of the lane
+    // mint here, writing exit-fate families the scan never reads —
+    // behavior-neutral to omit until it lands.)
+    a.plan_stmt_temp_frees(ctx.ast);
     a.mint_fast_lane(ctx.ast);
 
     let mut facts = a
@@ -853,6 +861,9 @@ impl Recorded {
             layouts: self.layout.verdicts,
             free_sites: self.own.free_sites,
             free_keeps: self.own.free_keeps,
+            stmt_temp_frees: self.own.stmt_temp_frees,
+            cond_temp_frees: self.own.cond_temp_frees,
+            arm_temp_frees: self.own.arm_temp_frees,
             rebind_frees: self.own.rebind_grants,
             move_poisons: self.own.move_poisons,
             fast_stores: self.layout.fast_stores,

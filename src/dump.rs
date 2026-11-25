@@ -325,6 +325,38 @@ pub fn render_shape(facts: &ShapeFacts, ast: &[Stmt]) -> String {
         }
     }
 
+    // — the exit-fate families (L6): the temp-fate planner's three
+    // maps (6.1) — the ctor sites born in a statement, a condition, an
+    // and/or operand and freed where the value dies. Site ids print
+    // raw like the ghost families; the NodeId keys project through
+    // their node's line like every walk family. A section prints only
+    // when it has an entry line.
+    {
+        let mut temp_frees = |header: &str, frees: &BTreeMap<NodeId, Vec<usize>>| {
+            let entries: Vec<String> = frees
+                .iter()
+                .filter(|(_, sites)| !sites.is_empty())
+                .map(|(key, sites)| {
+                    let list = sites
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("  @line {} sites [{list}]", line_of(*key))
+                })
+                .collect();
+            if !entries.is_empty() {
+                emitf(format!("{header}:"));
+                for entry in entries {
+                    emitf(entry);
+                }
+            }
+        };
+        temp_frees("stmt-temp-frees", &facts.stmt_temp_frees);
+        temp_frees("cond-temp-frees", &facts.cond_temp_frees);
+        temp_frees("arm-temp-frees", &facts.arm_temp_frees);
+    }
+
     if !facts.rebind_frees.is_empty() {
         emitf("rebind-grants:".into());
         for (stmt, grants) in &facts.rebind_frees {

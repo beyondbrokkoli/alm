@@ -4,10 +4,15 @@
 //! — the allowance below is the module's, not any layer's.
 #![allow(dead_code)]
 
+use alm::analysis::build_context;
+use alm::ast::{NodeId, Stmt};
 use alm::pipeline::front;
+use alm::shape::ShapeFacts;
 use alm::source::SourceFile;
 use alm::surface::{Flag, Surface};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub fn cases_dir() -> PathBuf {
     if let Ok(custom) = std::env::var("ALM_MIRROR_CASES") {
@@ -386,4 +391,263 @@ pub fn parse_on_big_stack(path: PathBuf, text: String) -> alm::pipeline::FrontOu
         .expect("spawn sweep thread")
         .join()
         .expect("sweep thread panicked")
+}
+
+// — the L6 harness (L6_HARNESS.md §3–§5): the oracle plate, the pins'
+// driver and the lease helper.
+
+/// The oracle's exit-family pokes for one program, a count per family
+/// — what its trace plate says it minted (L6_HARNESS.md §3). The
+/// fields follow the registry's slot order; `count_exit_families` is
+/// alm's side of the same table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExitCounts {
+    pub do_exit: u32,
+    pub stmt_temp: u32,
+    pub root_exit: u32,
+    pub ret_path: u32,
+    pub cond_temp: u32,
+    pub arm_temp: u32,
+    pub ret_keep: u32,
+    pub arm_split: u32,
+    /// No fact records a scalar skip — the oracle's number rides for
+    /// the census alone.
+    pub scalar_skip: u32,
+}
+
+/// The trace registry's slot ids by signal name: `<slot> <NAME> <tier>
+/// <text>` rows, comments and blanks ignored. Slots are looked up by
+/// name, never hard-coded.
+fn trace_slots(registry: &str) -> BTreeMap<&str, u8> {
+    registry
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut fields = l.split_whitespace();
+            let slot = fields.next()?.parse().ok()?;
+            Some((fields.next()?, slot))
+        })
+        .collect()
+}
+
+/// Decodes the compiler trace plate: `fired` and `capacity` (u32,
+/// little-endian), then the ring — one slot id per poke. A ring that
+/// wrapped is rotated, so it fails loudly instead of counting a
+/// truncated chronology (no corpus case wraps; the busiest records
+/// 3,555 of 8,192).
+fn plate_pokes(plate: &[u8]) -> BTreeMap<u8, u32> {
+    let word =
+        |at: usize| u32::from_le_bytes(plate[at..at + 4].try_into().expect("a plate header word"));
+    assert!(
+        plate.len() >= 8,
+        "the trace plate is {} bytes — truncated",
+        plate.len()
+    );
+    let (fired, capacity) = (word(0), word(4));
+    assert!(
+        fired <= capacity,
+        "the oracle's trace plate wrapped: {fired} pokes in a ring of {capacity}"
+    );
+    assert_eq!(
+        plate.len(),
+        8 + capacity as usize,
+        "the trace plate is {} bytes, not 8 + {capacity}",
+        plate.len()
+    );
+    let mut pokes: BTreeMap<u8, u32> = BTreeMap::new();
+    for &slot in &plate[8..8 + fired as usize] {
+        *pokes.entry(slot).or_insert(0) += 1;
+    }
+    pokes
+}
+
+/// The oracle's own count of the exit facts it minted for one program
+/// (L6_HARNESS.md §3). mirror has no facts dump, but it writes a
+/// trace plate unconditionally and the exit-family slots are poked
+/// only from `exits.rs`. A corpus file compiles from its own path;
+/// anything else is `name` written into a scratch directory, so a pin
+/// can pass its source. The run takes the case's FLAGS, the module
+/// root, core limit 0 (the oracle aborts by design on 17 cases) and
+/// no watcher variables.
+pub fn oracle_exit_counts(name: &str, text: &str) -> ExitCounts {
+    let cases = cases_dir();
+    let binary = cases
+        .parent()
+        .expect("corpus root has a parent")
+        .join("target/release/alm");
+    assert!(
+        binary.is_file(),
+        "the frozen oracle is missing — rebuild it: \
+         (cd ../mirror_experimental && cargo build --release)"
+    );
+
+    // One scratch directory per run: the plate lands in the oracle's
+    // working directory, so two runs sharing one would read each
+    // other's plate (the pins call this in parallel).
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    let scratch = std::env::temp_dir().join(format!(
+        "alm_l6_oracle_scratch_{}_{}",
+        std::process::id(),
+        RUNS.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&scratch).expect("oracle scratch dir");
+
+    let own_path = cases.join(name);
+    let file = if own_path.is_file() {
+        own_path
+    } else {
+        let written = scratch.join(name);
+        if let Some(parent) = written.parent() {
+            std::fs::create_dir_all(parent).expect("oracle input dir");
+        }
+        std::fs::write(&written, text).expect("write the oracle's input");
+        written
+    };
+
+    let flags: Vec<String> = text
+        .lines()
+        .find_map(|l| l.strip_prefix("-- FLAGS:"))
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .map(str::to_string)
+        .collect();
+    let out = std::process::Command::new("sh")
+        .args(["-c", "ulimit -c 0 && exec \"$@\"", "sh"])
+        .arg(&binary)
+        .args(&flags)
+        .arg(format!("--module-root={}", module_root().display()))
+        .arg(&file)
+        .current_dir(&scratch)
+        .env_remove("ALM_OMNI")
+        .env_remove("ALM_OMNI_STRICT")
+        .output()
+        .unwrap_or_else(|e| panic!("running the oracle {} failed: {e}", binary.display()));
+    let plate = std::fs::read(scratch.join(".alm_trace.bin")).unwrap_or_else(|e| {
+        panic!(
+            "the oracle left no trace plate ({}): {e} — exit {out:?}",
+            scratch.display()
+        )
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    let registry_path = cases
+        .parent()
+        .expect("corpus root has a parent")
+        .join("trace_signals.txt");
+    let registry = std::fs::read_to_string(&registry_path)
+        .unwrap_or_else(|e| panic!("{} unreadable: {e}", registry_path.display()));
+    let slots = trace_slots(&registry);
+    let pokes = plate_pokes(&plate);
+    let count = |signal: &str| {
+        let slot = slots
+            .get(signal)
+            .unwrap_or_else(|| panic!("the trace registry declares no {signal}"));
+        pokes.get(slot).copied().unwrap_or(0)
+    };
+    ExitCounts {
+        do_exit: count("DO_EXIT_FREE_SITE"),
+        stmt_temp: count("STMT_TEMP_FREE_SITE"),
+        root_exit: count("ROOT_EXIT_FREE_SITE"),
+        ret_path: count("RET_PATH_FREE_SITE"),
+        cond_temp: count("COND_TEMP_FREE_SITE"),
+        arm_temp: count("ARM_TEMP_FREE_SITE"),
+        ret_keep: count("RET_KEEP_FREE_SITE"),
+        arm_split: count("JOIN_ARM_SPLIT"),
+        scalar_skip: count("DO_EXIT_SCALAR_SKIP"),
+    }
+}
+
+/// alm's side of the oracle table (L6_HARNESS.md §3): what the facts
+/// hold, per family, in the oracle's units — one key per poke for the
+/// temp maps. A family counts zero until its checkpoint lands it: 6.2
+/// mints the do-exit, root-exit and arm-split maps, 6.3 the
+/// ret/break-path and ret-keep ones.
+pub fn count_exit_families(facts: &ShapeFacts) -> ExitCounts {
+    ExitCounts {
+        do_exit: 0,
+        stmt_temp: facts.stmt_temp_frees.len() as u32,
+        root_exit: 0,
+        ret_path: 0,
+        cond_temp: facts.cond_temp_frees.len() as u32,
+        arm_temp: facts.arm_temp_frees.len() as u32,
+        ret_keep: 0,
+        arm_split: 0,
+        scalar_skip: 0,
+    }
+}
+
+/// The entry lines of one section of the rendered shape dump — the
+/// indented children under its `name:` header, in dump order; empty
+/// when the section is absent (a section prints only when it has an
+/// entry). Facts are addressed through lines, never raw ids:
+/// `NodeId`s are minted per parse, so two analyses of one source
+/// compare under the dump.
+pub fn section<'a>(dump: &'a str, name: &str) -> Vec<&'a str> {
+    let header = format!("{name}:");
+    dump.lines()
+        .skip_while(|line| *line != header.as_str())
+        .skip(1)
+        .take_while(|line| line.starts_with(' '))
+        .collect()
+}
+
+/// The L6 pins' driver: `front` → `build_context` → `shape::analyze`
+/// at base 0 with no splice, the walk-pins lever on (mirror's
+/// `analyze_with` default). The program must come out diagnostic-free
+/// or the pin dies; the run takes the sweep's big-stack thread.
+pub fn facts_of(source: &str) -> (Vec<Stmt>, ShapeFacts) {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let surface = Surface::default();
+            let src = SourceFile::new("pin.lua", source);
+            let out = front(&src, &surface);
+            assert!(
+                out.diagnostics.is_empty(),
+                "pin source must parse clean: {:?}",
+                out.diagnostics
+            );
+            let ctx = build_context(&out.ast);
+            let facts = alm::shape::analyze(&ctx, true, &surface);
+            assert!(
+                facts.diagnostics.is_empty(),
+                "pin source must analyze clean: {:?}",
+                facts.diagnostics
+            );
+            (out.ast, facts)
+        })
+        .expect("spawn pin thread")
+        .join()
+        .expect("pin thread panicked")
+}
+
+/// The lease helper (L6_HARNESS.md §5). A known legacy defect is never
+/// a passing pin of the buggy behaviour: `body` asserts the *correct*
+/// behaviour and is expected to fail. A pass fails the run and names
+/// the lease (`known_lease/<name>`, a namespace of its own) — a
+/// passing `cargo test` is the only signal the next session acts on.
+/// The analysis runs outside the body, so its panic is an ordinary
+/// failure; the default panic hook is silenced only around the
+/// expected one.
+pub fn xfail(lease: &str, body: impl FnOnce() + std::panic::UnwindSafe) {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let failed = std::panic::catch_unwind(body).is_err();
+    std::panic::set_hook(prev_hook);
+    assert!(
+        failed,
+        "lease known_lease/{lease} passed — the defect is fixed: retire the \
+         lease, add the corpus case that pins the fixed law, re-bless"
+    );
+}
+
+/// The site a ctor was minted, for the pins that destructure a
+/// statement to its ctor nodes by hand.
+pub fn site_of(facts: &ShapeFacts, ctor: NodeId) -> usize {
+    *facts
+        .sites
+        .get(&ctor)
+        .unwrap_or_else(|| panic!("no site was minted for ctor {ctor:?}"))
 }
