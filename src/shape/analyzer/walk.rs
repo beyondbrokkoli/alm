@@ -883,8 +883,9 @@ impl Analyzer {
                          write the break inside a loop of the same body",
                     )));
                 }
-                // (L6 receipt: mirror plans the break's exit frees here
-                // under `rec.on()` — `plan_break_exits(stmt.id())`.)
+                if rec.on() {
+                    self.plan_break_exits(stmt.id());
+                }
             }
 
             Stmt::Return { value, .. } => {
@@ -908,8 +909,9 @@ impl Analyzer {
                     if let Some(slot) = self.fn_ret_reaches.last_mut() {
                         slot.extend(reach.iter().copied());
                     }
-                    // (L6 receipt: mirror plans the return's exit frees
-                    // here under `rec.on()` — `plan_return_exits`.)
+                    if rec.on() {
+                        self.plan_return_exits(Some((v, &ty)), &reach, stmt.id());
+                    }
                     if let Some(slot) = self.fn_rets.last_mut() {
                         if let Some(&entry) = self.fn_scope_entries.last() {
                             let outer_owned: BTreeSet<usize> = self.walk.scopes[..entry]
@@ -936,9 +938,10 @@ impl Analyzer {
                             frame.push(shape);
                         }
                     }
+                } else if rec.on() {
+                    let no_reach = BTreeSet::new();
+                    self.plan_return_exits(None, &no_reach, stmt.id());
                 }
-                // (L6 receipt: mirror plans a valueless return's exit
-                // frees here under `rec.on()`.)
             }
         }
         Ok(())

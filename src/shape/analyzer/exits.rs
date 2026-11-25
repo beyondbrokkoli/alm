@@ -231,6 +231,109 @@ impl Analyzer {
         Ok(())
     }
 
+    /// [ownership] The return edge: the scopes from the fn entry
+    /// outward re-plan (`split` off), keeps clear when there is no fn
+    /// entry (the host owns the artifact's exit), and the frees split by
+    /// reach into keep-frees and plain frees.
+    pub(super) fn plan_return_exits(
+        &mut self,
+        value: Option<(&Expr, &Ty)>,
+        reach: &BTreeSet<usize>,
+        stmt: NodeId,
+    ) {
+        let entry = self.fn_scope_entries.last().copied().unwrap_or(0);
+        let boundary = self.fn_scope_entries.is_empty();
+        let mut plain: Vec<super::facts::DoExitFree> = Vec::new();
+        let mut keeps: Vec<super::facts::DoExitFree> = Vec::new();
+        for depth in (entry..self.walk.scopes.len()).rev() {
+            if let Ok((frees, _)) = self.compute_scope_frees(depth, false) {
+                for mut f in frees {
+                    if boundary {
+                        f.keeps.clear();
+                    }
+                    if reach.contains(&f.site) {
+                        keeps.push(f);
+                    } else {
+                        plain.push(f);
+                    }
+                }
+            }
+        }
+        plain.sort_by_key(|f| (f.site, f.carrier.clone()));
+        plain.dedup_by_key(|f| (f.site, f.carrier.clone()));
+        if !plain.is_empty() {
+            // [ownership] the return-edge mint: the frees a return
+            // leaves plain — the dying bindings its value does not
+            // reach — keyed by the return statement.
+            // Idempotent under the walk's re-entry: map-insert replaces.
+            self.own.ret_path_frees.insert(stmt, plain);
+        }
+        keeps.sort_by_key(|f| (f.site, f.carrier.clone()));
+        keeps.dedup_by_key(|f| (f.site, f.carrier.clone()));
+        if !keeps.is_empty() {
+            // [ownership] the return-edge keep mint: the frees of the
+            // dying bindings the returned value reaches — keyed by the
+            // return statement.
+            self.own.ret_path_keep_frees.insert(stmt, keeps);
+        }
+        if let Some((v, ty)) = value
+            && matches!(ty, Tbl(_) | Pending)
+        {
+            let mut keep_temps = Vec::new();
+            self.ret_base_temp_sites(v, &mut keep_temps);
+            keep_temps.sort_unstable();
+            keep_temps.dedup();
+            self.prune_deepfree_children(&mut keep_temps);
+            if !keep_temps.is_empty() {
+                // [ownership] the keep-temp mint: a table-typed return's
+                // ctor bases are kept, not freed — keyed by the return.
+                self.own.ret_path_keep_temps.insert(stmt, keep_temps);
+            }
+        }
+        if let Some((v, ty)) = value
+            && !matches!(ty, Tbl(_) | Pending)
+        {
+            let mut sites = Vec::new();
+            self.collect_temp_sites(v, Fate::Escapes, &mut sites);
+            self.prune_deepfree_children(&mut sites);
+            if !sites.is_empty() {
+                // [ownership] the scalar-return mint: a scalar return's
+                // temps are statement temps — keyed by the return.
+                self.own.stmt_temp_frees.insert(stmt, sites);
+            }
+        }
+    }
+
+    /// [ownership] The break edge: the scopes from the loop entry
+    /// outward re-plan (`split` off) into plain frees; a break that
+    /// would leave a fn body plans nothing.
+    pub(super) fn plan_break_exits(&mut self, stmt: NodeId) {
+        // Idempotent under the walk's re-entry: plan_break_exits clears before
+        // re-minting so a veto path leaves no stale entry.
+        self.own.break_path_frees.remove(&stmt);
+        let Some(&entry) = self.loop_scope_entries.last() else {
+            return;
+        };
+        if let Some(&fn_entry) = self.fn_scope_entries.last()
+            && fn_entry >= entry
+        {
+            return;
+        }
+        let mut plain: Vec<super::facts::DoExitFree> = Vec::new();
+        for depth in (entry..self.walk.scopes.len()).rev() {
+            if let Ok((frees, _)) = self.compute_scope_frees(depth, false) {
+                plain.extend(frees);
+            }
+        }
+        plain.sort_by_key(|f| (f.site, f.carrier.clone()));
+        plain.dedup_by_key(|f| (f.site, f.carrier.clone()));
+        if !plain.is_empty() {
+            // [ownership] the break-edge mint: the scopes a break leaves,
+            // re-planned into plain frees — keyed by the break statement.
+            self.own.break_path_frees.insert(stmt, plain);
+        }
+    }
+
     pub(super) fn decide_root_exit(&mut self, rec: Gate) -> Result<(), ShapeError> {
         if !rec.on() {
             return Ok(());

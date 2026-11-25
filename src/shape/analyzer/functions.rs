@@ -406,6 +406,32 @@ impl Analyzer {
         }
     }
 
-    // (L6 receipt: `ret_base_temp_sites` — the keep-temp site collector
-    // the return-exit planner reads — ports with exits.rs.)
+    pub(super) fn ret_base_temp_sites(&self, e: &Expr, out: &mut Vec<usize>) {
+        if let Expr::Index { obj, .. } = e {
+            match obj.as_ref() {
+                Expr::TableCtor { .. } => {
+                    if let Some(&site) = self.lattice.sites.get(&obj.as_ref().id()) {
+                        out.push(site);
+                    }
+                }
+                Expr::Call { callee, .. } => {
+                    if let Expr::Identifier { name, .. } = callee.as_ref()
+                        && let Some(fn_ptr) = self.resolve_fn(name)
+                        && let Some(shape) = self.fn_ret_shapes.get(&fn_ptr)
+                    {
+                        out.extend(
+                            shape
+                                .aliases
+                                .iter()
+                                .copied()
+                                .filter(|s| !is_root(s) && !is_ghost(s)),
+                        );
+                    }
+                }
+                // C: any other base is neither a fresh ctor nor a fn return
+                _ => {}
+            }
+            self.ret_base_temp_sites(obj, out);
+        }
+    }
 }

@@ -609,21 +609,29 @@ pub fn oracle_verdict(name: &str, text: &str) -> (bool, Vec<String>) {
 
 /// alm's side of the oracle table (L6_HARNESS.md §3): what the facts
 /// hold, per family, in the oracle's units — one key per poke for the
-/// temp maps. The oracle pokes `DO_EXIT_FREE_SITE` once per free of
-/// every scope-death plan, the root drain's included, and
-/// `JOIN_ARM_SPLIT` once per arm-split entry across its four maps (two
-/// live since L3). The ret/break-path and ret-keep families count zero
-/// until 6.3 lands them.
+/// temp maps and the keep-temps. The oracle pokes `DO_EXIT_FREE_SITE`
+/// once per free of every scope-death plan, the root drain's included;
+/// `RET_PATH_FREE_SITE` once per free of the two plain edge lists, and
+/// `RET_KEEP_FREE_SITE` once per keep-free and once per keep-temp key;
+/// and `JOIN_ARM_SPLIT` once per arm-split entry across its four maps
+/// (two live since L3).
 pub fn count_exit_families(facts: &ShapeFacts) -> ExitCounts {
     ExitCounts {
         do_exit: (facts.root_exit_frees.len()
             + facts.do_exit_frees.values().map(Vec::len).sum::<usize>()) as u32,
         stmt_temp: facts.stmt_temp_frees.len() as u32,
         root_exit: facts.root_exit_frees.len() as u32,
-        ret_path: 0,
+        ret_path: (facts.ret_path_frees.values().map(Vec::len).sum::<usize>()
+            + facts.break_path_frees.values().map(Vec::len).sum::<usize>())
+            as u32,
         cond_temp: facts.cond_temp_frees.len() as u32,
         arm_temp: facts.arm_temp_frees.len() as u32,
-        ret_keep: 0,
+        ret_keep: (facts
+            .ret_path_keep_frees
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+            + facts.ret_path_keep_temps.len()) as u32,
         arm_split: (facts
             .arm_do_exit_frees
             .values()

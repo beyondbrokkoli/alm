@@ -7,7 +7,9 @@
 //! (`ownership_pins.rs`) hold the contents the plate cannot see.
 //!
 //! The oracle-plate reader's own pin rides first; it was green before
-//! the organ existed.
+//! the organ existed. The census thresholds froze at 6.3, with the
+//! organ whole: lower bounds on what that run measured
+//! (`Census::check_frozen`).
 
 mod common;
 
@@ -129,32 +131,56 @@ fn corpus() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The three temp-fate maps in family order: statement, condition,
-/// and/or operand.
-const TEMP_FAMILIES: [&str; 3] = ["stmt_temp_frees", "cond_temp_frees", "arm_temp_frees"];
+/// The four site-list maps in family order: the temp-fate planner's
+/// three — statement, condition, and/or operand — and the return
+/// edge's keep-temps, a table-typed return's ctor bases. One law covers
+/// the four: every site a minted ctor, no site twice under one key.
+const TEMP_FAMILIES: [&str; 4] = [
+    "stmt_temp_frees",
+    "cond_temp_frees",
+    "arm_temp_frees",
+    "ret_path_keep_temps",
+];
 
-/// The seven exit-fate families the organ mints once 6.2 has landed,
-/// in dump order: the scope-death planner's four around the temp
-/// planner's three. A family's dump header is its name with dashes.
-const FAMILIES: [&str; 7] = [
+/// The three edge lists keyed by their own statement, in dump order.
+const EDGE_LISTS: [&str; 3] = ["ret_path_frees", "break_path_frees", "ret_path_keep_frees"];
+
+/// The eleven exit-fate families the whole organ mints, in dump order:
+/// the scope-death planner's four around the temp planner's three and
+/// the edge planners' four. A family's dump header is its name with
+/// dashes.
+const FAMILIES: [&str; 11] = [
     "do_exit_frees",
     "root_exit_frees",
     "stmt_temp_frees",
     "cond_temp_frees",
     "arm_temp_frees",
+    "ret_path_frees",
+    "break_path_frees",
+    "ret_path_keep_frees",
+    "ret_path_keep_temps",
     "arm_do_exit_frees",
     "arm_root_exit_frees",
 ];
 
-fn temp_maps(facts: &ShapeFacts) -> [&BTreeMap<NodeId, Vec<usize>>; 3] {
+fn temp_maps(facts: &ShapeFacts) -> [&BTreeMap<NodeId, Vec<usize>>; 4] {
     [
         &facts.stmt_temp_frees,
         &facts.cond_temp_frees,
         &facts.arm_temp_frees,
+        &facts.ret_path_keep_temps,
     ]
 }
 
-/// The seven families as a rendered dump carries them — the form two
+fn edge_maps(facts: &ShapeFacts) -> [&BTreeMap<NodeId, Vec<DoExitFree>>; 3] {
+    [
+        &facts.ret_path_frees,
+        &facts.break_path_frees,
+        &facts.ret_path_keep_frees,
+    ]
+}
+
+/// The eleven families as a rendered dump carries them — the form two
 /// analyses of one source compare under: raw `NodeId`s are minted per
 /// parse, lines are not.
 fn exit_sections(dump: &str) -> Vec<String> {
@@ -177,6 +203,18 @@ struct KeySpace {
     /// body and a Do's block, `(stmt, 0)` and `(stmt, 1)` for an If's
     /// two arms — the keys `decide_scope_exit` mints at scope death.
     scope_keys: BTreeSet<(NodeId, u8)>,
+    /// The edge statements, the keys the two edge planners mint: a
+    /// return (the return lists and the keep-temps; the scalar-return
+    /// stmt temps too) and a break.
+    returns: BTreeSet<NodeId>,
+    breaks: BTreeSet<NodeId>,
+    /// The returns outside every fn literal — the boundary, where the
+    /// return edge clears its keeps: `fn_scope_entries` is empty
+    /// exactly while no fn body is being walked, and a fn body is
+    /// walked only from its literal.
+    boundary_returns: BTreeSet<NodeId>,
+    /// Whether the walk is inside a fn literal's body.
+    in_fn: bool,
     /// A statement's line, for the laws' messages.
     lines: BTreeMap<NodeId, u32>,
 }
@@ -207,9 +245,29 @@ impl Visitor for KeySpace {
             Stmt::Do { .. } => {
                 self.scope_keys.insert((id, 0));
             }
-            Stmt::Return { .. } | Stmt::Break { .. } => {}
+            Stmt::Return { .. } => {
+                self.returns.insert(id);
+                if !self.in_fn {
+                    self.boundary_returns.insert(id);
+                }
+            }
+            Stmt::Break { .. } => {
+                self.breaks.insert(id);
+            }
         }
         Ok(())
+    }
+
+    fn visit_function(
+        &mut self,
+        _params: &[String],
+        body: &[Stmt],
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        let outer = std::mem::replace(&mut self.in_fn, true);
+        let walked = walk_stmts(self, body);
+        self.in_fn = outer;
+        walked
     }
 
     fn visit_binary_op(
@@ -240,8 +298,8 @@ fn check_keeps(name: &str, family: &str, keeps: &[Keep]) {
     }
 }
 
-/// The laws of one scope-death free list: every freed site is a
-/// minted ctor site or a row ghost, and no site frees twice under one
+/// The laws of one scope-death or edge free list: every freed site is
+/// a minted ctor site or a row ghost, and no site frees twice under one
 /// carrier. The list is planned per dying binding —
 /// `compute_scope_frees` batches one entry per name — and two
 /// bindings can own one ctor site (a call's returned record read under
@@ -272,34 +330,46 @@ fn check_frees(
     }
 }
 
-/// The structural laws of the seven families, as far as they are
+/// The structural laws of the eleven families, as far as they are
 /// minted: a freed site is a minted ctor site (or, for the scope-death
-/// maps, a row ghost); no site frees twice under one temp key or one
-/// scope-death carrier; every kept ghost is a ghost. A temp key is the
-/// statement its planner scans — a value statement for stmt temps, a
-/// While / If for cond temps — or, for arm temps, an `and`/`or`
-/// operand's expression. A do-exit key is a control statement's scope
-/// — `(stmt, 0)` for a While or Do, `(stmt, 0)` or `(stmt, 1)` for an
-/// If — or a fn literal's own scope key, as `fn_scope_keys` records
-/// it.
-fn check_laws(name: &str, ast: &[Stmt], facts: &ShapeFacts) {
+/// and edge lists, a row ghost); no site frees twice under one temp key
+/// or one list carrier; every kept ghost is a ghost. A temp key is the
+/// statement its planner scans — a value statement for stmt temps, or
+/// a return, whose scalar value mints stmt temps of its own from
+/// `plan_return_exits` — a While / If for cond temps, and for arm
+/// temps an `and`/`or` operand's expression. An edge list is keyed by
+/// its own statement — a return for the two return lists and the
+/// keep-temps, a break for the break list — and a return outside every
+/// fn literal is the boundary: its keeps are cleared, because the host
+/// owns the artifact's exit. A do-exit key is a control statement's
+/// scope — `(stmt, 0)` for a While or Do, `(stmt, 0)` or `(stmt, 1)`
+/// for an If — or a fn literal's own scope key, as `fn_scope_keys`
+/// records it.
+///
+/// Answers how many edge lists are keyed by a boundary return — the
+/// boundary law's witnesses, for the census.
+fn check_laws(name: &str, ast: &[Stmt], facts: &ShapeFacts) -> usize {
     let sites: BTreeSet<usize> = facts.sites.values().copied().collect();
     for (family, frees) in TEMP_FAMILIES.iter().zip(temp_maps(facts)) {
         for list in frees.values() {
             for site in list {
                 assert!(
                     sites.contains(site),
-                    "{name}: {family} frees site {site} — no ctor was minted there"
+                    "{name}: {family} lists site {site} — no ctor was minted there"
                 );
             }
             let distinct: BTreeSet<usize> = list.iter().copied().collect();
             assert_eq!(
                 distinct.len(),
                 list.len(),
-                "{name}: {family} frees one site twice under a key"
+                "{name}: {family} lists one site twice under a key"
             );
         }
     }
+
+    let mut keys = KeySpace::default();
+    let _ = walk_stmts(&mut keys, ast);
+    let at = |stmt: &NodeId| format!(" at line {:?}", keys.lines.get(stmt));
 
     for (key, frees) in &facts.do_exit_frees {
         check_frees(
@@ -311,6 +381,21 @@ fn check_laws(name: &str, ast: &[Stmt], facts: &ShapeFacts) {
         );
     }
     check_frees(name, "root_exit_frees", "", &sites, &facts.root_exit_frees);
+    let mut boundary = 0;
+    for (family, list) in EDGE_LISTS.iter().zip(edge_maps(facts)) {
+        for (stmt, frees) in list {
+            check_frees(name, family, &at(stmt), &sites, frees);
+            if keys.boundary_returns.contains(stmt) {
+                boundary += 1;
+                assert!(
+                    frees.iter().all(|f| f.keeps.is_empty()),
+                    "{name}: {family}{} keeps a name or a ghost — a return with no fn \
+                     entry clears its keeps (the host owns the artifact's exit)",
+                    at(stmt)
+                );
+            }
+        }
+    }
     for e in facts.arm_do_exit_frees.values().flatten() {
         check_keeps(name, "arm_do_exit_frees", &e.keeps);
     }
@@ -318,14 +403,12 @@ fn check_laws(name: &str, ast: &[Stmt], facts: &ShapeFacts) {
         check_keeps(name, "arm_root_exit_frees", &e.keeps);
     }
 
-    let mut keys = KeySpace::default();
-    let _ = walk_stmts(&mut keys, ast);
-    let [stmt, cond, arm] = temp_maps(facts);
+    let [stmt, cond, arm, keep_temps] = temp_maps(facts);
     for key in stmt.keys() {
         assert!(
-            keys.value_stmts.contains(key),
-            "{name}: a stmt-temp key is not a Print / Expr / LocalDecl / Assignment / \
-             IndexAssign statement"
+            keys.value_stmts.contains(key) || keys.returns.contains(key),
+            "{name}: a stmt-temp key is neither a Print / Expr / LocalDecl / Assignment / \
+             IndexAssign statement nor a return"
         );
     }
     for key in cond.keys() {
@@ -338,6 +421,28 @@ fn check_laws(name: &str, ast: &[Stmt], facts: &ShapeFacts) {
         assert!(
             keys.and_or_operands.contains(key),
             "{name}: an arm-temp key is not an and/or operand"
+        );
+    }
+    for key in keep_temps.keys() {
+        assert!(
+            keys.returns.contains(key),
+            "{name}: a keep-temp key is not a return statement"
+        );
+    }
+    for key in facts
+        .ret_path_frees
+        .keys()
+        .chain(facts.ret_path_keep_frees.keys())
+    {
+        assert!(
+            keys.returns.contains(key),
+            "{name}: a return-edge key is not a return statement"
+        );
+    }
+    for key in facts.break_path_frees.keys() {
+        assert!(
+            keys.breaks.contains(key),
+            "{name}: a break-path key is not a break statement"
         );
     }
     let fn_keys: BTreeSet<(NodeId, u8)> = facts.fn_scope_keys.values().copied().collect();
@@ -353,20 +458,34 @@ fn check_laws(name: &str, ast: &[Stmt], facts: &ShapeFacts) {
             keys.lines.get(stmt)
         );
     }
+    boundary
+}
+
+/// The keeps of a list by kind: `(names, ghosts)`.
+fn count_keeps<'a>(keeps: impl IntoIterator<Item = &'a Keep>) -> (usize, usize) {
+    let mut names = 0;
+    let mut ghosts = 0;
+    for k in keeps {
+        match k {
+            Keep::Name(_) => names += 1,
+            Keep::Ghost(_) => ghosts += 1,
+        }
+    }
+    (names, ghosts)
 }
 
 /// What the sweep measured over the accepted corpus. Per family, in
 /// `FAMILIES` order: the files carrying the family, and its entries —
-/// frees for the two exit lists, keys for the temp maps, arm entries
-/// for the two arm lists.
+/// frees for the five exit lists, keys for the temp maps and the
+/// keep-temps, arm entries for the two arm lists.
 #[derive(Default)]
 struct Census {
-    files: [usize; 7],
-    entries: [usize; 7],
-    /// The sites freed — the three temp maps' and the two exit
-    /// lists' (a row ghost's id counts as its site); zero for the arm
-    /// lists, which free by tag and keep names.
-    sites: [usize; 7],
+    files: [usize; 11],
+    entries: [usize; 11],
+    /// The sites the lists free — the temp maps' and the exit lists'
+    /// (a row ghost's id counts as its site), the keep-temps' kept;
+    /// zero for the arm lists, which free by tag and keep names.
+    sites: [usize; 11],
     /// The do-exit map's scope keys — `decide_scope_exit` inserts its
     /// key even when nothing frees — how many of them are empty, and
     /// how many are a fn literal's body scope (the fn-body site's).
@@ -375,23 +494,45 @@ struct Census {
     fn_scopes: usize,
     /// Exit frees (do-exit and root) carrying at least one keep.
     kept: usize,
+    /// Edge frees (the three edge lists) carrying at least one keep.
+    edge_kept: usize,
+    /// Edge lists keyed by a return at the boundary — outside every fn
+    /// literal — and the files holding them: the census of the boundary
+    /// law.
+    boundary_keys: usize,
+    boundary_files: usize,
+    /// The arm-split entries as the oracle counts them: the joint of
+    /// four maps, two live since L3.
+    arm_split: usize,
     /// Frees of a site another carrier also frees in the same list —
     /// two bindings owning one ctor site — and the files holding them.
     shared: usize,
     shared_files: usize,
+    /// The keeps themselves, by kind: over the five exit lists
+    /// (do-exit, root and the three edge lists) and over the four arm
+    /// lists.
+    exit_name_keeps: usize,
+    exit_ghost_keeps: usize,
+    arm_name_keeps: usize,
+    arm_ghost_keeps: usize,
 }
 
 impl Census {
     fn add(&mut self, facts: &ShapeFacts) {
         let do_exit: usize = facts.do_exit_frees.values().map(Vec::len).sum();
-        let [stmt, cond, arm] = temp_maps(facts);
+        let [stmt, cond, arm, keep_temps] = temp_maps(facts);
         let arm_do_exit: usize = facts.arm_do_exit_frees.values().map(Vec::len).sum();
+        let edge: [usize; 3] = edge_maps(facts).map(|list| list.values().map(Vec::len).sum());
         let per_family = [
             (do_exit, do_exit),
             (facts.root_exit_frees.len(), facts.root_exit_frees.len()),
             (stmt.len(), stmt.values().map(Vec::len).sum()),
             (cond.len(), cond.values().map(Vec::len).sum()),
             (arm.len(), arm.values().map(Vec::len).sum()),
+            (edge[0], edge[0]),
+            (edge[1], edge[1]),
+            (edge[2], edge[2]),
+            (keep_temps.len(), keep_temps.values().map(Vec::len).sum()),
             (arm_do_exit, 0),
             (facts.arm_root_exit_frees.len(), 0),
         ];
@@ -419,6 +560,12 @@ impl Census {
             .chain(&facts.root_exit_frees)
             .filter(|f| !f.keeps.is_empty())
             .count();
+        self.edge_kept += edge_maps(facts)
+            .into_iter()
+            .flat_map(|list| list.values().flatten())
+            .filter(|f| !f.keeps.is_empty())
+            .count();
+        self.arm_split += count_exit_families(facts).arm_split as usize;
         let lists = facts
             .do_exit_frees
             .values()
@@ -431,17 +578,45 @@ impl Census {
             .sum();
         self.shared += shared;
         self.shared_files += usize::from(shared > 0);
+        let (names, ghosts) = count_keeps(
+            facts
+                .do_exit_frees
+                .values()
+                .flatten()
+                .chain(&facts.root_exit_frees)
+                .chain(
+                    edge_maps(facts)
+                        .into_iter()
+                        .flat_map(|list| list.values().flatten()),
+                )
+                .flat_map(|f| f.keeps.iter()),
+        );
+        self.exit_name_keeps += names;
+        self.exit_ghost_keeps += ghosts;
+        let (names, ghosts) = count_keeps(
+            facts
+                .arm_do_exit_frees
+                .values()
+                .flatten()
+                .chain(&facts.arm_root_exit_frees)
+                .chain(facts.arm_free_sites.values().flatten())
+                .chain(facts.arm_rebind_frees.values().flatten())
+                .flat_map(|e| e.keeps.iter()),
+        );
+        self.arm_name_keeps += names;
+        self.arm_ghost_keeps += ghosts;
     }
 
     fn print(&self) {
         for (i, family) in FAMILIES.iter().enumerate() {
             let unit = match i {
-                0 | 1 => "frees",
-                2..=4 => "entries",
+                0 | 1 | 5..=7 => "frees",
+                2..=4 | 8 => "entries",
                 _ => "arm entries",
             };
+            let freed = if i == 8 { "sites kept" } else { "sites freed" };
             eprintln!(
-                "  {family}: {} files, {} {unit}, {} sites freed",
+                "  {family}: {} files, {} {unit}, {} {freed}",
                 self.files[i], self.entries[i], self.sites[i]
             );
         }
@@ -455,6 +630,64 @@ impl Census {
             self.shared,
             self.shared_files
         );
+        eprintln!(
+            "  sums: do-exit {} + root {} = {}; ret/break-path {}; temp entries {} (stmt {}, \
+             cond {}, arm {}); arm-split entries {} (the joint of four maps; {} in the two \
+             scope-death lists)",
+            self.entries[0],
+            self.entries[1],
+            self.entries[0] + self.entries[1],
+            self.entries[5] + self.entries[6],
+            self.entries[2] + self.entries[3] + self.entries[4],
+            self.entries[2],
+            self.entries[3],
+            self.entries[4],
+            self.arm_split,
+            self.entries[9] + self.entries[10]
+        );
+        eprintln!(
+            "  keeps: {} Name, {} Ghost over the five exit lists; {} Name, {} Ghost over the \
+             four arm lists; edge frees carrying a keep: {}; edge lists keyed at the \
+             boundary: {} in {} files",
+            self.exit_name_keeps,
+            self.exit_ghost_keeps,
+            self.arm_name_keeps,
+            self.arm_ghost_keeps,
+            self.edge_kept,
+            self.boundary_keys,
+            self.boundary_files
+        );
+    }
+
+    /// The census frozen at 6.3 (L6_DESIGN.md §6), when the organ
+    /// became whole: lower bounds on what that run measured over the
+    /// accepted corpus. The oracle's plate states the six equal-relation
+    /// families exactly and the other leg asserts them; these floors
+    /// cover what the plate cannot see — a family losing its witnesses
+    /// to a later port, or the accepted pool shrinking.
+    fn check_frozen(&self, analyzed: usize) {
+        let temp_entries = self.entries[2] + self.entries[3] + self.entries[4];
+        let floors = [
+            ("analyzed files", analyzed, 325),
+            ("do-exit frees", self.entries[0], 171),
+            ("root frees", self.entries[1], 226),
+            (
+                "ret/break-path frees",
+                self.entries[5] + self.entries[6],
+                10,
+            ),
+            ("temp entries (stmt + cond + arm)", temp_entries, 25),
+            ("arm-split entries", self.arm_split, 2),
+            ("Name keeps over the exit lists", self.exit_name_keeps, 1),
+            ("Ghost keeps over the exit lists", self.exit_ghost_keeps, 1),
+        ];
+        for (what, measured, frozen) in floors {
+            assert!(
+                measured >= frozen,
+                "the ownership census fell below the floor frozen at 6.3: {measured} {what} \
+                 (frozen: {frozen})"
+            );
+        }
     }
 }
 
@@ -477,7 +710,9 @@ fn ownership_corpus_sweep() {
             Outcome::Refused => refused += 1,
             Outcome::Accepted(ast, facts, dump) => {
                 analyzed += 1;
-                check_laws(name, &ast, &facts);
+                let boundary = check_laws(name, &ast, &facts);
+                census.boundary_keys += boundary;
+                census.boundary_files += usize::from(boundary > 0);
                 census.add(&facts);
                 let Outcome::Accepted(_, _, again) = analyze(name.clone(), text.clone()) else {
                     panic!("{name}: the second analysis run did not accept the source")
@@ -502,6 +737,7 @@ fn ownership_corpus_sweep() {
         panics.len(),
         panics.join(", ")
     );
+    census.check_frozen(analyzed);
 }
 
 #[test]
@@ -529,8 +765,10 @@ fn ownership_facts_match_the_oracle() {
                 // `analyze_stage` drops its facts — accepted files
                 // are the ones that compare.
                 let plate = oracle_exit_counts(name, text);
-                // Equal, family by family: the cond and arm temps, and
-                // the root drain — each is planned once per program.
+                // Equal, family by family — each is planned once per
+                // program: the cond and arm temps, the stmt temps (the
+                // scalar-return branch landed at 6.3), the root drain,
+                // and both edge families.
                 assert_eq!(
                     mine.cond_temp, plate.cond_temp,
                     "{name}: cond-temp keys vs the oracle's pokes"
@@ -543,18 +781,26 @@ fn ownership_facts_match_the_oracle() {
                     mine.root_exit, plate.root_exit,
                     "{name}: root-exit frees vs the oracle's pokes"
                 );
-                // At most, family by family. The stmt temps gain their
-                // scalar-return branch at 6.3. A do-exit free and an
+                assert_eq!(
+                    mine.stmt_temp, plate.stmt_temp,
+                    "{name}: {} stmt-temp keys, but the oracle poked {}",
+                    mine.stmt_temp, plate.stmt_temp
+                );
+                assert_eq!(
+                    mine.ret_path, plate.ret_path,
+                    "{name}: {} ret/break-path frees, but the oracle poked {}",
+                    mine.ret_path, plate.ret_path
+                );
+                assert_eq!(
+                    mine.ret_keep, plate.ret_keep,
+                    "{name}: {} ret-keep frees and keys, but the oracle poked {}",
+                    mine.ret_keep, plate.ret_keep
+                );
+                // At most, family by family. A do-exit free and an
                 // arm-split entry are poked once per planning call, and
                 // the While arm's latch loop can walk a body more than
                 // once in the recorded pass while the maps keep one
                 // entry — so alm may sit below, never above.
-                assert!(
-                    mine.stmt_temp <= plate.stmt_temp,
-                    "{name}: {} stmt-temp keys, but the oracle poked {}",
-                    mine.stmt_temp,
-                    plate.stmt_temp
-                );
                 assert!(
                     mine.do_exit <= plate.do_exit,
                     "{name}: {} do-exit frees (the root drain included), but the oracle \
@@ -575,18 +821,22 @@ fn ownership_facts_match_the_oracle() {
     }
     eprintln!(
         "oracle plate over {analyzed} accepted files ({refused} refused): \
-         do-exit {} / {}, stmt {} / {}, root {} / {}, cond {} / {}, arm {} / {}, \
-         arm-split {} / {} (oracle / alm)",
+         do-exit {} / {}, stmt {} / {}, root {} / {}, ret/break-path {} / {}, cond {} / {}, \
+         arm {} / {}, ret-keep {} / {}, arm-split {} / {} (oracle / alm)",
         oracle.do_exit,
         alm.do_exit,
         oracle.stmt_temp,
         alm.stmt_temp,
         oracle.root_exit,
         alm.root_exit,
+        oracle.ret_path,
+        alm.ret_path,
         oracle.cond_temp,
         alm.cond_temp,
         oracle.arm_temp,
         alm.arm_temp,
+        oracle.ret_keep,
+        alm.ret_keep,
         oracle.arm_split,
         alm.arm_split
     );
@@ -615,16 +865,18 @@ fn ownership_facts_match_the_oracle() {
         },
         "the oracle's own totals over the files alm accepts"
     );
+    // The six equal-relation families, exactly the oracle's numbers
+    // (frozen at 6.3, L6_DESIGN.md §6): each is planned once per
+    // program over the accepted corpus, so no accepted case re-plans
+    // one of their entries under a key that already holds it.
+    assert_eq!(alm.stmt_temp, 19, "stmt-temp entries over the corpus");
     assert_eq!(alm.cond_temp, 2, "cond-temp entries over the corpus");
     assert_eq!(alm.arm_temp, 4, "arm-temp entries over the corpus");
-    assert!(
-        alm.stmt_temp <= 19,
-        "{} stmt-temp entries over the corpus — at most the oracle's 19 until 6.3",
-        alm.stmt_temp
-    );
-    // Equal: the root drain runs once per program, and no accepted
-    // corpus case plans an arm split from a latched loop body.
     assert_eq!(alm.root_exit, 226, "root-exit frees over the corpus");
+    assert_eq!(alm.ret_path, 10, "ret/break-path frees over the corpus");
+    assert_eq!(alm.ret_keep, 35, "ret-keep frees and keys over the corpus");
+    // At most by relation — a latched loop body re-plans under one key
+    // — and equal as measured (6.2).
     assert_eq!(alm.arm_split, 2, "arm-split entries over the corpus");
     assert!(
         alm.do_exit <= 397,

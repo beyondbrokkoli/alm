@@ -2,12 +2,13 @@
 //! `L6_PORT_MAP.md` §7, each asserting what the organ's law says —
 //! derived from its code, never from a run — and carrying the oracle's
 //! own count for its source (L6_HARNESS.md §3). The temp-fate programs
-//! (T1–T9, 6.1) and the scope-death and root-drain programs (S1–S9,
-//! 6.2). Facts are addressed through the rendered dump: a section by
-//! name, a statement by line, a ctor site by the line it was born on —
-//! never a raw id. Where two ctors share a line (T9, L1 and its
-//! control) the pin destructures the statement to the ctor nodes
-//! instead.
+//! (T1–T9, 6.1), the scope-death and root-drain programs (S1–S9, 6.2),
+//! and the return and break edge programs (E1–E9, 6.3). Facts are
+//! addressed through the rendered dump: a section by name, a statement
+//! by line, a ctor site by the line it was born on — never a raw id.
+//! Where two ctors share a line (T9, L1 and its control, E5 and the
+//! corpus break twin) the pin destructures the statement to the ctor
+//! nodes, or reads the sites born on the line.
 //!
 //! The one lease, `known_lease/field-obj-arm-scan`, asserts the
 //! correct behaviour under `common::xfail`: it must fail until the
@@ -18,8 +19,8 @@ mod common;
 use alm::ast::{BinOp, Expr, NodeId, Stmt};
 use alm::shape::ShapeFacts;
 use common::{
-    analyze_with_lever, count_exit_families, oracle_exit_counts, oracle_verdict, section, site_of,
-    xfail,
+    analyze_with_lever, cases_dir, count_exit_families, oracle_exit_counts, oracle_verdict,
+    section, site_of, xfail,
 };
 
 const T1: &str = "local f = function() return {1, 2} end\n\
@@ -1045,4 +1046,388 @@ fn s9_arm_split_root() {
     );
     let mine = count_exit_families(&facts);
     assert_eq!((mine.arm_split, mine.do_exit, mine.root_exit), (1, 1, 1));
+}
+
+// — 6.3: the return and break edges (`L6_PORT_MAP.md` §7). The
+// programs keep their own line numbers, as 6.2's do.
+
+/// E2: a return at the root — no fn entry, the boundary.
+const E2: &str = "local t = {1}
+local u = {2}
+return t
+";
+
+/// E4: a break inside a loop body that owns a ctor.
+const E4: &str = "local i = 0
+while i < 3 do
+    local child = {i}
+    if i == 1 then break end
+    i = i + 1
+end
+";
+
+/// E5: a table-typed return reading through a ctor base.
+const E5: &str = "local g = function() return ({{1}})[0] end
+local r = g()
+print(r[0])
+";
+
+/// E6: a scalar return whose value reads a ctor.
+const E6: &str = "local g = function() return ({4})[0] end
+print(g())
+";
+
+/// E8: a fn literal declared by a `local`.
+const E8: &str = "local f = function(c)
+    local m = {3}
+    print(m[0])
+end
+f(0)
+";
+
+/// E9: a fn literal assigned to a declared name.
+const E9: &str = "local f
+f = function()
+    local m = {3}
+    print(m[0])
+end
+f()
+";
+
+/// An edge entry — `  @line L site S carrier keeps: …` — as the
+/// statement's line and the free.
+fn edge_entry(line: &str) -> (u32, Freed) {
+    let (head, keeps) = keeps_field(line);
+    let (at, rest) = head
+        .strip_prefix("@line ")
+        .and_then(|rest| rest.split_once(" site "))
+        .unwrap_or_else(|| panic!("not an edge entry: {line:?}"));
+    let (site, carrier) = rest.split_once(' ').expect("the carrier");
+    (
+        at.parse().expect("a line number"),
+        Freed {
+            site: site.parse().expect("a site id"),
+            carrier: carrier.to_string(),
+            keeps,
+        },
+    )
+}
+
+/// The frees of one edge list — `ret-path-frees`,
+/// `break-path-frees`, `ret-path-keep-frees` — keyed by the statement
+/// at `line`: empty when that statement plans none there. The edge
+/// planners never mint an empty list, so an unplanned edge prints no
+/// line.
+fn edge_at(dump: &str, list: &str, line: u32) -> Vec<Freed> {
+    section(dump, list)
+        .iter()
+        .filter_map(|entry| edge_entry(entry).into())
+        .filter(|(at, _)| *at == line)
+        .map(|(_, f)| f)
+        .collect()
+}
+
+/// A corpus case's text.
+fn case(name: &str) -> String {
+    std::fs::read_to_string(cases_dir().join(name))
+        .unwrap_or_else(|e| panic!("{name} unreadable: {e}"))
+}
+
+#[test]
+fn e1_return_path_frees() {
+    // The corpus twin, and counts only — a nine-return program's
+    // law-derived contents are not worth hand-deriving. Its plate
+    // reads: one bare return that frees what it leaves behind, two
+    // returns inside a fn that carry their reached binding to the
+    // caller, and one scalar return that mints the stmt temp its value
+    // reads (the entry 6.1 could not mint).
+    let text = case("29_pin_return_path_frees.lua");
+    let (_, facts) = common::facts_of(&text);
+    let oracle = oracle_exit_counts("29_pin_return_path_frees.lua", &text);
+    assert_eq!(
+        (
+            oracle.ret_path,
+            oracle.ret_keep,
+            oracle.stmt_temp,
+            oracle.root_exit,
+        ),
+        (1, 3, 2, 1)
+    );
+    assert!(
+        oracle.do_exit <= 3,
+        "the oracle poked {} do-exit frees",
+        oracle.do_exit
+    );
+    let mine = count_exit_families(&facts);
+    assert_eq!(
+        (mine.ret_path, mine.ret_keep, mine.stmt_temp, mine.root_exit,),
+        (
+            oracle.ret_path,
+            oracle.ret_keep,
+            oracle.stmt_temp,
+            oracle.root_exit,
+        ),
+        "alm's four families against the oracle's pokes"
+    );
+    assert_eq!(mine.do_exit, 3, "two scope deaths and the root drain");
+}
+
+#[test]
+fn e2_boundary_return() {
+    let (ast, facts) = common::facts_of(E2);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    // A return with no fn entry is the boundary: the scopes from the
+    // entry outward — the root scope alone — re-plan, and every keep
+    // clears (the host owns the artifact's exit). The frees then split
+    // by reach: `t`'s alias is what the return hands out, so `t`'s free
+    // is a keep-free and `u`'s a plain free.
+    assert!(
+        matches!(&ast[2], Stmt::Return { .. }),
+        "the program returns at its root"
+    );
+    assert_eq!(
+        edge_at(&dump, "ret-path-frees", 3),
+        [Freed {
+            site: site_born_at(&dump, 2),
+            carrier: "u".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    assert_eq!(
+        edge_at(&dump, "ret-path-keep-frees", 3),
+        [Freed {
+            site: site_born_at(&dump, 1),
+            carrier: "t".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    // A returned name reads through no ctor, so there is no base to
+    // keep; and nothing else in the program returns or breaks.
+    assert!(
+        section(&dump, "ret-path-keep-temps").is_empty(),
+        "a returned name has no ctor base:\n{}",
+        dump
+    );
+    assert!(section(&dump, "break-path-frees").is_empty());
+    assert_eq!(facts.ret_path_frees.len(), 1, "one key — the return's");
+    assert_eq!(facts.ret_path_keep_frees.len(), 1, "one key — the return's");
+    let oracle = oracle_exit_counts("e2_boundary_return.lua", E2);
+    assert_eq!((oracle.ret_path, oracle.ret_keep), (1, 1));
+    let mine = count_exit_families(&facts);
+    assert_eq!((mine.ret_path, mine.ret_keep), (1, 1));
+}
+
+#[test]
+fn e4_break_path() {
+    let (ast, facts) = common::facts_of(E4);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    // The break plans the scopes from the loop entry outward with the
+    // plan's arm split off: the `if`'s then arm — a scope of its own,
+    // owning nothing — and the loop body, where `child` was born. A
+    // break hands nothing out, so there is no reach to split by: plain
+    // frees only.
+    //
+    // (The port map's pre-flight text keyed this entry `@5`; the break
+    // is the program's fourth line. The lines come off the statements
+    // here, not off a hand count.)
+    let Stmt::While { body, .. } = &ast[1] else {
+        panic!("the program's second statement is the loop")
+    };
+    let Stmt::If { then_body, .. } = &body[1] else {
+        panic!("the loop body's second statement is the test")
+    };
+    let [Stmt::Break { .. }] = then_body.as_slice() else {
+        panic!("the then arm is the break alone")
+    };
+    let (born, at) = (body[0].loc().line, then_body[0].loc().line);
+    assert_eq!(
+        (born, at),
+        (3, 4),
+        "`child` is declared on line 3 and the break is line 4"
+    );
+    assert_eq!(
+        edge_at(&dump, "break-path-frees", at),
+        [Freed {
+            site: site_born_at(&dump, born),
+            carrier: "child".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    assert_eq!(facts.break_path_frees.len(), 1, "one key — the break's");
+    assert!(section(&dump, "ret-path-frees").is_empty());
+    assert!(section(&dump, "ret-path-keep-frees").is_empty());
+    assert!(section(&dump, "ret-path-keep-temps").is_empty());
+    let oracle = oracle_exit_counts("e4_break_path.lua", E4);
+    assert_eq!(oracle.ret_path, 1);
+    let mine = count_exit_families(&facts);
+    assert_eq!(mine.ret_path, 1);
+}
+
+#[test]
+fn e4_twin_corpus_break_on_inclusive_limit() {
+    // The corpus twin, under its own flags (base 1, inclusive limit)
+    // and through the canonical path: the loop's `break` on line 13
+    // leaves the loop body owning `child` — one break-path entry,
+    // freeing a ctor born with `child` on line 12.
+    const NAME: &str = "for_inclusive_base1_break_on_inclusive_limit.lua";
+    let text = case(NAME);
+    let dump = match analyze_with_lever(NAME.into(), text.clone(), true) {
+        Ok(dump) => dump,
+        Err((_stage, refusal)) => panic!("the pipeline refuses the case: {refusal}"),
+    };
+    let entries: Vec<(u32, Freed)> = section(&dump, "break-path-frees")
+        .iter()
+        .map(|line| edge_entry(line))
+        .collect();
+    assert_eq!(entries.len(), 1, "one break-path entry — the loop's break");
+    let (at, freed) = &entries[0];
+    assert_eq!(*at, 13, "keyed by the loop's break");
+    assert_eq!(freed.carrier, "child");
+    assert!(freed.keeps.is_empty());
+    assert!(
+        sites_born_at(&dump, 12).contains(&freed.site),
+        "the break frees a ctor born with `child` on line 12: {}",
+        freed.site
+    );
+    let oracle = oracle_exit_counts(NAME, &text);
+    assert_eq!(oracle.ret_path, 1);
+}
+
+#[test]
+fn e5_return_keep_temps_ctor_base() {
+    let (ast, facts) = common::facts_of(E5);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    let Stmt::LocalDecl { exprs, .. } = &ast[0] else {
+        panic!("the program declares g")
+    };
+    let Expr::Function { body, .. } = &exprs[0] else {
+        panic!("g is a function literal")
+    };
+    let [
+        Stmt::Return {
+            value: Some(value), ..
+        },
+    ] = body.as_slice()
+    else {
+        panic!("g's body is one return of a value")
+    };
+    let Expr::Index { obj, .. } = value else {
+        panic!("the return reads through an index")
+    };
+    // A table-typed return keeps its value's ctor *bases*: the base of
+    // `({{1}})[0]` is the outer ctor, the row's housing. It is a
+    // keep-temp — not a temp the statement frees, since a Return
+    // statement scans none — and the row `{1}` inside it is not listed
+    // on its own.
+    assert_eq!(
+        temp_sites_at(&dump, "ret-path-keep-temps", 1),
+        [site_of(&facts, obj.id())]
+    );
+    assert_eq!(facts.ret_path_keep_temps.len(), 1, "one key — the return's");
+    assert!(
+        section(&dump, "stmt-temp-frees").is_empty(),
+        "the base is kept, not freed as a temp:\n{}",
+        dump
+    );
+    let oracle = oracle_exit_counts("e5_return_keep_temps_ctor_base.lua", E5);
+    assert_eq!(oracle.ret_keep, 1);
+    let mine = count_exit_families(&facts);
+    assert_eq!(mine.ret_keep, 1);
+}
+
+#[test]
+fn e6_scalar_return_temps() {
+    let (ast, facts) = common::facts_of(E6);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    // A scalar return keeps no bases; its temps are statement temps.
+    // The value is collected with `Escapes`, and the Index arm hands
+    // its obj `Dies` whatever fate it was given — so `{4}` is a temp,
+    // keyed by the return statement itself, from `plan_return_exits`.
+    assert!(matches!(&ast[0], Stmt::LocalDecl { .. }));
+    assert_eq!(temp_lines(&dump, "stmt-temp-frees"), [1]);
+    assert_eq!(
+        temp_sites_at(&dump, "stmt-temp-frees", 1),
+        [site_born_at(&dump, 1)]
+    );
+    assert!(section(&dump, "ret-path-keep-temps").is_empty());
+    let oracle = oracle_exit_counts("e6_scalar_return_temps.lua", E6);
+    assert_eq!(oracle.stmt_temp, 1);
+    let mine = count_exit_families(&facts);
+    assert_eq!(mine.stmt_temp, 1);
+}
+
+#[test]
+fn e8_fn_scope_exit_localdecl() {
+    let (ast, facts) = common::facts_of(E8);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    // A value statement mints k = 2 for its fn literal. At the body's
+    // death the fn-body site plans the innermost scope after the body
+    // walk: `m` dies there with its one ctor, nothing kept. Neither
+    // control arm (k = 0, k = 1) is this literal's key.
+    assert!(matches!(&ast[0], Stmt::LocalDecl { .. }));
+    assert_eq!(
+        do_exit_at(&dump, 1, 2),
+        [Freed {
+            site: site_born_at(&dump, 2),
+            carrier: "m".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    for arm in [0, 1] {
+        assert!(
+            do_exit_at(&dump, 1, arm).is_empty(),
+            "arm {arm} is not the literal's key"
+        );
+    }
+    assert_eq!(
+        facts.do_exit_frees.len(),
+        1,
+        "one scope key — the fn body's"
+    );
+    assert!(facts.do_exit_frees.contains_key(&(ast[0].id(), 2)));
+    assert_eq!(
+        section(&dump, "fn-scope-keys"),
+        ["  fn @line 1 -> (@line 1, arm 2)"]
+    );
+    let oracle = oracle_exit_counts("e8_fn_scope_exit_localdecl.lua", E8);
+    assert_eq!(oracle.do_exit, 1);
+    let mine = count_exit_families(&facts);
+    assert_eq!(mine.do_exit, 1);
+}
+
+#[test]
+fn e9_fn_scope_exit_assignment() {
+    let (ast, facts) = common::facts_of(E9);
+    let dump = alm::dump::render_shape(&facts, &ast);
+    // E8's literal assigned to a declared name instead: an Assignment
+    // mints the same k = 2, from the statement's own line.
+    assert!(matches!(&ast[1], Stmt::Assignment { .. }));
+    assert_eq!(
+        do_exit_at(&dump, 2, 2),
+        [Freed {
+            site: site_born_at(&dump, 3),
+            carrier: "m".into(),
+            keeps: Vec::new(),
+        }]
+    );
+    for arm in [0, 1] {
+        assert!(
+            do_exit_at(&dump, 2, arm).is_empty(),
+            "arm {arm} is not the literal's key"
+        );
+    }
+    assert_eq!(
+        facts.do_exit_frees.len(),
+        1,
+        "one scope key — the fn body's"
+    );
+    assert!(facts.do_exit_frees.contains_key(&(ast[1].id(), 2)));
+    assert_eq!(
+        section(&dump, "fn-scope-keys"),
+        ["  fn @line 2 -> (@line 2, arm 2)"]
+    );
+    let oracle = oracle_exit_counts("e9_fn_scope_exit_assignment.lua", E9);
+    assert_eq!(oracle.do_exit, 1);
+    let mine = count_exit_families(&facts);
+    assert_eq!(mine.do_exit, 1);
 }

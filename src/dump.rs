@@ -400,6 +400,60 @@ pub fn render_shape(facts: &ShapeFacts, ast: &[Stmt]) -> String {
         temp_frees("arm-temp-frees", &facts.arm_temp_frees);
     }
 
+    // — the exit-fate families (L6): the edge planners' four maps
+    // (6.3), each keyed by its own statement — what a return or a break
+    // leaves behind. The three exit lists print one line per free like
+    // the root drain; the keep-temps print the temp grammar. The walk
+    // may plan one edge twice (a loop body re-walked) and the second
+    // plan replaces the first, so a statement holds one entry.
+    {
+        let mut edge_frees =
+            |header: &str, frees: &BTreeMap<NodeId, Vec<crate::shape::DoExitFree>>| {
+                let entries: Vec<String> = frees
+                    .iter()
+                    .flat_map(|(stmt, frees)| {
+                        frees.iter().map(move |f| {
+                            format!(
+                                "  @line {} site {} {} keeps: {}",
+                                line_of(*stmt),
+                                f.site,
+                                f.carrier,
+                                render_keeps(&f.keeps)
+                            )
+                        })
+                    })
+                    .collect();
+                if !entries.is_empty() {
+                    emitf(format!("{header}:"));
+                    for entry in entries {
+                        emitf(entry);
+                    }
+                }
+            };
+        edge_frees("ret-path-frees", &facts.ret_path_frees);
+        edge_frees("break-path-frees", &facts.break_path_frees);
+        edge_frees("ret-path-keep-frees", &facts.ret_path_keep_frees);
+        let keep_temps: Vec<String> = facts
+            .ret_path_keep_temps
+            .iter()
+            .filter(|(_, sites)| !sites.is_empty())
+            .map(|(stmt, sites)| {
+                let list = sites
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("  @line {} sites [{list}]", line_of(*stmt))
+            })
+            .collect();
+        if !keep_temps.is_empty() {
+            emitf("ret-path-keep-temps:".into());
+            for entry in keep_temps {
+                emitf(entry);
+            }
+        }
+    }
+
     if !facts.rebind_frees.is_empty() {
         emitf("rebind-grants:".into());
         for (stmt, grants) in &facts.rebind_frees {
