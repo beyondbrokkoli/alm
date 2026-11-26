@@ -6,14 +6,14 @@
 //! bodies verbatim, cross-file methods `pub(super)`.
 //!
 //! Receipts vs mirror: `alm_rt` signals never port (§B); the omni
-//! watchers never port here (L6 — `declare/assign_fn_binding`'s pokes,
-//! `resolve_fn_binding`'s tier tracking + `omni_frames_digest`,
-//! `end_scope`'s burial block, `note_stmt`); `mint_instance` re-homes
-//! from a process-global `AtomicU32` to the Checker's own counter
-//! (per-compile deterministic — same sequence mirror's first compile
-//! mints, and the in-process sweeps compare equal).
+//! watchers landed at L6 (6.4), verbatim less their plate pokes;
+//! `mint_instance` re-homes from a process-global `AtomicU32` to the
+//! Checker's own counter (per-compile deterministic — same sequence
+//! mirror's first compile mints, and the in-process sweeps compare
+//! equal).
 
 use super::WalkState;
+use super::omni;
 use crate::shape::TableShape;
 use crate::shape::facts::{BuiltinVerb, FfiMint, FfiVerb, FnDef, InstanceId, InstanceInfo};
 
@@ -79,9 +79,7 @@ struct Frame {
     /// `fns` entry's name is in the `born` set of the frame it was
     /// minted at. A dying frame carrying a face NOT in its `born` set
     /// would mean a write landed somewhere its binding does not live —
-    /// the burial law's trip shape. (L6 receipt: the law's reader is
-    /// the omni watcher; the face rides until then.)
-    #[allow(dead_code)]
+    /// the burial law's trip shape.
     born: BTreeSet<String>,
     /// Names this frame declares as CAPTURE VIEWS: an expansion frame's
     /// depth-0 capture entries. A capture view reads the owner binding

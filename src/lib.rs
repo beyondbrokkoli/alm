@@ -9,7 +9,9 @@
 //! The ffi gate rides the pipeline behind the checker's verb table.
 //! Layer 6 of the rebase adds the ownership exit planner: temp fates,
 //! scope-death and root frees, and the return and break edges — the
-//! frees/keeps algebra the lowerer will emit. Nothing here may change
+//! frees/keeps algebra the lowerer will emit — and the omni watcher,
+//! an `ALM_OMNI`-gated observer of the scope law that writes to
+//! stderr only, and only when enabled. Nothing here may change
 //! behavior relative to the mirror compiler.
 
 pub mod analysis;

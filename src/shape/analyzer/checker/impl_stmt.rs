@@ -1,6 +1,6 @@
 use super::super::constraints::UnknownStore;
 use super::type_helpers::type_name;
-use super::{Checker, ReturnCtx};
+use super::{Checker, ReturnCtx, omni};
 use crate::ast::{Expr, Stmt};
 use crate::diag::Diagnostic;
 use crate::shape::facts::InstanceId;
@@ -14,6 +14,7 @@ impl Checker {
     ) -> Result<(), Diagnostic> {
         self.cur_stmt = Some(stmt.id());
         self.cur_stmt_line = Some(stmt.loc().line as usize);
+        omni::note_stmt(stmt.loc().line as usize);
         if self.frames.is_empty() {
             self.cur_decls.clear();
         }

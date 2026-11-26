@@ -1,6 +1,6 @@
 use super::super::constraints::UnknownStore;
 use super::type_helpers::type_name;
-use super::{CheckCtx, CheckFacts, Checker, ReturnCtx, WalkSnap, WalkState, snap_of};
+use super::{CheckCtx, CheckFacts, Checker, ReturnCtx, WalkSnap, WalkState, omni, snap_of};
 use crate::ast::{Expr, NodeId, Stmt};
 use crate::diag::Diagnostic;
 use crate::shape::facts::{FnDef, InstanceId, InstanceInfo};
@@ -108,6 +108,12 @@ impl Checker {
             // block local dying with its frame) from an orphan (a face
             // outliving the binding's home)
             frame.born.insert(name.to_string());
+            omni::checker_fn_write(
+                name,
+                omni::FnHome::Frame(self.frames.len() - 1),
+                ptr,
+                "declare",
+            );
         } else {
             // no frame home: the face takes the rider's ROOT home —
             // the checker-side twin of the walk's boundary-root scope
@@ -116,12 +122,14 @@ impl Checker {
             // has to carry them (phase 2 closed the gap the omni
             // layer's DROPPED receipt named).
             self.root_fns.insert(name.to_string(), ptr);
+            omni::checker_fn_write(name, omni::FnHome::Root, ptr, "declare");
         }
     }
 
     pub(super) fn assign_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
         if let Some(depth) = self.frames.iter().rposition(|f| f.fns.contains_key(name)) {
             self.frames[depth].fns.insert(name.to_string(), ptr);
+            omni::checker_fn_write(name, omni::FnHome::Frame(depth), ptr, "assign");
             return;
         }
         // The root home: an assignment to a root fn-bound name
@@ -135,26 +143,37 @@ impl Checker {
             && let Some(home) = self.root_fns.get_mut(name)
         {
             *home = ptr;
+            omni::checker_fn_write(name, omni::FnHome::Root, ptr, "assign → root home");
+            return;
         }
+        omni::checker_fn_write(
+            name,
+            omni::FnHome::None,
+            ptr,
+            "assign — no home depth, dropped",
+        );
     }
 
     pub(super) fn resolve_fn_binding(&self, name: &str) -> Option<Option<NodeId>> {
         let base = self.expansion_frame_bases.last().copied().unwrap_or(0);
-        // The tiers in their original or_else order. The root home
-        // sits between the inline chain and the master snapshot: the
-        // chain is the DEFINITION-SITE truth (inner wins — a body's
-        // shadowing decl must beat the root face), while the root
-        // home is the rider's own foundation for top-level fn faces —
-        // the names the chain excludes (CHAIN-FREEZE keeps root
-        // fn-bound names out of it). So a top-level call resolves at
-        // its binding point's state — the checker's statement-order
-        // timeline — instead of the master snapshot's
-        // defcollection-dragged future.
+        // The tiers in their original or_else order — the tier
+        // that ANSWERS is the diagnosis the omni layer rides on. The
+        // root home sits between the inline chain and the master
+        // snapshot: the chain is the DEFINITION-SITE truth (inner
+        // wins — a body's shadowing decl must beat the root face),
+        // while the root home is the rider's own foundation for
+        // top-level fn faces — the names the chain excludes
+        // (CHAIN-FREEZE keeps root fn-bound names out of it). So a
+        // top-level call resolves at its binding point's state — the
+        // checker's statement-order timeline — instead of the master
+        // snapshot's defcollection-dragged future.
+        let mut tier = omni::Tier::Frames;
         let mut answer = self.frames[base..]
             .iter()
             .rev()
             .find_map(|f| f.fns.get(name).copied());
         if answer.is_none() {
+            tier = omni::Tier::InlineChain;
             answer = self.inline_stack.last().and_then(|cur| {
                 self.ctx
                     .fn_def_sites
@@ -164,12 +183,71 @@ impl Checker {
             });
         }
         if answer.is_none() {
+            tier = omni::Tier::RootHome;
             answer = self.root_fns.get(name).copied();
         }
         if answer.is_none() {
+            tier = omni::Tier::MasterSnap;
             answer = self.snap.fns.get(name).copied();
         }
+        if omni::enabled() {
+            omni::resolve_fn(name, tier, answer, &self.omni_frames_digest(base));
+        }
         answer
+    }
+
+    /// The rider frames' fn-face inventory, compact — the resolve
+    /// event's "why did the tier answer" digest. An empty digest at
+    /// top level sends the resolve to the root home and then the
+    /// master snapshot; the root home's inventory rides after the
+    /// frames so the answer's home is always named.
+    fn omni_frames_digest(&self, base: usize) -> String {
+        let mut s = String::new();
+        for (i, frame) in self.frames[base..].iter().enumerate() {
+            if frame.fns.is_empty() {
+                continue;
+            }
+            s.push_str(if s.is_empty() { "[" } else { " | " });
+            s.push_str(&format!("d{}{{", base + i));
+            let mut first = true;
+            for (n, ptr) in &frame.fns {
+                if !first {
+                    s.push_str(", ");
+                }
+                first = false;
+                s.push_str(&match ptr {
+                    Some(p) => format!("{n}=fn#{}", p.0),
+                    None => format!("{n}=—"),
+                });
+            }
+            s.push('}');
+        }
+        if !self.root_fns.is_empty() {
+            s.push_str(if s.is_empty() { "[" } else { " | " });
+            s.push_str("root{");
+            let mut first = true;
+            let shown = self.root_fns.len().min(6);
+            for (i, (n, ptr)) in self.root_fns.iter().enumerate() {
+                if i == shown {
+                    s.push_str(&format!("…+{}", self.root_fns.len() - shown));
+                    break;
+                }
+                if !first {
+                    s.push_str(", ");
+                }
+                first = false;
+                s.push_str(&match ptr {
+                    Some(p) => format!("{n}=fn#{}", p.0),
+                    None => format!("{n}=—"),
+                });
+            }
+            s.push('}');
+        }
+        if s.is_empty() {
+            "∅ (no rider frame carries a fn face)".to_string()
+        } else {
+            s + "]"
+        }
     }
 
     pub(super) fn resolves_to_fn(&self, name: &str) -> bool {

@@ -189,6 +189,23 @@ impl Analyzer {
             }
         }
         self.fn_def_sites.insert(fn_ptr, chain.clone());
+        if omni::enabled() {
+            let excluded_root_fns: Vec<String> = self.walk.scopes[0]
+                .iter()
+                .filter(|(_, b)| b.fn_ptr.is_some())
+                .map(|(n, _)| n.clone())
+                .collect();
+            omni::collection_begin(
+                fn_ptr,
+                &chain,
+                &excluded_root_fns,
+                &omni::root_faces_of(&self.walk.scopes),
+            );
+            omni::dump_scopes(
+                &format!("collection fn#{}/body begins", fn_ptr.0),
+                &self.walk.scopes,
+            );
+        }
         let mut bound = BTreeSet::new();
         bound.extend(params.iter().cloned());
         let free = transitive_free_names(body, &mut bound);
@@ -268,6 +285,13 @@ impl Analyzer {
                 result = Err(err);
             }
         });
+        if omni::enabled() {
+            omni::collection_end(fn_ptr, &omni::root_faces_of(&self.walk.scopes));
+            omni::dump_scopes(
+                &format!("collection fn#{}/body returns", fn_ptr.0),
+                &self.walk.scopes,
+            );
+        }
         self.fn_scope_entries.pop();
         self.fn_walk.pop();
         let joined = self.fn_rets.pop().unwrap_or(None);
